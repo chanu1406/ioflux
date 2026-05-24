@@ -1,0 +1,17 @@
+# Build output
+/bin/
+
+# Editor swap files
+.*.swp
+.*.swo
+
+# Local project context
+/CONTEXT.md
+
+# Coverage profiles
+/coverage.out
+*.coverprofile
+
+# Go workspace
+go.work
+go.work.sum

@@ -1,0 +1,1 @@
+{"ioflux_trace_version":99,"kind":"synthetic","time_unit":"ns","scrubbed":false,"targets":[{"id":0,"name":"a","kind":"file","size":0}],"summary":{"num_ops":0,"num_streams":0,"num_groups":0,"total_bytes":0,"duration_ns":0}}

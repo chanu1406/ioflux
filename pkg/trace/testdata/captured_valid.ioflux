@@ -1,0 +1,4 @@
+{"ioflux_trace_version":1,"kind":"captured","time_unit":"ns","capture_method":"python-io-hooks","capture_limitations":"Python io/os hooks only; mmap and C-extension I/O not captured","scrubbed":false,"generated_by":"ioflux-capture 0.1.0","created_utc":"2026-05-24T12:00:00Z","targets":[{"id":0,"name":"/data/shard_0000.tar","kind":"file","size":4096}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":4096,"duration_ns":1000}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":42,"mode":"r"}
+{"t":500,"op_id":1,"s":0,"op":"READ","h":42,"off":0,"len":4096}
+{"t":1000,"op_id":2,"s":0,"op":"CLOSE","h":42}

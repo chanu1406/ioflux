@@ -1,0 +1,7 @@
+{"ioflux_trace_version":1,"kind":"synthetic","profile":"training-read","time_unit":"ns","scrubbed":false,"targets":[{"id":0,"name":"shard_0000.tar","kind":"file","size":8192},{"id":1,"name":"shard_0001.tar","kind":"file","size":8192}],"summary":{"num_ops":6,"num_streams":1,"num_groups":0,"total_bytes":8192,"duration_ns":400}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":42,"mode":"r"}
+{"t":100,"op_id":1,"s":0,"op":"READ","h":42,"off":0,"len":4096}
+{"t":200,"op_id":2,"s":0,"op":"READ","h":42,"off":4096,"len":4096}
+{"t":300,"op_id":3,"s":0,"op":"CLOSE","h":42}
+{"t":350,"op_id":4,"s":0,"op":"STAT","tgt":1}
+{"t":400,"op_id":5,"s":0,"op":"HEAD","tgt":1}

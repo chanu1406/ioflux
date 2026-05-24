@@ -1,0 +1,4 @@
+{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","scrubbed":false,"targets":[{"id":0,"name":"a","kind":"file","size":0}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":0,"duration_ns":0}}
+{"t":1000,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":42,"mode":"r"}
+{"t":500,"op_id":1,"s":0,"op":"READ","h":42,"off":0,"len":1024}
+{"t":2000,"op_id":2,"s":0,"op":"CLOSE","h":42}
