@@ -575,3 +575,121 @@ func TestIssue_StringFormats(t *testing.T) {
 		}
 	}
 }
+
+// Coverage-gap tests: branches in validate.go not reached by the tests above.
+
+func TestValidate_NegativeOpID(t *testing.T) {
+	ops := []Op{{T: 0, OpID: Ptr[int64](-1), S: 0, Op: OpHead, Tgt: Ptr(0)}}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "must be non-negative") {
+		t.Fatalf("want negative op_id error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_TargetsNull(t *testing.T) {
+	// targets:null is distinct from targets being absent; the validator
+	// must reject it explicitly.
+	rep := mustValidateRaw(t, `{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","scrubbed":false,"targets":null,"summary":{"num_ops":0,"num_streams":0,"num_groups":0,"total_bytes":0,"duration_ns":0}}`)
+	if !hasErr(rep, "targets") {
+		t.Fatalf("want targets error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_SummaryNull(t *testing.T) {
+	// summary:null is distinct from summary being absent.
+	rep := mustValidateRaw(t, `{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","scrubbed":false,"targets":[],"summary":null}`)
+	if !hasErr(rep, "summary") {
+		t.Fatalf("want summary null error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_TargetEmptyKind(t *testing.T) {
+	h := validSyntheticHeader()
+	h.Targets = []TargetInfo{{ID: 0, Name: "shard_0000.tar", Kind: ""}}
+	rep := mustValidate(t, h, nil)
+	if !hasErr(rep, "missing required kind") {
+		t.Fatalf("want target missing-kind error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_NegativeSummaryFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Summary)
+		want   string
+	}{
+		{"NumOps", func(s *Summary) { s.NumOps = -1 }, "summary.num_ops"},
+		{"NumStreams", func(s *Summary) { s.NumStreams = -1 }, "summary.num_streams"},
+		{"NumGroups", func(s *Summary) { s.NumGroups = -1 }, "summary.num_groups"},
+		{"TotalBytes", func(s *Summary) { s.TotalBytes = -1 }, "summary.total_bytes"},
+		{"DurationNS", func(s *Summary) { s.DurationNS = -1 }, "summary.duration_ns"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := validSyntheticHeader()
+			c.mutate(&h.Summary)
+			rep := mustValidate(t, h, nil)
+			if !hasErr(rep, c.want) {
+				t.Fatalf("want %s error, got %v", c.want, rep.Errors)
+			}
+		})
+	}
+}
+
+func TestValidate_NonOpenOpWithMode(t *testing.T) {
+	ops := []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeRead},
+		{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpRead, H: Ptr[int64](42), Off: Ptr[int64](0), Len: Ptr[int64](1024), Mode: ModeRead},
+		{T: 2, OpID: Ptr[int64](2), S: 0, Op: OpClose, H: Ptr[int64](42)},
+	}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "must not carry mode") {
+		t.Fatalf("want non-OPEN mode error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_NonOpenOpWithFlags(t *testing.T) {
+	ops := []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeRead},
+		{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpRead, H: Ptr[int64](42), Off: Ptr[int64](0), Len: Ptr[int64](1024), Flags: []string{"direct"}},
+		{T: 2, OpID: Ptr[int64](2), S: 0, Op: OpClose, H: Ptr[int64](42)},
+	}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "must not carry flags") {
+		t.Fatalf("want non-OPEN flags error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_HandleOpMissingH(t *testing.T) {
+	// CLOSE with no h field at all — distinct from an unknown handle ID.
+	ops := []Op{{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpClose}}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "CLOSE missing required h") {
+		t.Fatalf("want CLOSE missing-h error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_ReadNegativeOff(t *testing.T) {
+	ops := []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeRead},
+		{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpRead, H: Ptr[int64](42), Off: Ptr[int64](-1), Len: Ptr[int64](1024)},
+		{T: 2, OpID: Ptr[int64](2), S: 0, Op: OpClose, H: Ptr[int64](42)},
+	}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "must be non-negative") {
+		t.Fatalf("want negative off error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_OpenCarriesOffAndLen(t *testing.T) {
+	// OPEN must not carry off or len; forbidPositional enforces both.
+	ops := []Op{{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeRead,
+		Off: Ptr[int64](0), Len: Ptr[int64](1024)}}
+	rep := mustValidate(t, validSyntheticHeader(), ops)
+	if !hasErr(rep, "OPEN must not carry off") {
+		t.Errorf("want OPEN off error, got %v", rep.Errors)
+	}
+	if !hasErr(rep, "OPEN must not carry len") {
+		t.Errorf("want OPEN len error, got %v", rep.Errors)
+	}
+}
