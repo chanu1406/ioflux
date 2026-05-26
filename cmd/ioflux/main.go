@@ -1,5 +1,4 @@
-// Command ioflux is the IOFlux CLI. This early build wires the validate
-// subcommand for checking .ioflux trace files.
+// Command ioflux is the IOFlux CLI.
 package main
 
 import (
@@ -13,6 +12,7 @@ Usage:
   ioflux <command> [flags]
 
 Commands:
+  gen      <profile> [flags]  Generate a synthetic trace.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
 
 Run 'ioflux <command> -h' for command-specific help.
@@ -27,6 +27,8 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
+	case "gen":
+		os.Exit(runGen(args, os.Stdout, os.Stderr))
 	case "validate":
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "-h", "--help", "help":
