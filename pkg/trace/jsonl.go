@@ -58,6 +58,11 @@ func NewReader(r io.Reader) (*Reader, error) {
 // Header returns the parsed header.
 func (r *Reader) Header() Header { return r.hdr }
 
+// HeaderRaw returns a copy of the raw header line as it appeared in the trace.
+func (r *Reader) HeaderRaw() []byte {
+	return append([]byte(nil), r.headerRaw...)
+}
+
 // Line returns the 1-based line number of the most recently returned record.
 // After NewReader, Line() == 1 (the header). After each successful Next(),
 // Line() is the line that op was read from.

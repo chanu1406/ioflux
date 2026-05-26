@@ -14,6 +14,7 @@ Usage:
 Commands:
   gen      <profile> [flags]  Generate a synthetic trace.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
+  run      [flags]            Replay a trace against a storage engine.
 
 Run 'ioflux <command> -h' for command-specific help.
 `
@@ -31,6 +32,8 @@ func main() {
 		os.Exit(runGen(args, os.Stdout, os.Stderr))
 	case "validate":
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
+	case "run":
+		os.Exit(runRun(args, os.Stdout, os.Stderr))
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(0)

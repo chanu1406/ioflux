@@ -1,6 +1,7 @@
 package trace
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -166,6 +167,27 @@ func Validate(r *Reader) (Report, error) {
 	}
 
 	return rep, nil
+}
+
+// ValidateLoadedRaw validates an already-loaded raw header line and op list.
+// It preserves header-field presence checks for callers that still have the
+// original header bytes.
+func ValidateLoadedRaw(headerRaw []byte, ops []Op) (Report, error) {
+	var buf bytes.Buffer
+	buf.Write(bytes.TrimSpace(headerRaw))
+	buf.WriteByte('\n')
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for _, op := range ops {
+		if err := enc.Encode(op); err != nil {
+			return Report{}, err
+		}
+	}
+	r, err := NewReader(&buf)
+	if err != nil {
+		return Report{}, err
+	}
+	return Validate(r)
 }
 
 type handleState struct {

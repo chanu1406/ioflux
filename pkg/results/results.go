@@ -1,0 +1,104 @@
+// Package results defines the Results struct written to results.json at the end
+// of a replay run.
+package results
+
+import (
+	"encoding/json"
+	"io"
+	"time"
+
+	"github.com/chanuollala/ioflux/pkg/metrics"
+	"github.com/chanuollala/ioflux/pkg/trace"
+)
+
+// PlanInfo records the replay configuration echoed into results.json.
+type PlanInfo struct {
+	TracePath  string `json:"trace_path"`
+	Engine     string `json:"engine"`
+	Mode       string `json:"mode"`
+	TraceKind  string `json:"trace_kind"`
+	NumStreams int    `json:"num_streams"`
+	NumOps     int64  `json:"num_ops"`
+	TotalBytes int64  `json:"total_bytes"`
+}
+
+// PerOpStats holds latency percentiles and counters for one op type.
+type PerOpStats struct {
+	OpType string  `json:"op_type"`
+	Count  int64   `json:"count"`
+	P50NS  int64   `json:"p50_ns"`
+	P90NS  int64   `json:"p90_ns"`
+	P99NS  int64   `json:"p99_ns"`
+	P999NS int64   `json:"p999_ns"`
+	MaxNS  int64   `json:"max_ns"`
+	MeanNS float64 `json:"mean_ns"`
+}
+
+// Results is the full output of a replay run written to results.json.
+type Results struct {
+	GeneratedAt  string       `json:"generated_at"`
+	Plan         PlanInfo     `json:"plan"`
+	DurationNS   int64        `json:"duration_ns"`
+	OpsCompleted int64        `json:"ops_completed"`
+	BytesMoved   int64        `json:"bytes_moved"`
+	Errors       int64        `json:"errors"`
+	PerOpStats   []PerOpStats `json:"per_op_stats"`
+}
+
+// Build constructs a Results from a merged Recorder, a plan, and the measured
+// run duration.
+func Build(plan PlanInfo, rec *metrics.Recorder, durationNS int64) *Results {
+	kinds := rec.OpKinds()
+	stats := make([]PerOpStats, 0, len(kinds))
+	for _, k := range kinds {
+		h := rec.Histogram(k)
+		if h == nil {
+			continue
+		}
+		stats = append(stats, PerOpStats{
+			OpType: string(k),
+			Count:  rec.Count(k),
+			P50NS:  h.Percentile(50),
+			P90NS:  h.Percentile(90),
+			P99NS:  h.Percentile(99),
+			P999NS: h.Percentile(99.9),
+			MaxNS:  h.Max(),
+			MeanNS: h.Mean(),
+		})
+	}
+	return &Results{
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Plan:         plan,
+		DurationNS:   durationNS,
+		OpsCompleted: rec.TotalOps(),
+		BytesMoved:   rec.Bytes,
+		Errors:       rec.Errors,
+		PerOpStats:   stats,
+	}
+}
+
+// WriteJSON writes r as indented JSON to w.
+func WriteJSON(w io.Writer, r *Results) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(r)
+}
+
+// PerOpMap returns a map from op type string to PerOpStats for quick lookup.
+func (r *Results) PerOpMap() map[string]PerOpStats {
+	m := make(map[string]PerOpStats, len(r.PerOpStats))
+	for _, s := range r.PerOpStats {
+		m[s.OpType] = s
+	}
+	return m
+}
+
+// AllOpKinds enumerates all op kinds present in a trace's op list. Used by
+// callers that need to know which per-op-type histograms should be non-empty.
+func AllOpKinds(ops []trace.Op) map[trace.OpKind]struct{} {
+	m := make(map[trace.OpKind]struct{})
+	for _, op := range ops {
+		m[op.Op] = struct{}{}
+	}
+	return m
+}
