@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 
+	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/engine/localfile"
 	"github.com/chanuollala/ioflux/pkg/engine/mem"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
@@ -14,20 +16,21 @@ import (
 )
 
 const runUsage = `Usage:
-  ioflux run --trace trace.ioflux --engine mem [flags] -o results.json
+  ioflux run --trace trace.ioflux --engine mem|local [flags] -o results.json
 
 Replay a trace against a storage engine and emit results.json.
 
 Flags:
   --trace <path>        Path to a .ioflux trace file (required)
-  --engine <name>       Storage engine: mem (default mem)
+  --engine <name>       Storage engine: mem | local (default mem)
   --mode <mode>         Replay mode: asap | timeline | scaled (default asap)
   --max-inflight <n>    Worker-global concurrent in-flight op cap (default 512)
   --speedup <f>         Timeline scaling factor for --mode scaled (default 1.0)
   -o <path>             Output path for results.json (required; use - for stdout)
 
 Engine notes:
-  mem   In-process zero-I/O engine. All data is held in memory; no disk I/O.
+  mem     In-process zero-I/O engine. All data is held in memory; no disk I/O.
+  local   Local filesystem engine using platform file APIs.
 
 Exit codes:
   0   replay completed; results.json written
@@ -50,7 +53,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		outPath     string
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
-	fs.StringVar(&engineName, "engine", "mem", "storage engine (mem)")
+	fs.StringVar(&engineName, "engine", "mem", "storage engine (mem | local)")
 	fs.StringVar(&mode, "mode", "asap", "replay mode: asap | timeline | scaled")
 	fs.IntVar(&maxInflight, "max-inflight", 512, "worker-global concurrent in-flight op cap")
 	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
@@ -67,10 +70,6 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	if outPath == "" {
 		fmt.Fprintln(stderr, "ioflux run: -o is required")
 		fmt.Fprint(stderr, runUsage)
-		return 2
-	}
-	if engineName != "mem" {
-		fmt.Fprintf(stderr, "ioflux run: unsupported engine %q (currently supported: mem)\n", engineName)
 		return 2
 	}
 	switch mode {
@@ -103,17 +102,11 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	}
 	hdr := r.Header()
 
-	// Build MemEngine with per-target sizes from the trace's target table.
-	sizeMap := make(map[string]int64, len(hdr.Targets))
-	for _, tgt := range hdr.Targets {
-		sizeMap[tgt.Name] = tgt.Size
+	eng, err := buildRunEngine(engineName, hdr)
+	if err != nil {
+		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+		return 2
 	}
-	eng := mem.New(mem.WithSizeFunc(func(name string) int64 {
-		if sz, ok := sizeMap[name]; ok && sz > 0 {
-			return sz
-		}
-		return 64 << 20
-	}))
 
 	plan := replay.Plan{
 		TracePath:     tracePath,
@@ -162,4 +155,24 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func buildRunEngine(name string, hdr trace.Header) (engine.Engine, error) {
+	switch name {
+	case "mem":
+		sizeMap := make(map[string]int64, len(hdr.Targets))
+		for _, tgt := range hdr.Targets {
+			sizeMap[tgt.Name] = tgt.Size
+		}
+		return mem.New(mem.WithSizeFunc(func(target string) int64 {
+			if sz, ok := sizeMap[target]; ok && sz > 0 {
+				return sz
+			}
+			return 64 << 20
+		})), nil
+	case "local":
+		return localfile.New(), nil
+	default:
+		return nil, fmt.Errorf("unsupported engine %q (currently supported: mem, local)", name)
+	}
 }

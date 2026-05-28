@@ -14,7 +14,7 @@ import (
 // Sentinel errors returned by Engine implementations.
 var (
 	// ErrUnsupported is returned when an operation is not supported by the
-	// engine (e.g., Put on a POSIX engine, Fsync on S3).
+	// engine (e.g., Put on a local-file engine, Fsync on S3).
 	ErrUnsupported = errors.New("engine: operation not supported by this backend")
 
 	// ErrNotFound is returned when the target or handle does not exist.
@@ -84,7 +84,7 @@ type ObjectInfo struct {
 type Engine interface {
 	Caps() Capabilities
 
-	// POSIX-style file operations.
+	// File operations.
 	Open(ctx context.Context, target string, mode Mode, flags OpenFlags) (Handle, error)
 	Read(ctx context.Context, h Handle, off, length int64, buf []byte) (int, error)
 	Write(ctx context.Context, h Handle, off int64, data []byte) (int, error)

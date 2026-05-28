@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/engine/localfile"
 	"github.com/chanuollala/ioflux/pkg/engine/mem"
 	"github.com/chanuollala/ioflux/pkg/gen/trainingread"
 	"github.com/chanuollala/ioflux/pkg/replay"
@@ -479,6 +482,83 @@ func TestRunRecordsEngineErrorsWithoutReturningFatalError(t *testing.T) {
 	}
 	if res.Errors != 1 {
 		t.Fatalf("Errors=%d, want 1", res.Errors)
+	}
+}
+
+// TestEndToEnd_LocalFile replays a small read trace against LocalFileEngine over a
+// pre-created temp file and verifies that all ops complete without error.
+func TestEndToEnd_LocalFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "shard.tar")
+
+	const fileSize = 128 * 1024 // 128 KiB
+	if err := os.WriteFile(target, make([]byte, fileSize), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	const readLen = int64(32 * 1024) // 4 reads x 32 KiB = 128 KiB
+	tgt0 := 0
+	h0 := int64(42)
+	hdr := trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets: []trace.TargetInfo{
+			{ID: 0, Name: target, Kind: trace.TargetFile, Size: fileSize},
+		},
+		Summary: trace.Summary{NumOps: 6, NumStreams: 1, TotalBytes: 4 * readLen},
+	}
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1000, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(int64(0)), Len: trace.Ptr(readLen)},
+		{T: 2000, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(readLen), Len: trace.Ptr(readLen)},
+		{T: 3000, OpID: trace.Ptr(int64(3)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(2 * readLen), Len: trace.Ptr(readLen)},
+		{T: 4000, OpID: trace.Ptr(int64(4)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(3 * readLen), Len: trace.Ptr(readLen)},
+		{T: 5000, OpID: trace.Ptr(int64(5)), S: 0, Op: trace.OpClose, H: &h0},
+	}
+
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("WriteHeader: %v", err)
+	}
+	for _, op := range ops {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatalf("WriteOp: %v", err)
+		}
+	}
+
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	eng := localfile.New()
+	plan := replay.Plan{
+		TracePath:   filepath.Join(dir, "test.ioflux"),
+		Engine:      eng,
+		EngineName:  "local",
+		Mode:        "asap",
+		MaxInflight: 64,
+	}
+	exec, err := replay.Prepare(plan, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.Errors != 0 {
+		t.Errorf("Errors=%d, want 0", res.Errors)
+	}
+	if res.OpsCompleted != hdr.Summary.NumOps {
+		t.Errorf("OpsCompleted=%d, want %d", res.OpsCompleted, hdr.Summary.NumOps)
+	}
+	if res.BytesMoved != 4*readLen {
+		t.Errorf("BytesMoved=%d, want %d", res.BytesMoved, 4*readLen)
 	}
 }
 

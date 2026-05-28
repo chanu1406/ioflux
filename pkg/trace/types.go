@@ -134,7 +134,7 @@ func (k OpKind) IsHandleOp() bool {
 	return false
 }
 
-// TargetKind classifies a target as a POSIX file path or an object-store key.
+// TargetKind classifies a target as a local file path or an object-store key.
 type TargetKind string
 
 const (
