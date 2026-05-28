@@ -24,7 +24,7 @@ Flags:
   --record-size-dist <d>    Record size distribution: lognormal (default lognormal)
   --epochs <n>              Number of passes over the dataset (default 1)
   --dataloader-workers <n>  Concurrent DataLoader worker streams (default 8)
-  --prefetch-depth <n>      Outstanding shards per worker (default 2; M0: documented only)
+  --prefetch-depth <n>      Outstanding shards per worker (accepted, not yet modeled)
   --shuffle=<bool>          Shuffle shard order each epoch (default true; use --shuffle=false to disable)
   --read-within-shard <s>   Access pattern within a shard: sequential|random (default sequential)
   --seed <n>                PRNG seed for reproducibility (default 42)

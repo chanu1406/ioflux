@@ -19,10 +19,12 @@ const runUsage = `Usage:
 Replay a trace against a storage engine and emit results.json.
 
 Flags:
-  --trace <path>    Path to a .ioflux trace file (required)
-  --engine <name>   Storage engine: mem (default mem; only mem in M0)
-  --mode <mode>     Replay mode: asap (default asap; only asap in M0)
-  -o <path>         Output path for results.json (required; use - for stdout)
+  --trace <path>        Path to a .ioflux trace file (required)
+  --engine <name>       Storage engine: mem (default mem)
+  --mode <mode>         Replay mode: asap | timeline | scaled (default asap)
+  --max-inflight <n>    Worker-global concurrent in-flight op cap (default 512)
+  --speedup <f>         Timeline scaling factor for --mode scaled (default 1.0)
+  -o <path>             Output path for results.json (required; use - for stdout)
 
 Engine notes:
   mem   In-process zero-I/O engine. All data is held in memory; no disk I/O.
@@ -40,14 +42,18 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() { fmt.Fprint(stderr, runUsage) }
 
 	var (
-		tracePath  string
-		engineName string
-		mode       string
-		outPath    string
+		tracePath   string
+		engineName  string
+		mode        string
+		maxInflight int
+		speedup     float64
+		outPath     string
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
 	fs.StringVar(&engineName, "engine", "mem", "storage engine (mem)")
-	fs.StringVar(&mode, "mode", "asap", "replay mode (asap)")
+	fs.StringVar(&mode, "mode", "asap", "replay mode: asap | timeline | scaled")
+	fs.IntVar(&maxInflight, "max-inflight", 512, "worker-global concurrent in-flight op cap")
+	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
 	fs.StringVar(&outPath, "o", "", "output path for results.json (required; - for stdout)")
 
 	if err := fs.Parse(args); err != nil {
@@ -64,11 +70,21 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if engineName != "mem" {
-		fmt.Fprintf(stderr, "ioflux run: unsupported engine %q (only mem in M0)\n", engineName)
+		fmt.Fprintf(stderr, "ioflux run: unsupported engine %q (currently supported: mem)\n", engineName)
 		return 2
 	}
-	if mode != "asap" {
-		fmt.Fprintf(stderr, "ioflux run: unsupported mode %q (only asap in M0)\n", mode)
+	switch mode {
+	case "asap", "timeline", "scaled":
+	default:
+		fmt.Fprintf(stderr, "ioflux run: unsupported mode %q (want asap | timeline | scaled)\n", mode)
+		return 2
+	}
+	if maxInflight <= 0 {
+		fmt.Fprintf(stderr, "ioflux run: --max-inflight must be > 0, got %d\n", maxInflight)
+		return 2
+	}
+	if mode == "scaled" && speedup <= 0 {
+		fmt.Fprintf(stderr, "ioflux run: --speedup must be > 0 for --mode scaled, got %v\n", speedup)
 		return 2
 	}
 
@@ -100,10 +116,12 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	}))
 
 	plan := replay.Plan{
-		TracePath:  tracePath,
-		Engine:     eng,
-		EngineName: engineName,
-		Mode:       mode,
+		TracePath:     tracePath,
+		Engine:        eng,
+		EngineName:    engineName,
+		Mode:          mode,
+		MaxInflight:   maxInflight,
+		SpeedupFactor: speedup,
 	}
 	exec, err := replay.Prepare(plan, r)
 	if err != nil {

@@ -13,13 +13,15 @@ import (
 
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
-	TracePath  string `json:"trace_path"`
-	Engine     string `json:"engine"`
-	Mode       string `json:"mode"`
-	TraceKind  string `json:"trace_kind"`
-	NumStreams int    `json:"num_streams"`
-	NumOps     int64  `json:"num_ops"`
-	TotalBytes int64  `json:"total_bytes"`
+	TracePath     string  `json:"trace_path"`
+	Engine        string  `json:"engine"`
+	Mode          string  `json:"mode"`
+	MaxInflight   int     `json:"max_inflight"`
+	SpeedupFactor float64 `json:"speedup_factor,omitempty"`
+	TraceKind     string  `json:"trace_kind"`
+	NumStreams    int     `json:"num_streams"`
+	NumOps        int64   `json:"num_ops"`
+	TotalBytes    int64   `json:"total_bytes"`
 }
 
 // PerOpStats holds latency percentiles and counters for one op type.
@@ -34,15 +36,29 @@ type PerOpStats struct {
 	MeanNS float64 `json:"mean_ns"`
 }
 
+// DriftStats summarizes schedule drift (actualIssue − intendedArrival) for a
+// run. Zero values indicate the field was not measured (e.g., asap mode).
+type DriftStats struct {
+	P99NS  int64   `json:"p99_ns"`
+	P999NS int64   `json:"p999_ns"`
+	MaxNS  int64   `json:"max_ns"`
+	MeanNS float64 `json:"mean_ns"`
+}
+
 // Results is the full output of a replay run written to results.json.
 type Results struct {
-	GeneratedAt  string       `json:"generated_at"`
-	Plan         PlanInfo     `json:"plan"`
-	DurationNS   int64        `json:"duration_ns"`
-	OpsCompleted int64        `json:"ops_completed"`
-	BytesMoved   int64        `json:"bytes_moved"`
-	Errors       int64        `json:"errors"`
-	PerOpStats   []PerOpStats `json:"per_op_stats"`
+	GeneratedAt      string       `json:"generated_at"`
+	Plan             PlanInfo     `json:"plan"`
+	DurationNS       int64        `json:"duration_ns"`
+	OpsCompleted     int64        `json:"ops_completed"`
+	BytesMoved       int64        `json:"bytes_moved"`
+	Errors           int64        `json:"errors"`
+	PerOpStats       []PerOpStats `json:"per_op_stats"`
+	BacklogEvents    int64        `json:"backlog_events"`
+	BacklogBlockedNS int64        `json:"backlog_blocked_ns"`
+	// MaxInflightDepth is the peak concurrent in-flight op count.
+	MaxInflightDepth int64      `json:"max_backlog_depth"`
+	ScheduleDrift    DriftStats `json:"schedule_drift"`
 }
 
 // Build constructs a Results from a merged Recorder, a plan, and the measured
@@ -66,15 +82,27 @@ func Build(plan PlanInfo, rec *metrics.Recorder, durationNS int64) *Results {
 			MeanNS: h.Mean(),
 		})
 	}
-	return &Results{
-		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
-		Plan:         plan,
-		DurationNS:   durationNS,
-		OpsCompleted: rec.TotalOps(),
-		BytesMoved:   rec.Bytes,
-		Errors:       rec.Errors,
-		PerOpStats:   stats,
+	r := &Results{
+		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+		Plan:             plan,
+		DurationNS:       durationNS,
+		OpsCompleted:     rec.TotalOps(),
+		BytesMoved:       rec.Bytes,
+		Errors:           rec.Errors,
+		PerOpStats:       stats,
+		BacklogEvents:    rec.BacklogEvents,
+		BacklogBlockedNS: rec.BacklogBlockedNS,
+		MaxInflightDepth: rec.MaxInflightDepth,
 	}
+	if dh := rec.DriftHist; dh != nil {
+		r.ScheduleDrift = DriftStats{
+			P99NS:  dh.Percentile(99),
+			P999NS: dh.Percentile(99.9),
+			MaxNS:  dh.Max(),
+			MeanNS: dh.Mean(),
+		}
+	}
+	return r
 }
 
 // WriteJSON writes r as indented JSON to w.

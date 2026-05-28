@@ -152,9 +152,7 @@ func TestWriteGrowsObject(t *testing.T) {
 	}
 }
 
-// TestFsyncUnsupported verifies that Fsync returns ErrUnsupported, consistent
-// with Caps().Durable == false. The replay executor must reject traces with
-// FSYNC ops at PREPARE time via the Caps check and must never reach Fsync.
+// TestFsyncUnsupported verifies that Fsync returns ErrUnsupported.
 func TestFsyncUnsupported(t *testing.T) {
 	e := mem.New(mem.WithFixedSize(64))
 	h, _ := e.Open(ctx, "obj", engine.ModeWrite, 0)

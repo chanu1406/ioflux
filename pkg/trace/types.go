@@ -11,10 +11,10 @@ package trace
 
 import "strings"
 
-// TraceFormatVersion is the only ioflux_trace_version value accepted by v1.
+// TraceFormatVersion is the supported ioflux_trace_version.
 const TraceFormatVersion = 1
 
-// TimeUnitNanoseconds is the only time_unit value accepted by v1.
+// TimeUnitNanoseconds is the supported time_unit.
 const TimeUnitNanoseconds = "ns"
 
 // TraceKind distinguishes how a trace was produced. Consumers use this to keep
@@ -163,7 +163,7 @@ type TargetInfo struct {
 // Summary records aggregate trace statistics. Populated by the producer
 // (generator or capture tool) and treated as advisory metadata by the
 // validator. NumGroups is 0 for traces that use only the implicit default
-// group (the v1 synthetic case).
+// group.
 type Summary struct {
 	NumOps     int64 `json:"num_ops"`
 	NumStreams int   `json:"num_streams"`

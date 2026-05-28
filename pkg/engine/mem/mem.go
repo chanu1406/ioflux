@@ -17,18 +17,21 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
 // MemEngine is an in-process storage engine backed by byte slices.
 // It is safe for concurrent use by multiple goroutines.
 type MemEngine struct {
-	mu      sync.Mutex
-	objects map[string]*memObject
-	handles map[engine.Handle]*openHandle
-	nextH   atomic.Int64
-	sizeOf  func(target string) int64
+	mu        sync.Mutex
+	objects   map[string]*memObject
+	handles   map[engine.Handle]*openHandle
+	nextH     atomic.Int64
+	sizeOf    func(target string) int64
+	delayFunc func(trace.OpKind) time.Duration
 }
 
 type memObject struct {
@@ -61,8 +64,19 @@ func WithSizeFunc(f func(target string) int64) Option {
 	return func(e *MemEngine) { e.sizeOf = f }
 }
 
-// TODO(M2): add WithInjectedDelay(d time.Duration) option so the coordinated-
-// omission test can make the engine artificially slow.
+// WithInjectedDelay makes every op sleep for d before executing. Use this in
+// coordinated-omission and backlog tests to make the engine artificially slow.
+func WithInjectedDelay(d time.Duration) Option {
+	return WithInjectedDelayFunc(func(_ trace.OpKind) time.Duration { return d })
+}
+
+// WithInjectedDelayFunc makes each op sleep for the duration returned by f for
+// that op's kind. f returning 0 or negative skips the sleep for that op.
+// This lets tests slow only specific op types (e.g., READ) while keeping
+// OPEN/CLOSE instant.
+func WithInjectedDelayFunc(f func(trace.OpKind) time.Duration) Option {
+	return func(e *MemEngine) { e.delayFunc = f }
+}
 
 // New returns a new MemEngine. Without options, new objects are 64 MiB.
 func New(opts ...Option) *MemEngine {
@@ -90,6 +104,7 @@ func (e *MemEngine) Caps() engine.Capabilities {
 // Open opens target for the given mode. If target does not yet exist, it is
 // created with zeroed content sized by the engine's size function.
 func (e *MemEngine) Open(_ context.Context, target string, mode engine.Mode, _ engine.OpenFlags) (engine.Handle, error) {
+	e.delay(trace.OpOpen)
 	defer runtime.Gosched()
 
 	e.mu.Lock()
@@ -108,6 +123,7 @@ func (e *MemEngine) Open(_ context.Context, target string, mode engine.Mode, _ e
 // Read copies length bytes starting at off from h's object into buf.
 // Returns ErrShortRead if fewer bytes are available than requested.
 func (e *MemEngine) Read(_ context.Context, h engine.Handle, off, length int64, buf []byte) (int, error) {
+	e.delay(trace.OpRead)
 	defer runtime.Gosched()
 
 	if off < 0 {
@@ -143,6 +159,7 @@ func (e *MemEngine) Read(_ context.Context, h engine.Handle, off, length int64, 
 // Write writes data into h's object starting at off. If the write extends
 // beyond the current object size, the object is grown to fit.
 func (e *MemEngine) Write(_ context.Context, h engine.Handle, off int64, data []byte) (int, error) {
+	e.delay(trace.OpWrite)
 	defer runtime.Gosched()
 
 	if off < 0 {
@@ -167,16 +184,16 @@ func (e *MemEngine) Write(_ context.Context, h engine.Handle, off int64, data []
 	return len(data), nil
 }
 
-// Fsync is not supported by MemEngine (Caps().Durable == false). Any trace
-// with FSYNC ops must be rejected by the executor at PREPARE time via the
-// Caps check, before Fsync is ever called.
+// Fsync is not supported by MemEngine.
 func (e *MemEngine) Fsync(_ context.Context, _ engine.Handle) error {
+	e.delay(trace.OpFsync)
 	defer runtime.Gosched()
 	return engine.ErrUnsupported
 }
 
 // Close releases the handle. The underlying object is retained in memory.
 func (e *MemEngine) Close(_ context.Context, h engine.Handle) error {
+	e.delay(trace.OpClose)
 	defer runtime.Gosched()
 
 	e.mu.Lock()
@@ -192,6 +209,7 @@ func (e *MemEngine) Close(_ context.Context, h engine.Handle) error {
 // Stat returns metadata for target. If target does not exist, it is created
 // (same lazy-creation semantics as Open).
 func (e *MemEngine) Stat(_ context.Context, target string) (engine.ObjectInfo, error) {
+	e.delay(trace.OpStat)
 	defer runtime.Gosched()
 
 	e.mu.Lock()
@@ -215,23 +233,38 @@ func (e *MemEngine) Stat(_ context.Context, target string) (engine.ObjectInfo, e
 // immediately.
 
 func (e *MemEngine) Put(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	e.delay(trace.OpPut)
 	defer runtime.Gosched()
 	return engine.ErrUnsupported
 }
 
 func (e *MemEngine) Get(_ context.Context, _ string, _, _ int64, _ []byte) (int, error) {
+	e.delay(trace.OpGet)
 	defer runtime.Gosched()
 	return 0, engine.ErrUnsupported
 }
 
 func (e *MemEngine) Head(_ context.Context, _ string) (engine.ObjectInfo, error) {
+	e.delay(trace.OpHead)
 	defer runtime.Gosched()
 	return engine.ObjectInfo{}, engine.ErrUnsupported
 }
 
 func (e *MemEngine) Delete(_ context.Context, _ string) error {
+	e.delay(trace.OpDelete)
 	defer runtime.Gosched()
 	return engine.ErrUnsupported
+}
+
+// delay sleeps for the configured duration for the given op kind. No-op when
+// no delay function is configured or when the function returns ≤ 0.
+func (e *MemEngine) delay(op trace.OpKind) {
+	if e.delayFunc == nil {
+		return
+	}
+	if d := e.delayFunc(op); d > 0 {
+		time.Sleep(d)
+	}
 }
 
 // lookupHandle returns the openHandle for h, holding the engine lock only

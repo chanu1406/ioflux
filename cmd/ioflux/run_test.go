@@ -91,6 +91,68 @@ func TestRunCmd_PrepareRejectsMalformedTrace(t *testing.T) {
 	}
 }
 
+func TestRunCmd_TimelineFlagsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--mode", "timeline",
+		"--max-inflight", "64",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("--mode timeline exit=%d want 0; stderr=%s", code, stderr)
+	}
+
+	code, _, stderr = runRunCLI([]string{
+		"--trace", tracePath,
+		"--mode", "scaled",
+		"--speedup", "2.0",
+		"--max-inflight", "32",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("--mode scaled exit=%d want 0; stderr=%s", code, stderr)
+	}
+
+	code, _, stderr = runRunCLI([]string{
+		"--trace", tracePath,
+		"--mode", "nonsense",
+		"-o", resultsPath,
+	})
+	if code != 2 {
+		t.Fatalf("--mode nonsense exit=%d want 2; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "unsupported mode") {
+		t.Fatalf("stderr should report unsupported mode, got %q", stderr)
+	}
+
+	code, _, stderr = runRunCLI([]string{
+		"--trace", tracePath,
+		"--max-inflight", "0",
+		"-o", resultsPath,
+	})
+	if code != 2 {
+		t.Fatalf("--max-inflight 0 exit=%d want 2; stderr=%s", code, stderr)
+	}
+}
+
 func TestRunUsageExitCodeDocsMentionOpErrors(t *testing.T) {
 	if !strings.Contains(runUsage, "completed with op errors") {
 		t.Fatalf("runUsage should document op-error exit semantics, got:\n%s", runUsage)

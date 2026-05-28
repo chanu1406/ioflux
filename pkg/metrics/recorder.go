@@ -14,6 +14,19 @@ type Recorder struct {
 	counts map[trace.OpKind]int64
 	Bytes  int64
 	Errors int64
+
+	// BacklogEvents is the number of times an op had to wait for a semaphore
+	// slot because the worker-level MaxInflight cap was reached.
+	BacklogEvents int64
+	// BacklogBlockedNS is the total nanoseconds spent waiting for a semaphore
+	// slot across all backlog events.
+	BacklogBlockedNS int64
+	// MaxInflightDepth is the peak number of concurrent in-flight ops observed
+	// across all streams during the run.
+	MaxInflightDepth int64
+	// DriftHist records per-op schedule drift: actualIssue − intendedArrival.
+	// Nil when no drift was recorded (e.g., asap mode with no backlog).
+	DriftHist *Histogram
 }
 
 // NewRecorder returns an empty Recorder.
@@ -22,6 +35,25 @@ func NewRecorder() *Recorder {
 		hists:  make(map[trace.OpKind]*Histogram),
 		counts: make(map[trace.OpKind]int64),
 	}
+}
+
+// RecordDrift records one schedule-drift sample in nanoseconds. driftNS is
+// the gap between actualIssue and intendedArrival for one op (clamped to ≥0
+// by the caller). Must not be called concurrently.
+func (r *Recorder) RecordDrift(driftNS int64) {
+	if r.DriftHist == nil {
+		r.DriftHist = New()
+	}
+	r.DriftHist.RecordValue(driftNS)
+}
+
+// DriftP99 returns the p99 schedule drift in nanoseconds, or 0 if no drift
+// has been recorded.
+func (r *Recorder) DriftP99() int64 {
+	if r.DriftHist == nil {
+		return 0
+	}
+	return r.DriftHist.Percentile(99)
 }
 
 // Record records one op completion. latencyNS is the op's wall-clock duration;
@@ -55,6 +87,17 @@ func (r *Recorder) Merge(other *Recorder) {
 	}
 	r.Bytes += other.Bytes
 	r.Errors += other.Errors
+	r.BacklogEvents += other.BacklogEvents
+	r.BacklogBlockedNS += other.BacklogBlockedNS
+	if other.MaxInflightDepth > r.MaxInflightDepth {
+		r.MaxInflightDepth = other.MaxInflightDepth
+	}
+	if other.DriftHist != nil {
+		if r.DriftHist == nil {
+			r.DriftHist = New()
+		}
+		r.DriftHist.Merge(other.DriftHist)
+	}
 }
 
 // Histogram returns the Histogram for kind, or nil if no ops of that kind were

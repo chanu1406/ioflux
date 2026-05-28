@@ -31,8 +31,7 @@ func (h *Histogram) RecordValue(ns int64) {
 	_ = h.h.RecordValue(ns)
 }
 
-// Merge adds all samples from other into h. This is the lossless merge
-// operation required by §8.5 for correct distributed percentile aggregation.
+// Merge adds all samples from other into h without losing histogram precision.
 func (h *Histogram) Merge(other *Histogram) {
 	h.h.Merge(other.h)
 }

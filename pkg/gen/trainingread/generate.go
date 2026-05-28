@@ -1,17 +1,13 @@
-// Package trainingread generates synthetic .ioflux traces for the
-// training-read workload profile (PRD §8.2).
+// Package trainingread generates synthetic training-read traces.
 //
 // The generated trace models a sharded WebDataset-style read workload: N shard
 // files partitioned across W DataLoader worker streams, each reading one shard
 // at a time (OPEN → READ* → CLOSE) for E epochs. All streams are strictly
-// sequential (no group tags), consistent with v1 synthetic generation rules.
+// sequential and do not use group tags.
 //
-// M0 timing model: each op advances the owning stream's logical clock by
-// opDeltaNS (1 ms). This produces a uniform, reproducible timeline. Streams
-// run logically concurrently (all start at t=0), so ops are merge-sorted by
-// (t, stream, local position) before writing to satisfy the trace format's
-// global non-decreasing timestamp invariant. Realistic prefetch-depth-aware
-// timing lands with timeline mode in M1/M2.
+// Each op advances the owning stream's logical clock by opDeltaNS. Streams
+// start at t=0 and are merge-sorted before writing so timestamps remain
+// globally non-decreasing.
 package trainingread
 
 import (
@@ -23,16 +19,16 @@ import (
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
-// Params configures the training-read generator. All fields map to the PRD
-// §8.2 parameter table. Zero values are not meaningful; use DefaultParams.
+// Params configures the training-read generator. Use DefaultParams for a valid
+// starting point.
 type Params struct {
 	Shards            int
 	ShardSize         int64  // bytes per shard
 	RecordSize        int64  // mean record size in bytes (lognormal centre)
-	RecordSizeDist    string // only "lognormal" in v1
+	RecordSizeDist    string // only "lognormal" is supported
 	Epochs            int
 	DataloaderWorkers int
-	PrefetchDepth     int    // documented in PRD; unused in M0 timing model
+	PrefetchDepth     int    // accepted for CLI compatibility
 	Shuffle           bool   // shuffle shard order each epoch
 	ReadWithinShard   string // "sequential" | "random"
 	Seed              int64
@@ -43,7 +39,7 @@ type Params struct {
 	CreatedUTC string
 }
 
-// DefaultParams returns the PRD §8.2 default values.
+// DefaultParams returns the training-read defaults.
 func DefaultParams() Params {
 	return Params{
 		Shards:            1024,
@@ -59,9 +55,7 @@ func DefaultParams() Params {
 	}
 }
 
-// opDeltaNS is the per-op clock advance for the M0 timing model.
-// Each op — OPEN, READ, CLOSE — advances its stream's logical clock by this
-// amount (1 ms), giving a uniform, reproducible timeline.
+// opDeltaNS is the per-op logical clock advance.
 const opDeltaNS int64 = 1_000_000 // 1 ms
 
 // streamOp holds an op alongside the metadata needed to merge-sort streams
@@ -311,7 +305,7 @@ func ValidateParams(p Params) error {
 	case p.RecordSize > p.ShardSize:
 		return fmt.Errorf("gen: record-size %d exceeds shard-size %d", p.RecordSize, p.ShardSize)
 	case p.RecordSizeDist != "lognormal":
-		return fmt.Errorf("gen: record-size-dist %q not supported (only lognormal in v1)", p.RecordSizeDist)
+		return fmt.Errorf("gen: record-size-dist %q not supported (only lognormal is supported)", p.RecordSizeDist)
 	case p.Epochs <= 0:
 		return fmt.Errorf("gen: epochs must be > 0, got %d", p.Epochs)
 	case p.DataloaderWorkers <= 0:

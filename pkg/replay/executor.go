@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
 	"github.com/chanuollala/ioflux/pkg/results"
@@ -23,7 +24,12 @@ type Plan struct {
 	TracePath  string
 	Engine     engine.Engine
 	EngineName string
-	Mode       string // "asap" only in M0; flag exists so M1 can add "timeline"
+	// Mode is "asap", "timeline", or "scaled".
+	Mode string
+	// MaxInflight is the worker-level in-flight cap (0 → default 512).
+	MaxInflight int
+	// SpeedupFactor scales trace timestamps in "scaled" mode (0 → 1×).
+	SpeedupFactor float64
 }
 
 // Executor holds the loaded, validated plan ready for execution.
@@ -65,6 +71,9 @@ func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
 	caps := plan.Engine.Caps()
 	for _, ops := range byStream {
 		for _, op := range ops {
+			if op.Group != nil {
+				return nil, fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
+			}
 			if err := checkOpCaps(op, caps); err != nil {
 				return nil, fmt.Errorf("replay: prepare: %w", err)
 			}
@@ -120,20 +129,31 @@ func checkOpCaps(op trace.Op, caps engine.Capabilities) error {
 // Header returns the trace header parsed during Prepare.
 func (e *Executor) Header() trace.Header { return e.hdr }
 
-// Run executes the replay and returns Results. Only "asap" mode is supported
-// in M0; the mode field exists so the CLI surface is stable for M1.
+// Run executes the replay and returns Results. Supported modes: "asap",
+// "timeline", "scaled".
 func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
-	if e.plan.Mode != "asap" {
-		return nil, fmt.Errorf("replay: unsupported mode %q (only asap in M0)", e.plan.Mode)
+	switch e.plan.Mode {
+	case "asap", "timeline", "scaled":
+	default:
+		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
 	}
 	planInfo := results.PlanInfo{
-		TracePath:  e.plan.TracePath,
-		Engine:     e.plan.EngineName,
-		Mode:       e.plan.Mode,
-		TraceKind:  string(e.hdr.Kind),
-		NumStreams: e.hdr.Summary.NumStreams,
-		NumOps:     e.hdr.Summary.NumOps,
-		TotalBytes: e.hdr.Summary.TotalBytes,
+		TracePath:     e.plan.TracePath,
+		Engine:        e.plan.EngineName,
+		Mode:          e.plan.Mode,
+		MaxInflight:   e.plan.MaxInflight,
+		SpeedupFactor: e.plan.SpeedupFactor,
+		TraceKind:     string(e.hdr.Kind),
+		NumStreams:    e.hdr.Summary.NumStreams,
+		NumOps:        e.hdr.Summary.NumOps,
+		TotalBytes:    e.hdr.Summary.TotalBytes,
 	}
-	return runASAP(ctx, e.byStream, e.plan.Engine, e.hdr, planInfo)
+	opts := SchedulerOpts{
+		Mode:          e.plan.Mode,
+		MaxInflight:   e.plan.MaxInflight,
+		SpeedupFactor: e.plan.SpeedupFactor,
+		RunStart:      time.Now(),
+		PlanInfo:      planInfo,
+	}
+	return schedule(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }

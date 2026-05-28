@@ -10,7 +10,6 @@ import (
 
 // TestMergeMatchesUnion verifies the lossless-merge property: percentiles of
 // merge(hist(A), hist(B)) must equal percentiles of hist(A ∪ B).
-// This is the §8.5 / §9 correctness requirement for distributed aggregation.
 func TestMergeMatchesUnion(t *testing.T) {
 	rng := rand.New(rand.NewPCG(42, 0))
 
