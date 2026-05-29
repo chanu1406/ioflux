@@ -66,6 +66,8 @@ type Capabilities struct {
 	Durable      bool // Fsync is meaningful; if false, Fsync returns ErrUnsupported
 	ObjectAPI    bool // Put/Get/Head/Delete
 	Multipart    bool // multipart/chunked object writes (S3 multipart)
+	OSPageCache  bool // backend reads/writes go through the host OS page cache
+	// (true for local-FS engines, false for in-process or remote-object engines)
 }
 
 // ObjectInfo is returned by Stat and Head.

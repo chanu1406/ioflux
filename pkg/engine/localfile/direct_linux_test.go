@@ -22,11 +22,10 @@ import (
 // block size (typically 512 bytes; sometimes 4096 on newer hardware). The
 // scheduler's growBuf helper allocates plain Go slices that are not guaranteed
 // to be block-aligned, so actual Read/Write calls with O_DIRECT may return
-// EINVAL on unaligned buffers. For M1 synthetic traces (record sizes >= 4 KiB,
-// sequential reads from offset 0), alignment is incidental but not enforced.
-// When replaying captured traces with arbitrary offsets, aligned-buffer
-// allocation must be added. This is deferred to the phase when captured traces
-// are first exercised (M3/M4).
+// EINVAL on unaligned buffers. Current synthetic traces use record sizes >= 4
+// KiB and sequential reads from offset 0, so alignment is incidental but not
+// enforced. Captured traces with arbitrary offsets will need aligned-buffer
+// allocation before direct I/O can be reliable.
 func TestDirectFlagPlatform(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "direct.dat")

@@ -31,6 +31,9 @@ type SchedulerOpts struct {
 
 	// PlanInfo is echoed into the returned Results.
 	PlanInfo results.PlanInfo
+
+	// RunEnv records cache-state metadata applied before the run.
+	RunEnv results.RunEnv
 }
 
 // schedule runs all streams with strict per-stream ordering, intended-arrival
@@ -165,7 +168,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	merged.BacklogBlockedNS = backlogBlockedNS.Load()
 	merged.MaxInflightDepth = maxInflightDepth.Load()
 
-	res := results.Build(opts.PlanInfo, merged, durationNS)
+	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, durationNS)
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}

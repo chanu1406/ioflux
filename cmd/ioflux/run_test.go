@@ -193,6 +193,82 @@ func TestRunCmd_TimelineFlagsAccepted(t *testing.T) {
 	}
 }
 
+func TestRunCmd_UnmappedTargetRejected(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	// Generate a small trace; targets will be bare names like "shard_0000.tar".
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	// Target map that only matches "/mnt/" prefix — will miss the bare names.
+	if err := os.WriteFile(mapPath, []byte("target_rewrite:\n  - from: \"/mnt/\"\n    to: \"/tmp/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--target-map", mapPath,
+		"-o", resultsPath,
+	})
+	if code != 1 {
+		t.Fatalf("exit=%d want 1 (unmatched target); stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "matched no rule") {
+		t.Fatalf("stderr should mention unmatched rule, got %q", stderr)
+	}
+}
+
+func TestRunMetadataRecordsCacheState(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--cache-mode", "warm",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stderr=%s", code, stderr)
+	}
+
+	got, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(got, []byte(`"cache_mode": "warm"`)) {
+		t.Errorf("results.json should contain cache_mode=warm, got:\n%s", got)
+	}
+}
+
 func TestRunUsageExitCodeDocsMentionOpErrors(t *testing.T) {
 	if !strings.Contains(runUsage, "completed with op errors") {
 		t.Fatalf("runUsage should document op-error exit semantics, got:\n%s", runUsage)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -54,6 +55,7 @@ func (e *LocalFileEngine) Caps() engine.Capabilities {
 		Durable:      true,
 		ObjectAPI:    false,
 		Multipart:    false,
+		OSPageCache:  true,
 	}
 }
 
@@ -75,6 +77,14 @@ func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mod
 	}
 	if flags&engine.OpenFlagDirect != 0 && e.allowDirect && canDirect {
 		oflags |= openDirectFlag
+	}
+
+	if flags&engine.OpenFlagCreate != 0 {
+		if dir := filepath.Dir(target); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return 0, fmt.Errorf("localfile: mkdir %s: %w", dir, err)
+			}
+		}
 	}
 
 	f, err := os.OpenFile(target, oflags, 0o644)

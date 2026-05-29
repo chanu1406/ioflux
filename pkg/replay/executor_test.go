@@ -16,6 +16,7 @@ import (
 	"github.com/chanuollala/ioflux/pkg/engine/mem"
 	"github.com/chanuollala/ioflux/pkg/gen/trainingread"
 	"github.com/chanuollala/ioflux/pkg/replay"
+	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
@@ -482,6 +483,273 @@ func TestRunRecordsEngineErrorsWithoutReturningFatalError(t *testing.T) {
 	}
 	if res.Errors != 1 {
 		t.Fatalf("Errors=%d, want 1", res.Errors)
+	}
+}
+
+// TestExplicitGroupZeroAllowed verifies that ops with "group":0 (nil vs explicit
+// zero both mean the default group) pass Prepare. Only truly non-zero groups
+// should be rejected.
+func TestExplicitGroupZeroAllowed(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	group0 := int64(0)
+	group1 := int64(1)
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Group: &group0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Group: &group0, Op: trace.OpClose, H: &h0},
+	}
+	err := prepareOps(t, basicHeader(int64(len(ops))), ops, newCapsEngine(engine.Capabilities{Seekable: true}))
+	if err != nil {
+		t.Fatalf("Prepare rejected explicit group=0: %v", err)
+	}
+
+	// Explicit group=1 must still be rejected.
+	ops2 := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Group: &group1, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+	}
+	err = prepareOps(t, basicHeader(int64(len(ops2))), ops2, newCapsEngine(engine.Capabilities{Seekable: true}))
+	if err == nil {
+		t.Fatal("Prepare should reject non-zero group")
+	}
+	if !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("error=%v, want 'not supported'", err)
+	}
+}
+
+// TestWarmCacheSetsPrepareTouchedSameData verifies that running with
+// CacheMode="warm" sets PrepareTouchedSameData in results even when no
+// PrepareMode is configured.
+func TestWarmCacheSetsPrepareTouchedSameData(t *testing.T) {
+	buf := smallTrace(t, 1, 2)
+	r, err := trace.NewReader(buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	hdr := r.Header()
+	eng := memEngineForTrace(hdr)
+
+	plan := replay.Plan{
+		Engine:     eng,
+		EngineName: "mem",
+		Mode:       "asap",
+		CacheMode:  "warm",
+	}
+	exec, err := replay.Prepare(plan, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Plan.PrepareTouchedSameData {
+		t.Error("PrepareTouchedSameData should be true when CacheMode=warm")
+	}
+}
+
+// TestPrepareIONotRecorded verifies that dataset preparation ops are excluded from
+// Results.OpsCompleted and Results.BytesMoved — only replay ops are counted.
+func TestPrepareIONotRecorded(t *testing.T) {
+	hdr := basicHeader(3)
+	h0 := int64(42)
+	tgt0 := 0
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(int64(0)), Len: trace.Ptr(int64(1024))},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpClose, H: &h0},
+	}
+
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	eng := memEngineForTrace(r.Header())
+
+	plan := replay.Plan{
+		Engine:      eng,
+		EngineName:  "mem",
+		Mode:        "asap",
+		PrepareMode: "materialize-synthetic",
+	}
+	exec, err := replay.Prepare(plan, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// OpsCompleted must equal the trace's op count (3), not 3 + prep ops.
+	if res.OpsCompleted != int64(len(ops)) {
+		t.Errorf("OpsCompleted=%d, want %d (trace ops only, not prep ops)", res.OpsCompleted, len(ops))
+	}
+	if res.Errors != 0 {
+		t.Errorf("Errors=%d, want 0", res.Errors)
+	}
+}
+
+// TestPrepareRejectsOffsetWriteAgainstObjectEngine verifies that a trace with
+// offset WRITE ops is rejected at PREPARE when the target map rewrites targets
+// to an object engine reporting PartialWrite=false. File-shaped reads against
+// object backends are supported (per plan: Open(key) + Range Read), so the
+// check here is strictly about partial-write semantics.
+func TestPrepareRejectsOffsetWriteAgainstObjectEngine(t *testing.T) {
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	tgt0 := 0
+	h0 := int64(1)
+	hdr := trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "shard_0.tar", Kind: trace.TargetFile, Size: 4096}},
+		Summary:       trace.Summary{NumOps: 2, NumStreams: 1},
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeReadWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(512)), Len: trace.Ptr(int64(512))},
+	} {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	// Object-only engine: Seekable for range GETs, PartialWrite=false.
+	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
+	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
+	plan := replay.Plan{
+		Engine:     objectEng,
+		EngineName: "s3",
+		Bucket:     "bench",
+		Mode:       "asap",
+		TargetMap:  tm,
+	}
+	_, err = replay.Prepare(plan, r)
+	if err == nil {
+		t.Fatal("Prepare should reject offset WRITE against object engine (PartialWrite=false)")
+	}
+	if !strings.Contains(err.Error(), "PartialWrite=false") {
+		t.Errorf("Prepare error=%v, want PartialWrite=false rejection", err)
+	}
+}
+
+// TestPrepareAcceptsFileShapedReadsOnObjectMappedTargets verifies that a trace
+// with OPEN+READ+CLOSE against targets rewritten to s3:// passes Prepare on
+// engines reporting Seekable+ObjectAPI (matching S3Engine caps). Per the M1
+// plan, S3 supports file-shaped reads via Open(key) + Range Read.
+func TestPrepareAcceptsFileShapedReadsOnObjectMappedTargets(t *testing.T) {
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	tgt0 := 0
+	h0 := int64(1)
+	hdr := trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "shard_0.tar", Kind: trace.TargetFile, Size: 4096}},
+		Summary:       trace.Summary{NumOps: 3, NumStreams: 1},
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpRead, H: &h0, Off: trace.Ptr(int64(0)), Len: trace.Ptr(int64(1024))},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpClose, H: &h0},
+	} {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	// S3Engine caps: Seekable=true (for Range GET), PartialWrite=false, ObjectAPI=true.
+	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
+	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
+	plan := replay.Plan{
+		Engine:     objectEng,
+		EngineName: "s3",
+		Bucket:     "bench",
+		Mode:       "asap",
+		TargetMap:  tm,
+	}
+	if _, err := replay.Prepare(plan, r); err != nil {
+		t.Fatalf("Prepare should accept file-shaped reads on object-mapped targets; got: %v", err)
+	}
+}
+
+// TestWarmCacheFailureDoesNotSetTouchedSameData verifies the honesty bit:
+// when warm priming yields zero successful reads, PrepareTouchedSameData stays
+// false even though CacheMode="warm" was requested.
+func TestWarmCacheFailureDoesNotSetTouchedSameData(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpClose, H: &h0},
+	}
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(basicHeader(int64(len(ops)))); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	// capsEngine returns ErrUnsupported for Open, so warm priming will fail
+	// for every target. Seekable=true keeps caps validation happy.
+	plan := replay.Plan{
+		Engine:     newCapsEngine(engine.Capabilities{Seekable: true}),
+		EngineName: "noop",
+		Mode:       "asap",
+		CacheMode:  "warm",
+	}
+	exec, err := replay.Prepare(plan, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Plan.PrepareTouchedSameData {
+		t.Error("PrepareTouchedSameData should be false when warm priming failed for all targets")
+	}
+	if len(res.RunEnv.CacheLimitations) == 0 {
+		t.Error("expected CacheLimitations to be recorded for failed warm priming")
 	}
 }
 

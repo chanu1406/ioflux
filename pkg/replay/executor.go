@@ -14,8 +14,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chanuollala/ioflux/pkg/cache"
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/prepare"
 	"github.com/chanuollala/ioflux/pkg/results"
+	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
@@ -30,13 +33,28 @@ type Plan struct {
 	MaxInflight int
 	// SpeedupFactor scales trace timestamps in "scaled" mode (0 → 1×).
 	SpeedupFactor float64
+	// TargetMap rewrites trace targets before caps validation and replay.
+	// When nil, targets are used as-is.
+	TargetMap *targetmap.Map
+	// Bucket is the S3 bucket configured on the engine; used to validate
+	// s3:// URIs in TargetMap. Empty means skip bucket-name validation.
+	Bucket string
+	// PrepareMode selects the dataset-preparation strategy. Empty means skip
+	// preparation (targets must already exist on the backend).
+	PrepareMode string
+	// SourceRoot is the local FS path for materialize-from-source.
+	SourceRoot string
+	// CacheMode is "cold" or "warm". Empty means skip cache controls.
+	CacheMode string
 }
 
 // Executor holds the loaded, validated plan ready for execution.
 type Executor struct {
-	plan     Plan
-	hdr      trace.Header
-	byStream map[int64][]trace.Op
+	plan      Plan
+	hdr       trace.Header
+	byStream  map[int64][]trace.Op
+	allOps    []trace.Op
+	prepStats prepare.Stats
 }
 
 // Prepare loads all ops from r, validates that every op is compatible with
@@ -68,10 +86,24 @@ func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
 		return nil, fmt.Errorf("replay: prepare: invalid trace: %s", formatValidationErrors(rep))
 	}
 
+	// Apply target map rewrite before caps check so that post-rewrite kinds
+	// (file → object) are visible to checkOpCaps. originalTargets preserves
+	// pre-rewrite names so materialize-from-source can locate source files
+	// regardless of the destination layout.
+	originalTargets := append([]trace.TargetInfo(nil), hdr.Targets...)
+	if plan.TargetMap != nil {
+		ec := targetmap.EngineContext{EngineKind: plan.EngineName, Bucket: plan.Bucket}
+		rewritten, _, err := plan.TargetMap.Rewrite(hdr.Targets, ec)
+		if err != nil {
+			return nil, fmt.Errorf("replay: prepare: target map: %w", err)
+		}
+		hdr.Targets = rewritten
+	}
+
 	caps := plan.Engine.Caps()
 	for _, ops := range byStream {
 		for _, op := range ops {
-			if op.Group != nil {
+			if op.Group != nil && *op.Group != 0 {
 				return nil, fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
 			}
 			if err := checkOpCaps(op, caps); err != nil {
@@ -80,7 +112,21 @@ func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
 		}
 	}
 
-	return &Executor{plan: plan, hdr: hdr, byStream: byStream}, nil
+	// Dataset preparation — runs before the replay executor (and Recorder) is
+	// constructed, so its I/O is never credited to results.
+	var prepStats prepare.Stats
+	if plan.PrepareMode != "" {
+		prep, err := prepare.For(prepare.Mode(plan.PrepareMode), plan.SourceRoot)
+		if err != nil {
+			return nil, fmt.Errorf("replay: prepare: dataset prep: %w", err)
+		}
+		prepStats, err = prep.Prepare(context.Background(), hdr.Targets, originalTargets, ops, plan.Engine)
+		if err != nil {
+			return nil, fmt.Errorf("replay: prepare: dataset prep: %w", err)
+		}
+	}
+
+	return &Executor{plan: plan, hdr: hdr, byStream: byStream, allOps: ops, prepStats: prepStats}, nil
 }
 
 func formatValidationErrors(rep trace.Report) string {
@@ -137,16 +183,35 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 	default:
 		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
 	}
+
+	// Apply cache-state controls before the measured run.
+	var cacheRes cache.Result
+	if e.plan.CacheMode != "" {
+		cacheRes = cache.Apply(ctx, cache.Mode(e.plan.CacheMode), e.plan.Engine, e.hdr.Targets)
+	}
+
 	planInfo := results.PlanInfo{
-		TracePath:     e.plan.TracePath,
-		Engine:        e.plan.EngineName,
-		Mode:          e.plan.Mode,
-		MaxInflight:   e.plan.MaxInflight,
-		SpeedupFactor: e.plan.SpeedupFactor,
-		TraceKind:     string(e.hdr.Kind),
-		NumStreams:    e.hdr.Summary.NumStreams,
-		NumOps:        e.hdr.Summary.NumOps,
-		TotalBytes:    e.hdr.Summary.TotalBytes,
+		TracePath:                 e.plan.TracePath,
+		Engine:                    e.plan.EngineName,
+		Mode:                      e.plan.Mode,
+		MaxInflight:               e.plan.MaxInflight,
+		SpeedupFactor:             e.plan.SpeedupFactor,
+		TraceKind:                 string(e.hdr.Kind),
+		NumStreams:                e.hdr.Summary.NumStreams,
+		NumOps:                    e.hdr.Summary.NumOps,
+		TotalBytes:                e.hdr.Summary.TotalBytes,
+		PrepareMode:               e.plan.PrepareMode,
+		PrepareTouchedSameData:    e.prepStats.TouchedSameData || (e.plan.CacheMode == "warm" && cacheRes.Primed > 0),
+		PrepareVerified:           e.prepStats.Verified,
+		PrepareCreated:            e.prepStats.Created,
+		PrepareCopied:             e.prepStats.Copied,
+		PrepareSkippedSizeUnknown: e.prepStats.SkippedSizeUnknown,
+		PrepareDerivedSizeFromOps: e.prepStats.DerivedSizeFromOps,
+	}
+	runEnv := results.RunEnv{
+		CacheMode:        e.plan.CacheMode,
+		CacheActions:     cacheRes.Actions,
+		CacheLimitations: cacheRes.Limitations,
 	}
 	opts := SchedulerOpts{
 		Mode:          e.plan.Mode,
@@ -154,6 +219,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		SpeedupFactor: e.plan.SpeedupFactor,
 		RunStart:      time.Now(),
 		PlanInfo:      planInfo,
+		RunEnv:        runEnv,
 	}
 	return schedule(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }

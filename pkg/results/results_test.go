@@ -26,7 +26,7 @@ func TestBuildAndWriteJSON(t *testing.T) {
 		NumOps:     4,
 		TotalBytes: 8192,
 	}
-	r := results.Build(plan, rec, 10_000_000)
+	r := results.Build(plan, results.RunEnv{}, rec, 10_000_000)
 
 	if r.OpsCompleted != 4 {
 		t.Errorf("OpsCompleted=%d, want 4", r.OpsCompleted)
@@ -85,7 +85,7 @@ func TestPerOpStatsMonotonic(t *testing.T) {
 	for i := int64(1); i <= 100; i++ {
 		rec.Record(trace.OpRead, i*1_000_000, 512, false)
 	}
-	r := results.Build(results.PlanInfo{}, rec, 0)
+	r := results.Build(results.PlanInfo{}, results.RunEnv{}, rec, 0)
 	pm := r.PerOpMap()
 	s := pm["READ"]
 	if !(s.P50NS <= s.P90NS && s.P90NS <= s.P99NS && s.P99NS <= s.MaxNS) {

@@ -13,15 +13,22 @@ import (
 
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
-	TracePath     string  `json:"trace_path"`
-	Engine        string  `json:"engine"`
-	Mode          string  `json:"mode"`
-	MaxInflight   int     `json:"max_inflight"`
-	SpeedupFactor float64 `json:"speedup_factor,omitempty"`
-	TraceKind     string  `json:"trace_kind"`
-	NumStreams    int     `json:"num_streams"`
-	NumOps        int64   `json:"num_ops"`
-	TotalBytes    int64   `json:"total_bytes"`
+	TracePath                 string  `json:"trace_path"`
+	Engine                    string  `json:"engine"`
+	Mode                      string  `json:"mode"`
+	MaxInflight               int     `json:"max_inflight"`
+	SpeedupFactor             float64 `json:"speedup_factor,omitempty"`
+	TraceKind                 string  `json:"trace_kind"`
+	NumStreams                int     `json:"num_streams"`
+	NumOps                    int64   `json:"num_ops"`
+	TotalBytes                int64   `json:"total_bytes"`
+	PrepareMode               string  `json:"prepare_mode,omitempty"`
+	PrepareTouchedSameData    bool    `json:"prepare_touched_same_data,omitempty"`
+	PrepareVerified           int     `json:"prepare_verified,omitempty"`
+	PrepareCreated            int     `json:"prepare_created,omitempty"`
+	PrepareCopied             int     `json:"prepare_copied,omitempty"`
+	PrepareSkippedSizeUnknown int     `json:"prepare_skipped_size_unknown,omitempty"`
+	PrepareDerivedSizeFromOps int     `json:"prepare_derived_size_from_ops,omitempty"`
 }
 
 // PerOpStats holds latency percentiles and counters for one op type.
@@ -45,10 +52,18 @@ type DriftStats struct {
 	MeanNS float64 `json:"mean_ns"`
 }
 
+// RunEnv records the environment state applied before the RUN phase.
+type RunEnv struct {
+	CacheMode        string   `json:"cache_mode,omitempty"`
+	CacheActions     []string `json:"cache_actions,omitempty"`
+	CacheLimitations []string `json:"cache_limitations,omitempty"`
+}
+
 // Results is the full output of a replay run written to results.json.
 type Results struct {
 	GeneratedAt      string       `json:"generated_at"`
 	Plan             PlanInfo     `json:"plan"`
+	RunEnv           RunEnv       `json:"run_env"`
 	DurationNS       int64        `json:"duration_ns"`
 	OpsCompleted     int64        `json:"ops_completed"`
 	BytesMoved       int64        `json:"bytes_moved"`
@@ -61,9 +76,9 @@ type Results struct {
 	ScheduleDrift    DriftStats `json:"schedule_drift"`
 }
 
-// Build constructs a Results from a merged Recorder, a plan, and the measured
-// run duration.
-func Build(plan PlanInfo, rec *metrics.Recorder, durationNS int64) *Results {
+// Build constructs a Results from a merged Recorder, a plan, run environment
+// metadata, and the measured run duration.
+func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64) *Results {
 	kinds := rec.OpKinds()
 	stats := make([]PerOpStats, 0, len(kinds))
 	for _, k := range kinds {
@@ -85,6 +100,7 @@ func Build(plan PlanInfo, rec *metrics.Recorder, durationNS int64) *Results {
 	r := &Results{
 		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
 		Plan:             plan,
+		RunEnv:           runEnv,
 		DurationNS:       durationNS,
 		OpsCompleted:     rec.TotalOps(),
 		BytesMoved:       rec.Bytes,

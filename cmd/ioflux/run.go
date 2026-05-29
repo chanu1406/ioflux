@@ -12,6 +12,7 @@ import (
 	"github.com/chanuollala/ioflux/pkg/engine/mem"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
+	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
@@ -26,6 +27,11 @@ Flags:
   --mode <mode>         Replay mode: asap | timeline | scaled (default asap)
   --max-inflight <n>    Worker-global concurrent in-flight op cap (default 512)
   --speedup <f>         Timeline scaling factor for --mode scaled (default 1.0)
+  --target-map <path>   Path to a YAML target-map config (optional)
+  --allow-passthrough   Allow targets that match no rule to pass through unchanged
+  --prepare <mode>      Dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source
+  --source-root <path>  Local source path for --prepare materialize-from-source
+  --cache-mode <mode>   Cache state: cold | warm (default cold)
   -o <path>             Output path for results.json (required; use - for stdout)
 
 Engine notes:
@@ -45,12 +51,16 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() { fmt.Fprint(stderr, runUsage) }
 
 	var (
-		tracePath   string
-		engineName  string
-		mode        string
-		maxInflight int
-		speedup     float64
-		outPath     string
+		tracePath        string
+		engineName       string
+		mode             string
+		maxInflight      int
+		speedup          float64
+		outPath          string
+		targetMapPath    string
+		allowPassthrough bool
+		prepareMode      string
+		sourceRoot       string
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
 	fs.StringVar(&engineName, "engine", "mem", "storage engine (mem | local)")
@@ -58,6 +68,13 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&maxInflight, "max-inflight", 512, "worker-global concurrent in-flight op cap")
 	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
 	fs.StringVar(&outPath, "o", "", "output path for results.json (required; - for stdout)")
+	fs.StringVar(&targetMapPath, "target-map", "", "path to YAML target-map config (optional)")
+	fs.BoolVar(&allowPassthrough, "allow-passthrough", false, "allow unmatched targets to pass through unchanged")
+	fs.StringVar(&prepareMode, "prepare", "", "dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source")
+	fs.StringVar(&sourceRoot, "source-root", "", "local source path for --prepare materialize-from-source")
+
+	var cacheMode string
+	fs.StringVar(&cacheMode, "cache-mode", "cold", "cache state: cold | warm (default cold)")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -108,6 +125,18 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	var tmap *targetmap.Map
+	if targetMapPath != "" {
+		tmap, err = targetmap.Load(targetMapPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+			return 1
+		}
+		if allowPassthrough {
+			tmap.AllowPassthrough = true
+		}
+	}
+
 	plan := replay.Plan{
 		TracePath:     tracePath,
 		Engine:        eng,
@@ -115,6 +144,10 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		Mode:          mode,
 		MaxInflight:   maxInflight,
 		SpeedupFactor: speedup,
+		TargetMap:     tmap,
+		PrepareMode:   prepareMode,
+		SourceRoot:    sourceRoot,
+		CacheMode:     cacheMode,
 	}
 	exec, err := replay.Prepare(plan, r)
 	if err != nil {
