@@ -963,3 +963,35 @@ func (e *readFailEngine) Head(_ context.Context, _ string) (engine.ObjectInfo, e
 	return engine.ObjectInfo{}, engine.ErrUnsupported
 }
 func (e *readFailEngine) Delete(_ context.Context, _ string) error { return engine.ErrUnsupported }
+
+// TestResultsIncludeCPU verifies that a replay populates the CPU block. The
+// non-zero rusage assertion lives in pkg/cpustat (busy loop) — here we only
+// check that WallNS is populated and tracks DurationNS, since coarse rusage
+// accounting can report zero user+sys for very short replays on some kernels.
+func TestResultsIncludeCPU(t *testing.T) {
+	buf := smallTrace(t, 2, 8)
+	r, err := trace.NewReader(buf)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	eng := memEngineForTrace(r.Header())
+	plan := replay.Plan{Engine: eng, EngineName: "mem", Mode: "asap"}
+	exec, err := replay.Prepare(plan, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.CPU.WallNS <= 0 {
+		t.Errorf("CPU.WallNS=%d, want > 0", res.CPU.WallNS)
+	}
+	if res.CPU.WallNS != res.DurationNS {
+		t.Errorf("CPU.WallNS=%d != DurationNS=%d (must come from the same monotonic clock)",
+			res.CPU.WallNS, res.DurationNS)
+	}
+	if res.CPU.UserNS < 0 || res.CPU.SysNS < 0 {
+		t.Errorf("CPU rusage went negative: User=%d Sys=%d", res.CPU.UserNS, res.CPU.SysNS)
+	}
+}

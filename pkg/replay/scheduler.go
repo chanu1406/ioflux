@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/chanuollala/ioflux/pkg/cpustat"
 	"github.com/chanuollala/ioflux/pkg/engine"
 	"github.com/chanuollala/ioflux/pkg/metrics"
 	"github.com/chanuollala/ioflux/pkg/results"
@@ -64,6 +65,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	type streamResult struct{ rec *metrics.Recorder }
 	resultsCh := make(chan streamResult, len(byStream))
 	wallStart := time.Now()
+	cpuStart := cpustat.Now()
 
 	isTimeline := opts.Mode == "timeline" || opts.Mode == "scaled"
 
@@ -159,6 +161,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	close(resultsCh)
 
 	durationNS := time.Since(wallStart).Nanoseconds()
+	cpuDelta := cpustat.Now().Sub(cpuStart)
 
 	merged := metrics.NewRecorder()
 	for sr := range resultsCh {
@@ -169,6 +172,9 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	merged.MaxInflightDepth = maxInflightDepth.Load()
 
 	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, durationNS)
+	// WallNS comes from durationNS (Go monotonic) — never from cpustat, whose
+	// Sample is rusage only. This keeps CPU.WallNS == DurationNS by construction.
+	res.CPU = results.CPU{UserNS: cpuDelta.UserNS, SysNS: cpuDelta.SysNS, WallNS: durationNS}
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}

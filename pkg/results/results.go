@@ -59,6 +59,14 @@ type RunEnv struct {
 	CacheLimitations []string `json:"cache_limitations,omitempty"`
 }
 
+// CPU records per-process CPU time consumed by the run. Reported alongside
+// throughput so a CPU-bound result is not mistaken for a storage-bound one.
+type CPU struct {
+	UserNS int64 `json:"user_ns"`
+	SysNS  int64 `json:"sys_ns"`
+	WallNS int64 `json:"wall_ns"`
+}
+
 // Results is the full output of a replay run written to results.json.
 type Results struct {
 	GeneratedAt      string       `json:"generated_at"`
@@ -74,10 +82,11 @@ type Results struct {
 	// MaxInflightDepth is the peak concurrent in-flight op count.
 	MaxInflightDepth int64      `json:"max_backlog_depth"`
 	ScheduleDrift    DriftStats `json:"schedule_drift"`
+	CPU              CPU        `json:"cpu"`
 }
 
 // Build constructs a Results from a merged Recorder, a plan, run environment
-// metadata, and the measured run duration.
+// metadata, and the measured run duration. Caller may set Results.CPU after.
 func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64) *Results {
 	kinds := rec.OpKinds()
 	stats := make([]PerOpStats, 0, len(kinds))
