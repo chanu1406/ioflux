@@ -171,7 +171,7 @@ func computeRequiredSizes(targets []trace.TargetInfo, ops []trace.Op) map[string
 // prepareChunkSize chunks from buf.
 func writeTarget(ctx context.Context, eng engine.Engine, name string, size int64, buf []byte) error {
 	if eng.Caps().ObjectAPI {
-		return eng.Put(ctx, name, io.LimitReader(zeroReader{}, size), size)
+		return eng.Put(ctx, name, &zeroReadSeeker{size: size}, size)
 	}
 	return writePOSIX(ctx, eng, name, size, buf)
 }
@@ -197,14 +197,39 @@ func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64,
 	return eng.Close(ctx, h)
 }
 
-// zeroReader is an infinite source of zero bytes used for Put-based materialization.
-type zeroReader struct{}
+// zeroReadSeeker is a seekable source of zero bytes used for Put-based materialization.
+type zeroReadSeeker struct {
+	off, size int64
+}
 
-func (zeroReader) Read(p []byte) (int, error) {
-	for i := range p {
+func (z *zeroReadSeeker) Read(p []byte) (int, error) {
+	if z.off >= z.size {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if remain := z.size - z.off; remain < n {
+		n = remain
+	}
+	for i := int64(0); i < n; i++ {
 		p[i] = 0
 	}
-	return len(p), nil
+	z.off += n
+	return int(n), nil
+}
+
+func (z *zeroReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		z.off = offset
+	case io.SeekCurrent:
+		z.off += offset
+	case io.SeekEnd:
+		z.off = z.size + offset
+	}
+	if z.off < 0 {
+		return 0, fmt.Errorf("seek before start")
+	}
+	return z.off, nil
 }
 
 // --- materialize-from-source ---
@@ -244,7 +269,7 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 		if err != nil {
 			return fmt.Errorf("stat source %q: %w", srcPath, err)
 		}
-		return eng.Put(ctx, name, io.LimitReader(src, fi.Size()), fi.Size())
+		return eng.Put(ctx, name, io.NewSectionReader(src, 0, fi.Size()), fi.Size())
 	}
 
 	h, err := eng.Open(ctx, name, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)

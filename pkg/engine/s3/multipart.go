@@ -61,7 +61,7 @@ func (e *S3Engine) putMultipart(ctx context.Context, key string, r io.Reader, si
 			PartNumber:    aws.Int32(partNumber),
 			Body:          bytes.NewReader(partBuf[:n]),
 			ContentLength: aws.Int64(int64(n)),
-		}, awss3.WithAPIOptions(addUnsignedPayloadMiddleware))
+		})
 		if err != nil {
 			abort()
 			return mapErr(fmt.Sprintf("upload part %d for %s", partNumber, key), err)

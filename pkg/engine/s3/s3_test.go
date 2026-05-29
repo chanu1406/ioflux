@@ -111,32 +111,6 @@ func TestSigningAndEndpoint(t *testing.T) {
 	}
 }
 
-func TestPutAcceptsNonSeekableReader(t *testing.T) {
-	var gotBody []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("ReadAll body: %v", err)
-		}
-		w.Header().Set("ETag", `"single"`)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	eng, err := s3engine.New(testConfig(srv.URL))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	src := io.LimitReader(strings.NewReader("streamed"), 8)
-	if err := eng.Put(context.Background(), "streamed.dat", src, 8); err != nil {
-		t.Fatalf("Put non-seekable: %v", err)
-	}
-	if string(gotBody) != "streamed" {
-		t.Fatalf("body=%q, want streamed", gotBody)
-	}
-}
-
 func TestRangeReadViaOpen(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

@@ -15,12 +15,10 @@ import (
 	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	smithy "github.com/aws/smithy-go"
-	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
@@ -132,12 +130,6 @@ func coldHTTPClient() *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-func addUnsignedPayloadMiddleware(stack *middleware.Stack) error {
-	v4.RemoveContentSHA256HeaderMiddleware(stack)
-	v4.RemoveComputePayloadSHA256Middleware(stack)
-	return v4.AddUnsignedPayloadMiddleware(stack)
-}
-
 // Caps returns S3 capabilities. Seekable means range GETs are supported for
 // offset reads; PartialWrite is false because S3 cannot perform arbitrary
 // offset writes.
@@ -220,7 +212,7 @@ func (e *S3Engine) Put(ctx context.Context, key string, r io.Reader, size int64)
 		Key:           aws.String(key),
 		Body:          r,
 		ContentLength: aws.Int64(size),
-	}, awss3.WithAPIOptions(addUnsignedPayloadMiddleware))
+	})
 	return mapErr("put "+key, err)
 }
 
