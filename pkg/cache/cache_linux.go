@@ -5,9 +5,9 @@ package cache
 import (
 	"fmt"
 	"os"
-	"syscall"
 
 	"github.com/chanuollala/ioflux/pkg/trace"
+	"golang.org/x/sys/unix"
 )
 
 // applyPOSIXCold calls posix_fadvise(POSIX_FADV_DONTNEED) on each file target
@@ -19,7 +19,7 @@ func applyPOSIXCold(targets []trace.TargetInfo) (actions, limitations []string) 
 			limitations = append(limitations, fmt.Sprintf("cold: cannot open %q for fadvise: %v", tgt.Name, err))
 			continue
 		}
-		ferr := syscall.Fadvise(int(f.Fd()), 0, 0, syscall.FADV_DONTNEED)
+		ferr := unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 		f.Close()
 		if ferr != nil {
 			limitations = append(limitations, fmt.Sprintf("cold: fadvise DONTNEED %q: %v", tgt.Name, ferr))
