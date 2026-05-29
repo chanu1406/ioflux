@@ -3,9 +3,14 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -91,6 +96,189 @@ func TestRunCmd_LocalEngine(t *testing.T) {
 	}
 	if !bytes.Contains(got, []byte(`"bytes_moved": 8192`)) {
 		t.Fatalf("results should record local read bytes, got:\n%s", got)
+	}
+}
+
+func TestRunCmd_S3RequiresBucket(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "1",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"-o", resultsPath,
+	})
+	if code != 2 {
+		t.Fatalf("runRun s3 without bucket exit=%d want 2; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "bucket is required") {
+		t.Fatalf("stderr should mention missing bucket, got %q", stderr)
+	}
+}
+
+func TestRunCmd_S3TargetMapBucketMismatch(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "1",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+	if err := os.WriteFile(mapPath, []byte("target_rewrite:\n  - from: \"\"\n    to: \"s3://other-bucket/imagenet/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"--endpoint", "http://127.0.0.1:1",
+		"--bucket", "bench",
+		"--path-style",
+		"--access-key", "test-access",
+		"--secret-key", "test-secret",
+		"--target-map", mapPath,
+		"-o", resultsPath,
+	})
+	if code != 1 {
+		t.Fatalf("runRun s3 bucket mismatch exit=%d want 1; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "rule targets bucket") {
+		t.Fatalf("stderr should mention bucket mismatch, got %q", stderr)
+	}
+}
+
+func TestRunCmd_S3EngineWithTargetMapAndPrepare(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+	if err := os.WriteFile(mapPath, []byte("target_rewrite:\n  - from: \"\"\n    to: \"s3://bench/imagenet/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	objects := make(map[string][]byte)
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/bench/") {
+			http.NotFound(w, r)
+			return
+		}
+		key := strings.TrimPrefix(r.URL.Path, "/bench/")
+
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("ReadAll PutObject body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			objects[key] = body
+			mu.Unlock()
+			w.Header().Set("ETag", `"put"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			mu.Lock()
+			body, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			mu.Lock()
+			body, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			start, end, ok := parseTestRange(r.Header.Get("Range"), len(body))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[start : end+1])
+		default:
+			t.Errorf("unexpected S3 method %s", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"--endpoint", srv.URL,
+		"--bucket", "bench",
+		"--path-style",
+		"--access-key", "test-access",
+		"--secret-key", "test-secret",
+		"--target-map", mapPath,
+		"--prepare", "materialize-synthetic",
+		"--cache-mode", "cold",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun s3 exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	got, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(got, []byte(`"engine": "s3"`)) {
+		t.Fatalf("results should record s3 engine, got:\n%s", got)
+	}
+	if !bytes.Contains(got, []byte(`"errors": 0`)) {
+		t.Fatalf("results should contain zero op errors, got:\n%s", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(objects) != 2 {
+		t.Fatalf("materialize-synthetic should PUT 2 objects, got %d (%v)", len(objects), objects)
 	}
 }
 
@@ -276,4 +464,26 @@ func TestRunUsageExitCodeDocsMentionOpErrors(t *testing.T) {
 	if strings.Contains(runUsage, "engine error)") {
 		t.Fatalf("runUsage still uses old engine-error wording:\n%s", runUsage)
 	}
+}
+
+func parseTestRange(header string, size int) (int, int, bool) {
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(header, "bytes="), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	start, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	end, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	if start < 0 || end < start || end >= size {
+		return 0, 0, false
+	}
+	return start, end, true
 }
