@@ -29,3 +29,48 @@ jobs:
 
       - name: test
         run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: start minio
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address :9001
+
+      - name: wait for minio
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live; then
+              echo "MinIO ready after $i attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become healthy within 60s" >&2
+          docker logs minio || true
+          exit 1
+
+      - name: create bench bucket
+        run: |
+          AWS_ACCESS_KEY_ID=minioadmin \
+          AWS_SECRET_ACCESS_KEY=minioadmin \
+          aws s3 mb s3://bench \
+            --endpoint-url http://localhost:9000 \
+            --region us-east-1
+
+      - name: integration tests
+        env:
+          IOFLUX_MINIO_ENDPOINT: http://localhost:9000
+          IOFLUX_MINIO_BUCKET: bench
+          IOFLUX_MINIO_ACCESS_KEY: minioadmin
+          IOFLUX_MINIO_SECRET_KEY: minioadmin
+        run: go test -tags integration -race -count=1 ./pkg/engine/s3/... ./cmd/ioflux/...
