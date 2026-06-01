@@ -16,3 +16,6 @@
 # Go workspace
 go.work
 go.work.sum
+
+# Local demo outputs
+/demo/
