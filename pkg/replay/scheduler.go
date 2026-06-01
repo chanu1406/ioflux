@@ -10,6 +10,7 @@ import (
 
 	"github.com/chanuollala/ioflux/pkg/cpustat"
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/fidelity"
 	"github.com/chanuollala/ioflux/pkg/metrics"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -62,7 +63,10 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 		backlogBlockedNS atomic.Int64
 	)
 
-	type streamResult struct{ rec *metrics.Recorder }
+	type streamResult struct {
+		sid int64
+		rec *metrics.Recorder
+	}
 	resultsCh := make(chan streamResult, len(byStream))
 	wallStart := time.Now()
 	cpuStart := cpustat.Now()
@@ -70,17 +74,18 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	isTimeline := opts.Mode == "timeline" || opts.Mode == "scaled"
 
 	var wg sync.WaitGroup
-	for _, ops := range byStream {
+	for sid, ops := range byStream {
 		wg.Add(1)
-		go func(streamOps []trace.Op) {
+		go func(sid int64, streamOps []trace.Op) {
 			defer wg.Done()
 			rec := metrics.NewRecorder()
 			handleMap := make(map[int64]engine.Handle)
 			buf := make([]byte, 64*1024)
+			var streamInflight int64
 
 			for _, op := range streamOps {
 				if ctx.Err() != nil {
-					resultsCh <- streamResult{rec: rec}
+					resultsCh <- streamResult{sid: sid, rec: rec}
 					return
 				}
 
@@ -91,7 +96,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 						select {
 						case <-time.After(wait):
 						case <-ctx.Done():
-							resultsCh <- streamResult{rec: rec}
+							resultsCh <- streamResult{sid: sid, rec: rec}
 							return
 						}
 					}
@@ -105,7 +110,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 					select {
 					case sem <- struct{}{}:
 					case <-ctx.Done():
-						resultsCh <- streamResult{rec: rec}
+						resultsCh <- streamResult{sid: sid, rec: rec}
 						return
 					}
 					waited := time.Since(waitStart).Nanoseconds()
@@ -122,6 +127,12 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 					if maxInflightDepth.CompareAndSwap(old, cur) {
 						break
 					}
+				}
+
+				// Track per-stream concurrency. Sequential streams stay at ≤1.
+				streamInflight++
+				if streamInflight > rec.PeakInflight {
+					rec.PeakInflight = streamInflight
 				}
 
 				serviceStart := time.Now()
@@ -141,6 +152,7 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 				var latencyNS int64
 				if isTimeline {
 					latencyNS = time.Since(intendedArrival).Nanoseconds()
+					rec.RecordCompletionLag(latencyNS)
 				} else {
 					latencyNS = time.Since(serviceStart).Nanoseconds()
 				}
@@ -149,12 +161,13 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 				}
 				rec.Record(op.Op, latencyNS, bytesN, opErr != nil)
 
+				streamInflight--
 				currentInflight.Add(-1)
 				<-sem
 			}
 
-			resultsCh <- streamResult{rec: rec}
-		}(ops)
+			resultsCh <- streamResult{sid: sid, rec: rec}
+		}(sid, ops)
 	}
 
 	wg.Wait()
@@ -164,17 +177,40 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	cpuDelta := cpustat.Now().Sub(cpuStart)
 
 	merged := metrics.NewRecorder()
+	peakByStream := make(map[int64]int64, len(byStream))
 	for sr := range resultsCh {
 		merged.Merge(sr.rec)
+		peakByStream[sr.sid] = sr.rec.PeakInflight
 	}
 	merged.BacklogEvents = backlogEvents.Load()
 	merged.BacklogBlockedNS = backlogBlockedNS.Load()
 	merged.MaxInflightDepth = maxInflightDepth.Load()
 
+	// Count actual ops from the loaded stream map; hdr.Summary.NumOps is advisory.
+	var actualNumOps int64
+	for _, streamOps := range byStream {
+		actualNumOps += int64(len(streamOps))
+	}
+
+	// Mean inter-arrival: trace duration / actual ops, divided by speedup in
+	// scaled mode so the threshold tracks the compressed real-time cadence.
+	var meanInterArrivalNS int64
+	if actualNumOps > 0 && hdr.Summary.DurationNS > 0 {
+		meanInterArrivalNS = hdr.Summary.DurationNS / actualNumOps
+		if opts.Mode == "scaled" {
+			meanInterArrivalNS = int64(float64(meanInterArrivalNS) / speedup)
+		}
+	}
+
+	// Use actual op count for coverage; stale advisory header must not hide skips.
+	correctedHdr := hdr
+	correctedHdr.Summary.NumOps = actualNumOps
+
 	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, durationNS)
 	// WallNS comes from durationNS (Go monotonic) — never from cpustat, whose
 	// Sample is rusage only. This keeps CPU.WallNS == DurationNS by construction.
 	res.CPU = results.CPU{UserNS: cpuDelta.UserNS, SysNS: cpuDelta.SysNS, WallNS: durationNS}
+	res.Fidelity = fidelity.Build(merged, correctedHdr, opts.Mode, meanInterArrivalNS, peakByStream)
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}

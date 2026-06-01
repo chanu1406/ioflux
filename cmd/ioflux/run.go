@@ -34,6 +34,7 @@ Flags:
   --source-root <path>  Local source path for --prepare materialize-from-source
   --cache-mode <mode>   Cache state: cold | warm (default cold)
   -o <path>             Output path for results.json (required; use - for stdout)
+  --csv <path>          Append a CSV row to this file (optional; header written once)
 
 S3 flags:
   --endpoint <url>                 S3-compatible endpoint override (optional)
@@ -77,6 +78,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		maxInflight      int
 		speedup          float64
 		outPath          string
+		csvPath          string
 		targetMapPath    string
 		allowPassthrough bool
 		prepareMode      string
@@ -89,6 +91,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&maxInflight, "max-inflight", 512, "worker-global concurrent in-flight op cap")
 	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
 	fs.StringVar(&outPath, "o", "", "output path for results.json (required; - for stdout)")
+	fs.StringVar(&csvPath, "csv", "", "append a CSV row to this file (optional)")
 	fs.StringVar(&targetMapPath, "target-map", "", "path to YAML target-map config (optional)")
 	fs.BoolVar(&allowPassthrough, "allow-passthrough", false, "allow unmatched targets to pass through unchanged")
 	fs.StringVar(&prepareMode, "prepare", "", "dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source")
@@ -217,6 +220,17 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 
 	if outPath != "-" {
 		fmt.Fprintf(stdout, "wrote %s\n", outPath)
+	}
+
+	if csvPath != "" {
+		if err := results.AppendCSV(csvPath, res); err != nil {
+			fmt.Fprintf(stderr, "ioflux run: write csv: %v\n", err)
+			return 2
+		}
+	}
+
+	if res.Fidelity.LowFidelity {
+		fmt.Fprintf(stderr, "ioflux run: warning: low-fidelity replay: %s\n", res.Fidelity.LowFidelityReason)
 	}
 	if res.Errors > 0 {
 		fmt.Fprintf(stderr, "ioflux run: %d op(s) failed; see results.errors\n", res.Errors)

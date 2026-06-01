@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/chanuollala/ioflux/pkg/fidelity"
 	"github.com/chanuollala/ioflux/pkg/metrics"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
@@ -80,9 +81,10 @@ type Results struct {
 	BacklogEvents    int64        `json:"backlog_events"`
 	BacklogBlockedNS int64        `json:"backlog_blocked_ns"`
 	// MaxInflightDepth is the peak concurrent in-flight op count.
-	MaxInflightDepth int64      `json:"max_backlog_depth"`
-	ScheduleDrift    DriftStats `json:"schedule_drift"`
-	CPU              CPU        `json:"cpu"`
+	MaxInflightDepth int64                   `json:"max_backlog_depth"`
+	ScheduleDrift    DriftStats              `json:"schedule_drift"`
+	CPU              CPU                     `json:"cpu"`
+	Fidelity         fidelity.FidelityReport `json:"fidelity"`
 }
 
 // Build constructs a Results from a merged Recorder, a plan, run environment

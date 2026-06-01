@@ -1,0 +1,2 @@
+timestamp,trace_path,trace_kind,engine,mode,num_streams,num_ops,max_inflight,cache_mode,prepare_mode,duration_ns,ops_completed,bytes_moved,errors,read_p50_ns,read_p99_ns,read_p999_ns,ops_per_sec,gib_per_sec,cpu_user_ns,cpu_sys_ns,backlog_events,schedule_drift_p99_ns,low_fidelity
+2024-01-01T00:00:00Z,golden.ioflux,synthetic,mem,asap,1,10,512,cold,,0,0,0,0,0,0,0,0.000,0.000,0,0,0,0,false

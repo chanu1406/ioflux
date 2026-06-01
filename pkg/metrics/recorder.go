@@ -27,6 +27,16 @@ type Recorder struct {
 	// DriftHist records per-op schedule drift: actualIssue − intendedArrival.
 	// Nil when no drift was recorded (e.g., asap mode with no backlog).
 	DriftHist *Histogram
+
+	// CompletionLagHist records per-op completion lag: completionTime − intendedArrival.
+	// Only populated in timeline/scaled mode. Nil otherwise.
+	CompletionLagHist *Histogram
+
+	// PeakInflight is the maximum number of concurrent in-flight ops observed
+	// within a single stream over the run. For strictly-sequential streams (no
+	// group tags) this must never exceed 1; values >1 indicate a concurrency
+	// violation. Each per-stream Recorder sets this independently; Merge takes max.
+	PeakInflight int64
 }
 
 // NewRecorder returns an empty Recorder.
@@ -45,6 +55,19 @@ func (r *Recorder) RecordDrift(driftNS int64) {
 		r.DriftHist = New()
 	}
 	r.DriftHist.RecordValue(driftNS)
+}
+
+// RecordCompletionLag records one completion-lag sample: completionTime −
+// intendedArrival. Only called in timeline/scaled mode. Must not be called
+// concurrently.
+func (r *Recorder) RecordCompletionLag(lagNS int64) {
+	if lagNS < 0 {
+		lagNS = 0
+	}
+	if r.CompletionLagHist == nil {
+		r.CompletionLagHist = New()
+	}
+	r.CompletionLagHist.RecordValue(lagNS)
 }
 
 // DriftP99 returns the p99 schedule drift in nanoseconds, or 0 if no drift
@@ -97,6 +120,15 @@ func (r *Recorder) Merge(other *Recorder) {
 			r.DriftHist = New()
 		}
 		r.DriftHist.Merge(other.DriftHist)
+	}
+	if other.CompletionLagHist != nil {
+		if r.CompletionLagHist == nil {
+			r.CompletionLagHist = New()
+		}
+		r.CompletionLagHist.Merge(other.CompletionLagHist)
+	}
+	if other.PeakInflight > r.PeakInflight {
+		r.PeakInflight = other.PeakInflight
 	}
 }
 

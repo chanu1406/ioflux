@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"net/http"
@@ -463,6 +464,62 @@ func TestRunUsageExitCodeDocsMentionOpErrors(t *testing.T) {
 	}
 	if strings.Contains(runUsage, "engine error)") {
 		t.Fatalf("runUsage still uses old engine-error wording:\n%s", runUsage)
+	}
+}
+
+// TestRunCmd_CSVAppend verifies that two runs with --csv append a header row
+// and two data rows, with the header written only once.
+func TestRunCmd_CSVAppend(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+	csvPath := filepath.Join(dir, "results.csv")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	baseArgs := []string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--mode", "asap",
+		"-o", resultsPath,
+		"--csv", csvPath,
+	}
+	for i := 0; i < 2; i++ {
+		if code, _, stderr := runRunCLI(baseArgs); code != 0 {
+			t.Fatalf("run %d: exit=%d want 0; stderr=%s", i+1, code, stderr)
+		}
+	}
+
+	f, err := os.Open(csvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	recs, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	// header + 2 data rows = 3 records
+	if len(recs) != 3 {
+		t.Fatalf("got %d CSV rows (incl header), want 3", len(recs))
+	}
+	if recs[0][0] != "timestamp" {
+		t.Errorf("header[0]=%q, want timestamp", recs[0][0])
+	}
+	if recs[0][len(recs[0])-1] != "low_fidelity" {
+		t.Errorf("header last col=%q, want low_fidelity", recs[0][len(recs[0])-1])
 	}
 }
 
