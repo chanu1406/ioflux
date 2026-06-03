@@ -244,6 +244,27 @@ func TestLocalFileShortReadAtEOF(t *testing.T) {
 	}
 }
 
+// TestAppendFlagNotApplied verifies that the engine does NOT apply O_APPEND
+// when a trace OPEN carries the append flag. Replay is offset-addressed via
+// WriteAt, which returns an error on an O_APPEND-opened file.
+func TestAppendFlagNotApplied(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "append_test.dat")
+	ctx := context.Background()
+	eng := localfile.New()
+
+	h, err := eng.Open(ctx, target, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagAppend)
+	if err != nil {
+		t.Fatalf("Open with append flag: %v", err)
+	}
+	defer eng.Close(ctx, h)
+
+	// WriteAt must succeed; if O_APPEND were set, Go's WriteAt returns an error.
+	if _, err := eng.Write(ctx, h, 0, []byte("hello")); err != nil {
+		t.Errorf("WriteAt on append-flagged open failed: %v (O_APPEND must not be applied)", err)
+	}
+}
+
 // TestLocalFileConcurrentReads verifies that multiple goroutines can read the
 // same file concurrently without data races.
 func TestLocalFileConcurrentReads(t *testing.T) {

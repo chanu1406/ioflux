@@ -9,9 +9,9 @@ import "github.com/chanuollala/ioflux/pkg/engine"
 // fcntl(F_GETFL)). Note: calling this puts the *os.File into blocking mode
 // (Go runtime constraint), but that is harmless for pread/pwrite paths.
 func (e *LocalFileEngine) FdForHandle(h engine.Handle) (uintptr, error) {
-	f, err := e.lookupHandle(h)
+	of, err := e.lookupHandle(h)
 	if err != nil {
 		return 0, err
 	}
-	return f.Fd(), nil
+	return of.f.Fd(), nil
 }

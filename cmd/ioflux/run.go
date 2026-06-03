@@ -47,6 +47,12 @@ S3 flags:
   --s3-multipart-threshold <size>  Multipart threshold (default 64MiB)
   --s3-multipart-part-size <size>  Multipart part size (default 16MiB; minimum 5MiB)
 
+Local engine flags:
+  --allow-direct        Honor O_DIRECT opens from the trace (Linux only; default off)
+  --direct-fallback     Fall back to buffered I/O when O_DIRECT is unsupported by the
+                        filesystem rather than failing the open
+  --direct-align <n>    Block alignment for O_DIRECT (bytes; 0 = auto-detect)
+
 Engine notes:
   mem     In-process zero-I/O engine. All data is held in memory; no disk I/O.
   local   Local filesystem engine using platform file APIs.
@@ -61,6 +67,11 @@ Exit codes:
 type runEngineConfig struct {
 	Name      string
 	CacheMode string
+
+	// Local file engine O_DIRECT options.
+	AllowDirect    bool
+	DirectFallback bool
+	DirectAlign    int64
 
 	S3 s3engine.Config
 }
@@ -83,6 +94,9 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		allowPassthrough bool
 		prepareMode      string
 		sourceRoot       string
+		allowDirect      bool
+		directFallback   bool
+		directAlign      int64
 		s3Cfg            s3engine.Config
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
@@ -96,6 +110,9 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&allowPassthrough, "allow-passthrough", false, "allow unmatched targets to pass through unchanged")
 	fs.StringVar(&prepareMode, "prepare", "", "dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source")
 	fs.StringVar(&sourceRoot, "source-root", "", "local source path for --prepare materialize-from-source")
+	fs.BoolVar(&allowDirect, "allow-direct", false, "enable O_DIRECT for trace OPEN ops carrying the direct flag (local engine, Linux only)")
+	fs.BoolVar(&directFallback, "direct-fallback", false, "fall back to buffered I/O when O_DIRECT is unsupported by the filesystem")
+	fs.Int64Var(&directAlign, "direct-align", 0, "O_DIRECT block alignment in bytes (0 = auto-detect from filesystem)")
 	fs.StringVar(&s3Cfg.Endpoint, "endpoint", "", "S3-compatible endpoint override")
 	fs.StringVar(&s3Cfg.Region, "region", "", "S3 region")
 	fs.StringVar(&s3Cfg.Bucket, "bucket", "", "S3 bucket")
@@ -153,9 +170,12 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	hdr := r.Header()
 
 	eng, bucket, err := buildRunEngine(runEngineConfig{
-		Name:      engineName,
-		CacheMode: cacheMode,
-		S3:        s3Cfg,
+		Name:           engineName,
+		CacheMode:      cacheMode,
+		AllowDirect:    allowDirect,
+		DirectFallback: directFallback,
+		DirectAlign:    directAlign,
+		S3:             s3Cfg,
 	}, hdr)
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
@@ -197,6 +217,13 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux run: replay: %v\n", err)
 		return 1
+	}
+
+	// Collect engine limitations (e.g. O_DIRECT fallback) into the results.
+	if lfe, ok := eng.(*localfile.LocalFileEngine); ok {
+		if lims := lfe.Limitations(); len(lims) > 0 {
+			res.RunEnv.EngineLimitations = lims
+		}
 	}
 
 	// Write output.
@@ -253,7 +280,11 @@ func buildRunEngine(cfg runEngineConfig, hdr trace.Header) (engine.Engine, strin
 			return 64 << 20
 		})), "", nil
 	case "local":
-		return localfile.New(), "", nil
+		return localfile.New(
+			localfile.WithAllowDirect(cfg.AllowDirect),
+			localfile.WithDirectFallback(cfg.DirectFallback),
+			localfile.WithDirectAlign(cfg.DirectAlign),
+		), "", nil
 	case "s3":
 		cfg.S3.DisableHTTPKeepAlive = cfg.CacheMode == "cold"
 		eng, err := s3engine.New(cfg.S3)

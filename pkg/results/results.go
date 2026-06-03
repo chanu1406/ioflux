@@ -55,9 +55,10 @@ type DriftStats struct {
 
 // RunEnv records the environment state applied before the RUN phase.
 type RunEnv struct {
-	CacheMode        string   `json:"cache_mode,omitempty"`
-	CacheActions     []string `json:"cache_actions,omitempty"`
-	CacheLimitations []string `json:"cache_limitations,omitempty"`
+	CacheMode         string   `json:"cache_mode,omitempty"`
+	CacheActions      []string `json:"cache_actions,omitempty"`
+	CacheLimitations  []string `json:"cache_limitations,omitempty"`
+	EngineLimitations []string `json:"engine_limitations,omitempty"`
 }
 
 // CPU records per-process CPU time consumed by the run. Reported alongside
