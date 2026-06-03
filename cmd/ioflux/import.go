@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/chanuollala/ioflux/pkg/importer"
+	"github.com/chanuollala/ioflux/pkg/importer/dftracer"
 	"github.com/chanuollala/ioflux/pkg/importer/strace"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
@@ -21,7 +22,8 @@ const importUsage = `Usage:
 Translate an external trace into the IOFlux trace format.
 
 Sources:
-  strace   strace -T -tt -f output (file syscalls)
+  strace     strace -T -tt -f output (file syscalls)
+  dftracer   DFTracer .pfw / .pfw.gz Chrome Trace JSON (POSIX events)
 
 Flags:
   -o <path>   Output file (required; use - for stdout)
@@ -39,7 +41,8 @@ Exit code:
 type importFunc func(io.Reader, io.Writer) (importer.Report, error)
 
 var importSources = map[string]importFunc{
-	"strace": strace.Import,
+	"strace":    strace.Import,
+	"dftracer":  dftracer.Import,
 }
 
 // runImport is the entry point for the `import` subcommand.
@@ -51,7 +54,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	source := args[0]
 	imp, ok := importSources[source]
 	if !ok {
-		fmt.Fprintf(stderr, "ioflux import: unknown source %q\n\nSupported sources: strace\n", source)
+		fmt.Fprintf(stderr, "ioflux import: unknown source %q\n\nSupported sources: strace, dftracer\n", source)
 		return 2
 	}
 	args = args[1:]

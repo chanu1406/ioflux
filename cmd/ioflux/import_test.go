@@ -151,6 +151,64 @@ func TestImportCmd_GzipInput(t *testing.T) {
 	validateBytes(t, b)
 }
 
+const sampleDFTracer = `[
+{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/x.bin","flags":0,"return_val":3}},
+{"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/x.bin","fd":3,"count":4096,"return_val":4096}},
+{"name":"close","cat":"POSIX","ph":"X","ts":1020.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/x.bin","fd":3,"return_val":0}}
+]`
+
+func TestImportCmd_DFTracerSmoke(t *testing.T) {
+	in := writeTemp(t, "in.pfw", sampleDFTracer)
+	out := filepath.Join(t.TempDir(), "out.ioflux")
+	code, stdout, stderr := runImportCLI([]string{"dftracer", "-o", out, in})
+	if code != 0 {
+		t.Fatalf("exit=%d; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "wrote") {
+		t.Errorf("stdout should confirm write; got %q", stdout)
+	}
+	if !strings.Contains(stderr, "capture limitations:") {
+		t.Errorf("stderr should print capture limitations; got %q", stderr)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := validateBytes(t, b)
+	if hdr.Kind != trace.TraceImported {
+		t.Errorf("kind=%q, want imported", hdr.Kind)
+	}
+	if hdr.CaptureMethod != "import:dftracer" {
+		t.Errorf("capture_method=%q, want import:dftracer", hdr.CaptureMethod)
+	}
+}
+
+func TestImportCmd_DFTracerGzipInput(t *testing.T) {
+	dir := t.TempDir()
+	gzPath := filepath.Join(dir, "in.pfw.gz")
+	f, err := os.Create(gzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write([]byte(sampleDFTracer)); err != nil {
+		t.Fatal(err)
+	}
+	gw.Close()
+	f.Close()
+
+	out := filepath.Join(dir, "out.ioflux")
+	code, _, stderr := runImportCLI([]string{"dftracer", "-o", out, gzPath})
+	if code != 0 {
+		t.Fatalf("exit=%d; stderr=%s", code, stderr)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateBytes(t, b)
+}
+
 func TestImportCmd_FailureDoesNotTruncateOutput(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.ioflux")
