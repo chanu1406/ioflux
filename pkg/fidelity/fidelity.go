@@ -23,7 +23,7 @@ import (
 var LowFidelityDriftFraction = 0.10
 
 // LowFidelityDriftFallbackNS is used when mean inter-arrival is undefined
-// (0 or unknown). 10 ms matches the PRD user decision.
+// (0 or unknown). 10 ms is a reasonable human-perceptible I/O latency floor.
 var LowFidelityDriftFallbackNS = int64(10_000_000) // 10 ms
 
 // LowFidelityBacklogFraction is the maximum fraction of ops allowed to have

@@ -117,10 +117,10 @@ func applyFirst(rules []Rule, tgt trace.TargetInfo, ec EngineContext) (trace.Tar
 	return trace.TargetInfo{}, false, nil
 }
 
-// rewriteTo computes the new TargetInfo when a rule matched. Per the M1 plan,
-// any URI scheme not in {"", "file"} flips Kind to object; "file://" is
-// normalized away and the target stays a file. s3:// additionally validates
-// the bucket against the engine context.
+// rewriteTo computes the new TargetInfo when a rule matched. Any URI scheme
+// not in {"", "file"} flips Kind to object; "file://" is normalized away and
+// the target stays a file. s3:// additionally validates the bucket against the
+// engine context.
 func rewriteTo(to, suffix string, tgt trace.TargetInfo, ec EngineContext) (trace.TargetInfo, error) {
 	out := tgt
 	scheme := uriScheme(to)

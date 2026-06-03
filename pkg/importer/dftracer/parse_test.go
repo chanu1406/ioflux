@@ -2,6 +2,7 @@ package dftracer_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"io"
 	"os"
 	"strings"
@@ -350,6 +351,69 @@ const multiStreamTrace = `[
 {"name":"read","cat":"POSIX","ph":"X","ts":2010.0,"dur":5.0,"pid":20,"tid":20,"args":{"fname":"/data/p2.bin","fd":3,"count":128,"return_val":128}},
 {"name":"close","cat":"POSIX","ph":"X","ts":2020.0,"dur":1.0,"pid":20,"tid":20,"args":{"fname":"/data/p2.bin","fd":3,"return_val":0}}
 ]`
+
+func TestImport_RealDFTracerFixture(t *testing.T) {
+	// Uses testdata/real_dftracer.pfw: a fixture modelled on the format emitted
+	// by the LLNL DFTracer library (llnl/dftracer dfanalyzer_old/test.pfw).
+	// Verifies: "ret" field name, string-encoded count/ret (older serializer quirk),
+	// "hostname" in args (ignored), and cursor advancement across sequential reads.
+	in, err := os.ReadFile("testdata/real_dftracer.pfw")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var buf bytes.Buffer
+	rep, err := dftracer.Import(bytes.NewReader(in), &buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+
+	// fixture: open+write+close (write stream) + open+read+read+read(eof)+close = 8 ops
+	// read(ret=0) is EOF → skipped; __lxstat → unsupported_event → skipped
+	if rep.NumOps != 8 {
+		t.Errorf("NumOps = %d, want 8", rep.NumOps)
+	}
+	if rep.SkippedReasons["eof_read"] != 1 {
+		t.Errorf("eof_read = %d, want 1", rep.SkippedReasons["eof_read"])
+	}
+	if rep.SkippedReasons["unsupported_event"] != 1 {
+		t.Errorf("unsupported_event = %d, want 1 (__lxstat)", rep.SkippedReasons["unsupported_event"])
+	}
+
+	_, ops := readTrace(t, buf.Bytes())
+	// Three sequential reads at off=0, off=131072, off=262144; cursor must advance.
+	offsets := map[int64]bool{}
+	for _, op := range ops {
+		if op.Op == trace.OpRead && op.Off != nil {
+			offsets[*op.Off] = true
+		}
+	}
+	for _, want := range []int64{0, 131072, 262144} {
+		if !offsets[want] {
+			t.Errorf("missing READ at off=%d (cursor tracking)", want)
+		}
+	}
+}
+
+func TestImport_RealDFTracerGzip(t *testing.T) {
+	// Same fixture via .pfw.gz, decompressed before passing to Import (gzip
+	// decompression is the CLI's job; here we exercise it explicitly at the
+	// package level to confirm the content round-trips correctly).
+	raw, err := os.ReadFile("testdata/real_dftracer.pfw.gz")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gz.Close()
+	var buf bytes.Buffer
+	if _, err := dftracer.Import(gz, &buf); err != nil {
+		t.Fatalf("Import .pfw.gz: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+}
 
 func TestImport_MultiStream(t *testing.T) {
 	// Two processes each open fd=3; distinct streams must have non-colliding handles.

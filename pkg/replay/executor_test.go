@@ -656,8 +656,8 @@ func TestPrepareRejectsOffsetWriteAgainstObjectEngine(t *testing.T) {
 
 // TestPrepareAcceptsFileShapedReadsOnObjectMappedTargets verifies that a trace
 // with OPEN+READ+CLOSE against targets rewritten to s3:// passes Prepare on
-// engines reporting Seekable+ObjectAPI (matching S3Engine caps). Per the M1
-// plan, S3 supports file-shaped reads via Open(key) + Range Read.
+// engines reporting Seekable+ObjectAPI (matching S3Engine caps). S3 supports
+// file-shaped reads via Open(key) + Range Read.
 func TestPrepareAcceptsFileShapedReadsOnObjectMappedTargets(t *testing.T) {
 	var buf bytes.Buffer
 	tw := trace.NewWriter(&buf)

@@ -146,9 +146,9 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 
 				bytesN, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf)
 
-				// In timeline/scaled, latency must capture the full backlog (PRD §8.5
-				// coordinated-omission rule). In asap, latency is pure service time —
-				// semaphore-wait time is not credited to the op.
+				// In timeline/scaled, latency must capture the full backlog
+				// (coordinated-omission: include the time spent waiting for the
+				// semaphore). In asap, latency is pure service time.
 				var latencyNS int64
 				if isTimeline {
 					latencyNS = time.Since(intendedArrival).Nanoseconds()

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/chanuollala/ioflux/pkg/importer"
@@ -22,7 +23,8 @@ import (
 const (
 	captureMethod      = trace.CaptureMethod("import:dftracer")
 	captureLimitations = "DFTracer POSIX trace; STDIO (fread/fwrite) and MPI-IO events not represented; " +
-		"mmap page-fault I/O not captured; ops on file descriptors opened before tracing are skipped"
+		"mmap page-fault I/O not captured; ops on file descriptors opened before tracing are skipped; " +
+		"cross-thread fd sharing not modeled (fd opened by one thread is unresolved when accessed by another)"
 	generatedBy = "ioflux-import 0.1.0 / dftracer"
 )
 
@@ -37,30 +39,49 @@ type dfEvent struct {
 }
 
 // dfArgs holds the POSIX event arguments. Pointer fields let the importer
-// distinguish absent fields from zero values.
+// distinguish absent fields from zero values. Count, ReturnVal, and Ret use
+// json.RawMessage because older DFTracer versions serialized numeric values as
+// JSON strings (e.g. "ret":"131072"); rawInt handles both forms.
 type dfArgs struct {
 	Fname     string          `json:"fname"`
 	Fd        *int64          `json:"fd"`
 	Offset    *int64          `json:"offset"`
 	Size      *int64          `json:"size"`
-	Count     *int64          `json:"count"`      // alternative to size
-	ReturnVal *int64          `json:"return_val"` // preferred return field
-	Ret       *int64          `json:"ret"`        // fallback return field
+	Count     json.RawMessage `json:"count"`
+	ReturnVal json.RawMessage `json:"return_val"` // preferred return field
+	Ret       json.RawMessage `json:"ret"`        // fallback return field
 	Flags     json.RawMessage `json:"flags"`      // int or string
 }
 
-// retVal returns the return value from args, preferring return_val over ret.
-func (a *dfArgs) retVal() (int64, bool) {
-	if a.ReturnVal != nil {
-		return *a.ReturnVal, true
+// rawInt parses a JSON value that may be either a JSON number or a quoted
+// decimal string. Older DFTracer versions serialized some numeric fields as
+// strings (e.g. "ret":"131072"); both forms are accepted.
+func rawInt(raw json.RawMessage) (int64, bool) {
+	if len(raw) == 0 {
+		return 0, false
 	}
-	if a.Ret != nil {
-		return *a.Ret, true
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n, true
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n, true
+		}
 	}
 	return 0, false
 }
 
-// reqCount returns the actual bytes transferred: the return value (not the
+// retVal returns the return value from args, preferring return_val over ret.
+func (a *dfArgs) retVal() (int64, bool) {
+	if n, ok := rawInt(a.ReturnVal); ok {
+		return n, true
+	}
+	return rawInt(a.Ret)
+}
+
+// transferCount returns the actual bytes transferred: the return value (not the
 // requested count), since a short read/write still moves the cursor correctly.
 func (a *dfArgs) transferCount() (int64, bool) {
 	return a.retVal()
@@ -157,13 +178,13 @@ func (p *parser) dispatch(stream, t int64, name string, a *dfArgs) {
 	case "open", "open64", "openat", "creat":
 		p.doOpen(stream, t, a)
 	case "read":
-		p.doRW(stream, t, a, trace.OpRead)
+		p.doRW(stream, t, a, trace.OpRead, false)
 	case "pread64", "pread":
-		p.doRW(stream, t, a, trace.OpRead)
+		p.doRW(stream, t, a, trace.OpRead, true)
 	case "write":
-		p.doRW(stream, t, a, trace.OpWrite)
+		p.doRW(stream, t, a, trace.OpWrite, false)
 	case "pwrite64", "pwrite":
-		p.doRW(stream, t, a, trace.OpWrite)
+		p.doRW(stream, t, a, trace.OpWrite, true)
 	case "close":
 		p.doClose(stream, t, a)
 	case "lseek", "lseek64":
@@ -201,7 +222,7 @@ func (p *parser) doOpen(stream, t int64, a *dfArgs) {
 	p.b.Add(op)
 }
 
-func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind) {
+func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind, positional bool) {
 	if a.Fd == nil {
 		p.b.Skip("unresolved_fd")
 		return
@@ -231,9 +252,9 @@ func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind) {
 	}
 
 	var off int64
-	if a.Offset != nil {
-		// Positional I/O (e.g. pread64): use the recorded offset and do not
-		// advance the cursor (matches kernel semantics for O_PREAD).
+	if positional && a.Offset != nil {
+		// Positional I/O (pread64/pwrite64): use the recorded offset and do not
+		// advance the cursor (matches kernel semantics for pread/pwrite).
 		off = *a.Offset
 	} else {
 		off = e.Cursor

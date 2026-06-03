@@ -1,0 +1,12 @@
+[
+{"id":0,"name":"open","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080323781412,"dur":3430,"ph":"X","args":{"hostname":"corona237","ret":18,"flags":66,"fname":"/scratch/dftracer_data/file_0.bin","mode":420}}
+{"id":1,"name":"write","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080323825066,"dur":106189,"ph":"X","args":{"hostname":"corona237","ret":"3276800","count":"3276800","fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":2,"name":"close","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080323938978,"dur":73,"ph":"X","args":{"hostname":"corona237","ret":0,"fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":3,"name":"open","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324850328,"dur":148,"ph":"X","args":{"hostname":"corona237","ret":18,"fname":"/scratch/dftracer_data/file_0.bin","flags":0}}
+{"id":4,"name":"read","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324850514,"dur":115,"ph":"X","args":{"hostname":"corona237","ret":"131072","count":"131072","fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":5,"name":"read","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324855210,"dur":58,"ph":"X","args":{"hostname":"corona237","ret":"131072","count":"131072","fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":6,"name":"read","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324855310,"dur":52,"ph":"X","args":{"hostname":"corona237","ret":"131072","count":"131072","fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":7,"name":"read","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324855403,"dur":48,"ph":"X","args":{"hostname":"corona237","ret":"0","count":"131072","fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":8,"name":"close","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324855500,"dur":45,"ph":"X","args":{"hostname":"corona237","ret":0,"fname":"/scratch/dftracer_data/file_0.bin","fd":18}}
+{"id":9,"name":"__lxstat","cat":"POSIX","pid":1338896,"tid":1338896,"ts":1698080324860000,"dur":100,"ph":"X","args":{"hostname":"corona237","fname":"/scratch/dftracer_data/file_0.bin"}}
+]

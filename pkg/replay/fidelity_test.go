@@ -1,9 +1,9 @@
 package replay_test
 
-// Integration tests for the fidelity report (PRD §9 "Fidelity report test").
-// These run full replay paths so they can't live in pkg/fidelity (which doesn't
-// import replay). The three tests cover the three low-fidelity trigger paths:
-// drift-driven, backlog-driven, and fast-backend (high fidelity).
+// Integration tests for the fidelity report. These run full replay paths so
+// they can't live in pkg/fidelity (which doesn't import replay). The three
+// tests cover the three low-fidelity trigger paths: drift-driven,
+// backlog-driven, and fast-backend (high fidelity).
 
 import (
 	"bytes"
@@ -102,8 +102,8 @@ func buildFidelityTrace(t *testing.T, nREADs int, intervalNS int64) (*bytes.Buff
 	return &buf, hdr
 }
 
-// TestSlowBackendIsFlaggedLowFidelity_DriftDriven is the PRD §9 coordinated-
-// omission fidelity test. 1 stream × 100 READs at 10ms cadence; engine adds
+// TestSlowBackendIsFlaggedLowFidelity_DriftDriven verifies coordinated-omission
+// fidelity detection. 1 stream × 100 READs at 10ms cadence; engine adds
 // 100ms per READ. Because the stream is strictly sequential, each op falls
 // 90ms further behind its intended arrival. By op 100 the cumulative drift is
 // ~9 s. maxInflight=1000 so the semaphore is never the bottleneck.

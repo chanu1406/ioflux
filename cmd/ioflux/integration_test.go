@@ -77,7 +77,7 @@ func TestMinIO_EndToEndGenRun(t *testing.T) {
 	if res.Errors != 0 {
 		t.Errorf("Errors=%d, want 0", res.Errors)
 	}
-	// M1 acceptance: every op in the trace was issued.
+	// Every op in the trace must have been issued.
 	if got, want := res.Fidelity.Coverage.OpsIssued, res.Plan.NumOps; got != want {
 		t.Errorf("Coverage.OpsIssued=%d, want %d (= Plan.NumOps)", got, want)
 	}

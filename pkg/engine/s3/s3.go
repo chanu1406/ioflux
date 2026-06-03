@@ -171,7 +171,7 @@ func (e *S3Engine) Read(ctx context.Context, h engine.Handle, off, length int64,
 	return e.Get(ctx, key, off, length, buf)
 }
 
-// Write is intentionally unsupported in M1; offset writes are rejected at
+// Write is intentionally unsupported; offset writes are rejected at
 // PREPARE via Caps().PartialWrite=false.
 func (e *S3Engine) Write(_ context.Context, _ engine.Handle, _ int64, _ []byte) (int, error) {
 	return 0, engine.ErrUnsupported

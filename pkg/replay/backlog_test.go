@@ -98,7 +98,7 @@ func TestBacklog_TotalInflightCapped(t *testing.T) {
 	}
 
 	// In asap mode, semaphore-wait time must not be credited to op latency
-	// (PRD §8.5: "Latency = service time"). Injected delay is 5ms; even with
+	// (latency = service time only). Injected delay is 5ms; even with
 	// significant queue waits, p99 must stay close to service time.
 	if readStats, ok := res.PerOpMap()["READ"]; ok {
 		const maxAsapLatencyNS = int64(50 * time.Millisecond)
