@@ -41,8 +41,8 @@ Exit code:
 type importFunc func(io.Reader, io.Writer) (importer.Report, error)
 
 var importSources = map[string]importFunc{
-	"strace":    strace.Import,
-	"dftracer":  dftracer.Import,
+	"strace":   strace.Import,
+	"dftracer": dftracer.Import,
 }
 
 // runImport is the entry point for the `import` subcommand.
