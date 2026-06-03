@@ -13,6 +13,7 @@ Usage:
 
 Commands:
   gen      <profile> [flags]  Generate a synthetic trace.
+  import   <source> [flags]   Import an external trace (e.g. strace) into .ioflux.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
   run      [flags]            Replay a trace against a storage engine.
 
@@ -30,6 +31,8 @@ func main() {
 	switch cmd {
 	case "gen":
 		os.Exit(runGen(args, os.Stdout, os.Stderr))
+	case "import":
+		os.Exit(runImport(args, os.Stdout, os.Stderr))
 	case "validate":
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "run":
