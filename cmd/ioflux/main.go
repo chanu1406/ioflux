@@ -16,6 +16,7 @@ Commands:
   import   <source> [flags]   Import an external trace (e.g. strace) into .ioflux.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
   run      [flags]            Replay a trace against a storage engine.
+  report   <results.json>     Pretty-print a saved run report.
 
 Run 'ioflux <command> -h' for command-specific help.
 `
@@ -37,6 +38,8 @@ func main() {
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "run":
 		os.Exit(runRun(args, os.Stdout, os.Stderr))
+	case "report":
+		os.Exit(runReport(args, os.Stdout, os.Stderr))
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(0)
