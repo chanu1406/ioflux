@@ -1,47 +1,59 @@
 # IOFlux
 
-IOFlux is a trace driven storage workload replay tool for AI systems. It is
-designed to capture, generate, validate, and replay storage access patterns
-such as training data reads, checkpoint writes, and object store ingestion.
+IOFlux is a trace driven storage workload replay tool for AI workloads. It
+generates, imports, validates, and replays storage access patterns such as
+training data reads and checkpoint writes, then reports how a backend handled
+them.
 
 A trace is a portable JSONL recording of storage operations over time: opens,
-reads, writes, closes, object GETs, and related metadata. IOFlux uses traces to
-benchmark storage backends against concrete AI workload behavior rather than generic
-synthetic I/O patterns.
+reads, writes, closes, object GETs, and related metadata. IOFlux replays a trace
+against a real backend so you can benchmark storage against a concrete workload
+rather than a generic synthetic profile.
 
-The goal is to benchmark storage backends against a concrete workload trace,
-not just a generic synthetic profile. IOFlux is intended to work with POSIX
-filesystems and S3-compatible object stores, with reports focused on
-throughput, latency, straggler behavior, and replay fidelity.
+IOFlux works with POSIX filesystems and S3-compatible object stores, with reports
+focused on throughput, latency, straggler behavior, and replay fidelity. Traces
+can be generated synthetically or imported from strace and DFTracer output. Live
+capture and multi-host distribution are not implemented yet.
 
-This repository is in early development. The current build includes the
-`.ioflux` JSONL trace reader/writer, trace validation logic, and the
-`ioflux validate` subcommand.
+## Commands
+
+- `ioflux gen training-read [flags]` generates a synthetic trace.
+- `ioflux import strace|dftracer <file>` imports an external trace into .ioflux.
+- `ioflux validate <trace>` checks a trace against the schema and invariants.
+- `ioflux run [flags]` replays a trace against the mem, local, or s3 engine.
+- `ioflux report <results.json>` prints a saved run report.
+
+Run `ioflux <command> -h` for the flags of each command.
 
 ## Quick start
 
+Build the binary:
+
 ```bash
 go build -o bin/ioflux ./cmd/ioflux
-bin/ioflux validate pkg/trace/testdata/minimal_valid.ioflux
 ```
 
-Expected output:
+Import an strace capture, replay it against the local filesystem, and print the
+report:
 
-```
-ioflux trace: pkg/trace/testdata/minimal_valid.ioflux
-  version          1
-  kind             synthetic
-  profile          training-read
-  time_unit        ns
-  targets          2
-  ops              6
-  streams          1
-OK
+```bash
+bin/ioflux import strace -o run.ioflux capture.strace
+bin/ioflux run --trace run.ioflux --engine local \
+  --prepare materialize-synthetic --target-map map.yaml -o results.json
+bin/ioflux report results.json
 ```
 
-Exit codes: `0` if the trace is valid, `1` if it has invariant violations,
-`2` on usage or I/O failure. Warnings (e.g., a stream that opens a file but
-never closes it) do not affect the exit code.
+The target map rewrites the captured paths onto the replay backend, so the run
+only touches data you choose:
+
+```yaml
+target_rewrite:
+  - from: "/mnt/dataset/imagenet/"
+    to: "./scratch/"
+```
+
+Exit codes: `0` on success, `1` on a trace or replay error, `2` on usage or I/O
+failure.
 
 ## Development
 
