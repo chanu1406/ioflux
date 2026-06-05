@@ -119,6 +119,34 @@ func printRunReport(w io.Writer, res *results.Results) {
 		fmtDuration(res.CPU.WallNS),
 	)
 
+	// --- Distribution (multi-host runs only) ---
+	if len(res.Hosts) > 1 {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Hosts (%d):\n", len(res.Hosts))
+		fmt.Fprintf(w, "  %-20s %10s %12s %10s %10s\n",
+			"Host", "Ops", "Bytes", "1st-done", "last-done")
+		for _, h := range res.Hosts {
+			name := h.Hostname
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Fprintf(w, "  %-20s %10d %12s %10s %10s\n",
+				name, h.OpsCompleted, fmtBytes(h.BytesMoved),
+				fmtDuration(h.FirstDoneNS), fmtDuration(h.LastDoneNS))
+		}
+		if sw := res.Straggler; sw != nil {
+			fmt.Fprintf(w, "  straggler window:  first-done %s   last-done %s   skew %s\n",
+				fmtDuration(sw.FirstDoneNS), fmtDuration(sw.LastDoneNS), fmtDuration(sw.SkewNS))
+			fmt.Fprintf(w, "  first-done:        %.1f ops/s   %.3f GiB/s   (excludes straggler tail)\n",
+				sw.FirstDoneOpsPerSec, sw.FirstDoneGiBPerSec)
+			fmt.Fprintf(w, "  last-done:         %.1f ops/s   %.3f GiB/s\n",
+				sw.LastDoneOpsPerSec, sw.LastDoneGiBPerSec)
+		}
+		if res.GoDeliverySkewNS > 0 {
+			fmt.Fprintf(w, "  go-delivery skew:  %s\n", fmtDuration(res.GoDeliverySkewNS))
+		}
+	}
+
 	// --- Fidelity ---
 	fid := res.Fidelity
 	fmt.Fprintln(w)

@@ -163,6 +163,66 @@ func TestReportCmd_ValidResults(t *testing.T) {
 	}
 }
 
+func TestReportCmd_MultiHostDistribution(t *testing.T) {
+	res := makeTestResults()
+	res.GoDeliverySkewNS = 1_500_000
+	res.Hosts = []results.HostResult{
+		{Hostname: "hostA", OpsCompleted: 600, BytesMoved: 40_000_000, FirstDoneNS: 800_000_000, LastDoneNS: 1_000_000_000},
+		{Hostname: "hostB", OpsCompleted: 424, BytesMoved: 27_108_864, FirstDoneNS: 1_500_000_000, LastDoneNS: 2_000_000_000},
+	}
+	res.Straggler = &results.StragglerWindow{
+		FirstDoneNS:        1_000_000_000,
+		LastDoneNS:         2_000_000_000,
+		SkewNS:             1_000_000_000,
+		FirstDoneOpsPerSec: 800,
+		LastDoneOpsPerSec:  512,
+		FirstDoneGiBPerSec: 0.05,
+		LastDoneGiBPerSec:  0.03,
+	}
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	for _, want := range []string{
+		"Hosts (2):",
+		"hostA",
+		"hostB",
+		"straggler window:",
+		"first-done:",
+		"last-done:",
+		"excludes straggler tail",
+		"go-delivery skew:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+func TestReportCmd_SingleHostOmitsDistribution(t *testing.T) {
+	// A single-node result has no Hosts; the distribution section must not appear.
+	res := makeTestResults()
+	data, _ := json.Marshal(res)
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := runReportCLI([]string{p})
+	if strings.Contains(out, "Hosts (") || strings.Contains(out, "straggler window:") {
+		t.Errorf("single-node report must omit the distribution section\nfull output:\n%s", out)
+	}
+}
+
 func TestReportCmd_FidelityDetails(t *testing.T) {
 	// Verify that completion lag and full drift stats appear when non-zero.
 	res := makeTestResults()

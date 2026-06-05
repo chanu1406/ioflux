@@ -42,7 +42,7 @@ func TestWorkerMerge_SplitEquivalentToWhole(t *testing.T) {
 
 	// Whole-trace run through the worker primitive, then aggregate the single
 	// WorkerOutput — this is exactly the single-node path.
-	whole, err := exec.RunWorker(context.Background(), time.Now())
+	whole, err := exec.RunWorker(context.Background(), time.Now(), nil)
 	if err != nil {
 		t.Fatalf("RunWorker (whole): %v", err)
 	}
@@ -54,12 +54,12 @@ func TestWorkerMerge_SplitEquivalentToWhole(t *testing.T) {
 		t.Fatalf("need ≥2 streams to split, got %d", len(ids))
 	}
 	half := len(ids) / 2
-	outA, err := exec.WithStreams(ids[:half]).RunWorker(context.Background(), time.Now())
+	outA, err := exec.WithStreams(ids[:half]).RunWorker(context.Background(), time.Now(), nil)
 	if err != nil {
 		t.Fatalf("RunWorker (A): %v", err)
 	}
 	outA.Hostname = "hostA"
-	outB, err := exec.WithStreams(ids[half:]).RunWorker(context.Background(), time.Now())
+	outB, err := exec.WithStreams(ids[half:]).RunWorker(context.Background(), time.Now(), nil)
 	if err != nil {
 		t.Fatalf("RunWorker (B): %v", err)
 	}

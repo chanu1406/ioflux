@@ -186,10 +186,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 	}
 
 	// Apply cache-state controls before the measured run.
-	var cacheRes cache.Result
-	if e.plan.CacheMode != "" {
-		cacheRes = cache.Apply(ctx, cache.Mode(e.plan.CacheMode), e.plan.Engine, e.hdr.Targets)
-	}
+	cacheRes := e.ApplyCache(ctx)
 
 	planInfo := results.PlanInfo{
 		TracePath:                 e.plan.TracePath,
@@ -252,25 +249,40 @@ func (e *Executor) StreamIDs() []int64 {
 	return ids
 }
 
-// RunWorker applies cache controls and replays this executor's assigned streams
-// starting at runStart, returning the raw per-worker output for a coordinator
-// to merge. It is the worker-side primitive beneath the gRPC layer: the
-// distributed coordinator calls it on each worker and feeds the WorkerOutputs to
-// buildResults. (Single-node Run uses the same scheduler via schedule.)
-func (e *Executor) RunWorker(ctx context.Context, runStart time.Time) (*WorkerOutput, error) {
+// ApplyCache applies the configured cache-state controls (cold/warm) against the
+// engine's targets and returns the actions/limitations to record in run metadata.
+// It belongs to the PREPARE phase: a distributed coordinator must call it on every
+// worker before the RUN barrier, so all workers are cache-ready before any worker
+// starts issuing ops. No-op (zero Result) when no cache mode is configured.
+func (e *Executor) ApplyCache(ctx context.Context) cache.Result {
+	if e.plan.CacheMode == "" {
+		return cache.Result{}
+	}
+	return cache.Apply(ctx, cache.Mode(e.plan.CacheMode), e.plan.Engine, e.hdr.Targets)
+}
+
+// RunWorker replays this executor's assigned streams starting at runStart,
+// returning the raw per-worker output for a coordinator to merge. progress, when
+// non-nil, is called periodically with cumulative ops/bytes for live streaming.
+// It is the worker-side primitive beneath the gRPC layer: the distributed
+// coordinator calls it on each worker and feeds the WorkerOutputs to BuildResults.
+// (Single-node Run uses the same scheduler via schedule.)
+//
+// Cache controls are NOT applied here — they belong to PREPARE (call ApplyCache
+// before the RUN barrier) so they never run inside the measured, barrier-gated
+// window.
+func (e *Executor) RunWorker(ctx context.Context, runStart time.Time, progress func(ops, bytes int64)) (*WorkerOutput, error) {
 	switch e.plan.Mode {
 	case "asap", "timeline", "scaled":
 	default:
 		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
-	}
-	if e.plan.CacheMode != "" {
-		cache.Apply(ctx, cache.Mode(e.plan.CacheMode), e.plan.Engine, e.hdr.Targets)
 	}
 	opts := SchedulerOpts{
 		Mode:          e.plan.Mode,
 		MaxInflight:   e.plan.MaxInflight,
 		SpeedupFactor: e.plan.SpeedupFactor,
 		RunStart:      runStart,
+		Progress:      progress,
 	}
 	return runStreams(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }
