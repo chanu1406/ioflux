@@ -7,9 +7,9 @@ import (
 	"io"
 	"os"
 
+	"github.com/chanuollala/ioflux/pkg/cluster"
 	"github.com/chanuollala/ioflux/pkg/engine"
 	"github.com/chanuollala/ioflux/pkg/engine/localfile"
-	"github.com/chanuollala/ioflux/pkg/engine/mem"
 	s3engine "github.com/chanuollala/ioflux/pkg/engine/s3"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
@@ -63,18 +63,6 @@ Exit codes:
   1   replay rejected before dispatch (bad trace, caps mismatch) or completed with op errors
   2   usage error or I/O failure
 `
-
-type runEngineConfig struct {
-	Name      string
-	CacheMode string
-
-	// Local file engine O_DIRECT options.
-	AllowDirect    bool
-	DirectFallback bool
-	DirectAlign    int64
-
-	S3 s3engine.Config
-}
 
 // runRun is the entry point for the `run` subcommand.
 func runRun(args []string, stdout, stderr io.Writer) int {
@@ -169,7 +157,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	}
 	hdr := r.Header()
 
-	eng, bucket, err := buildRunEngine(runEngineConfig{
+	eng, bucket, err := buildRunEngine(cluster.EngineSpec{
 		Name:           engineName,
 		CacheMode:      cacheMode,
 		AllowDirect:    allowDirect,
@@ -266,33 +254,12 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func buildRunEngine(cfg runEngineConfig, hdr trace.Header) (engine.Engine, string, error) {
-	switch cfg.Name {
-	case "mem":
-		sizeMap := make(map[string]int64, len(hdr.Targets))
+func buildRunEngine(spec cluster.EngineSpec, hdr trace.Header) (engine.Engine, string, error) {
+	if spec.TargetSizes == nil {
+		spec.TargetSizes = make(map[string]int64, len(hdr.Targets))
 		for _, tgt := range hdr.Targets {
-			sizeMap[tgt.Name] = tgt.Size
+			spec.TargetSizes[tgt.Name] = tgt.Size
 		}
-		return mem.New(mem.WithSizeFunc(func(target string) int64 {
-			if sz, ok := sizeMap[target]; ok && sz > 0 {
-				return sz
-			}
-			return 64 << 20
-		})), "", nil
-	case "local":
-		return localfile.New(
-			localfile.WithAllowDirect(cfg.AllowDirect),
-			localfile.WithDirectFallback(cfg.DirectFallback),
-			localfile.WithDirectAlign(cfg.DirectAlign),
-		), "", nil
-	case "s3":
-		cfg.S3.DisableHTTPKeepAlive = cfg.CacheMode == "cold"
-		eng, err := s3engine.New(cfg.S3)
-		if err != nil {
-			return nil, "", err
-		}
-		return eng, cfg.S3.Bucket, nil
-	default:
-		return nil, "", fmt.Errorf("unsupported engine %q (currently supported: mem, local, s3)", cfg.Name)
 	}
+	return cluster.BuildEngine(spec)
 }

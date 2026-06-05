@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -222,4 +223,54 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		RunEnv:        runEnv,
 	}
 	return schedule(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
+}
+
+// WithStreams returns a shallow copy of e whose stream set is restricted to
+// streamIDs. The distributed coordinator uses it to assign a subset of streams
+// to each worker; stream IDs not present in the trace are ignored. The returned
+// executor shares the underlying op slices (they are not mutated by replay).
+func (e *Executor) WithStreams(streamIDs []int64) *Executor {
+	sub := make(map[int64][]trace.Op, len(streamIDs))
+	for _, sid := range streamIDs {
+		if ops, ok := e.byStream[sid]; ok {
+			sub[sid] = ops
+		}
+	}
+	cp := *e
+	cp.byStream = sub
+	return &cp
+}
+
+// StreamIDs returns the executor's stream IDs in ascending order, so a
+// coordinator can partition them across workers.
+func (e *Executor) StreamIDs() []int64 {
+	ids := make([]int64, 0, len(e.byStream))
+	for sid := range e.byStream {
+		ids = append(ids, sid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// RunWorker applies cache controls and replays this executor's assigned streams
+// starting at runStart, returning the raw per-worker output for a coordinator
+// to merge. It is the worker-side primitive beneath the gRPC layer: the
+// distributed coordinator calls it on each worker and feeds the WorkerOutputs to
+// buildResults. (Single-node Run uses the same scheduler via schedule.)
+func (e *Executor) RunWorker(ctx context.Context, runStart time.Time) (*WorkerOutput, error) {
+	switch e.plan.Mode {
+	case "asap", "timeline", "scaled":
+	default:
+		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
+	}
+	if e.plan.CacheMode != "" {
+		cache.Apply(ctx, cache.Mode(e.plan.CacheMode), e.plan.Engine, e.hdr.Targets)
+	}
+	opts := SchedulerOpts{
+		Mode:          e.plan.Mode,
+		MaxInflight:   e.plan.MaxInflight,
+		SpeedupFactor: e.plan.SpeedupFactor,
+		RunStart:      runStart,
+	}
+	return runStreams(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }

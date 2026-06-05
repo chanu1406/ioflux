@@ -69,6 +69,32 @@ type CPU struct {
 	WallNS int64 `json:"wall_ns"`
 }
 
+// HostResult records one worker's contribution to a distributed run. It is
+// populated only for multi-host runs; single-node runs omit the hosts array.
+type HostResult struct {
+	Hostname     string `json:"hostname"`
+	OpsCompleted int64  `json:"ops_completed"`
+	BytesMoved   int64  `json:"bytes_moved"`
+	CPU          CPU    `json:"cpu"`
+	// FirstDoneNS/LastDoneNS are this worker's earliest/latest stream completion
+	// times, relative to its run start.
+	FirstDoneNS int64 `json:"first_done_ns"`
+	LastDoneNS  int64 `json:"last_done_ns"`
+}
+
+// StragglerWindow quantifies completion skew across workers in a distributed
+// run. FirstDoneNS is the earliest worker completion (throughput up to it
+// excludes the straggler tail); LastDoneNS is the latest. SkewNS is the gap.
+type StragglerWindow struct {
+	FirstDoneNS        int64   `json:"first_done_ns"`
+	LastDoneNS         int64   `json:"last_done_ns"`
+	SkewNS             int64   `json:"skew_ns"`
+	FirstDoneOpsPerSec float64 `json:"first_done_ops_per_sec"`
+	LastDoneOpsPerSec  float64 `json:"last_done_ops_per_sec"`
+	FirstDoneGiBPerSec float64 `json:"first_done_gib_per_sec"`
+	LastDoneGiBPerSec  float64 `json:"last_done_gib_per_sec"`
+}
+
 // Results is the full output of a replay run written to results.json.
 type Results struct {
 	GeneratedAt      string       `json:"generated_at"`
@@ -86,6 +112,12 @@ type Results struct {
 	ScheduleDrift    DriftStats              `json:"schedule_drift"`
 	CPU              CPU                     `json:"cpu"`
 	Fidelity         fidelity.FidelityReport `json:"fidelity"`
+
+	// Hosts, Straggler, and GoDeliverySkewNS are populated only for distributed
+	// (multi-host) runs; single-node runs omit them so their output is unchanged.
+	Hosts            []HostResult     `json:"hosts,omitempty"`
+	Straggler        *StragglerWindow `json:"straggler,omitempty"`
+	GoDeliverySkewNS int64            `json:"go_delivery_skew_ns,omitempty"`
 }
 
 // Build constructs a Results from a merged Recorder, a plan, run environment

@@ -38,9 +38,39 @@ type SchedulerOpts struct {
 	RunEnv results.RunEnv
 }
 
-// schedule runs all streams with strict per-stream ordering, intended-arrival
-// latency accounting, and a shared in-flight cap.
+// WorkerOutput is the raw result of replaying one worker's assigned streams.
+// The coordinator merges WorkerOutputs from all workers before building the
+// final Results, so distributed percentiles come from a single lossless
+// histogram merge rather than averaged per-host numbers. For a single-node run
+// there is exactly one WorkerOutput.
+type WorkerOutput struct {
+	// Hostname identifies the worker; set by the coordinator (empty single-node).
+	Hostname     string
+	Recorder     *metrics.Recorder
+	PeakByStream map[int64]int64
+	CPU          results.CPU
+	// ActualNumOps is the number of ops this worker loaded and replayed.
+	ActualNumOps int64
+	// FirstDoneNS/LastDoneNS are this worker's earliest/latest stream completion
+	// times, relative to its run start.
+	FirstDoneNS int64
+	LastDoneNS  int64
+}
+
+// schedule runs all streams of a single (in-process) worker and builds the
+// final Results. It is the single-node path: runStreams produces the raw
+// per-worker output and buildResults aggregates the one-element slice, so a
+// single-node run and a one-worker distributed run go through identical code.
 func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Engine, hdr trace.Header, opts SchedulerOpts) (*results.Results, error) {
+	out, runErr := runStreams(ctx, byStream, eng, hdr, opts)
+	return BuildResults([]*WorkerOutput{out}, opts, hdr, 0), runErr
+}
+
+// runStreams replays byStream with strict per-stream ordering, intended-arrival
+// latency accounting, and a shared in-flight cap, returning the raw per-worker
+// recorder and timing. It does not build Results; buildResults does that over
+// one or more WorkerOutputs.
+func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Engine, hdr trace.Header, opts SchedulerOpts) (*WorkerOutput, error) {
 	if opts.MaxInflight <= 0 {
 		opts.MaxInflight = 512
 	}
@@ -64,8 +94,9 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 	)
 
 	type streamResult struct {
-		sid int64
-		rec *metrics.Recorder
+		sid          int64
+		rec          *metrics.Recorder
+		completionNS int64
 	}
 	resultsCh := make(chan streamResult, len(byStream))
 	wallStart := time.Now()
@@ -79,13 +110,17 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 		go func(sid int64, streamOps []trace.Op) {
 			defer wg.Done()
 			rec := metrics.NewRecorder()
+			// Report this stream's recorder and completion time exactly once,
+			// however the goroutine exits (finished or ctx-cancelled mid-stream).
+			defer func() {
+				resultsCh <- streamResult{sid: sid, rec: rec, completionNS: time.Since(wallStart).Nanoseconds()}
+			}()
 			handleMap := make(map[int64]engine.Handle)
 			buf := make([]byte, 64*1024)
 			var streamInflight int64
 
 			for _, op := range streamOps {
 				if ctx.Err() != nil {
-					resultsCh <- streamResult{sid: sid, rec: rec}
 					return
 				}
 
@@ -96,7 +131,6 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 						select {
 						case <-time.After(wait):
 						case <-ctx.Done():
-							resultsCh <- streamResult{sid: sid, rec: rec}
 							return
 						}
 					}
@@ -110,7 +144,6 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 					select {
 					case sem <- struct{}{}:
 					case <-ctx.Done():
-						resultsCh <- streamResult{sid: sid, rec: rec}
 						return
 					}
 					waited := time.Since(waitStart).Nanoseconds()
@@ -165,8 +198,6 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 				currentInflight.Add(-1)
 				<-sem
 			}
-
-			resultsCh <- streamResult{sid: sid, rec: rec}
 		}(sid, ops)
 	}
 
@@ -178,43 +209,137 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 
 	merged := metrics.NewRecorder()
 	peakByStream := make(map[int64]int64, len(byStream))
+	var firstDoneNS, lastDoneNS int64
+	haveDone := false
 	for sr := range resultsCh {
 		merged.Merge(sr.rec)
 		peakByStream[sr.sid] = sr.rec.PeakInflight
+		if !haveDone || sr.completionNS < firstDoneNS {
+			firstDoneNS = sr.completionNS
+		}
+		if sr.completionNS > lastDoneNS {
+			lastDoneNS = sr.completionNS
+		}
+		haveDone = true
 	}
 	merged.BacklogEvents = backlogEvents.Load()
 	merged.BacklogBlockedNS = backlogBlockedNS.Load()
 	merged.MaxInflightDepth = maxInflightDepth.Load()
 
-	// Count actual ops from the loaded stream map; hdr.Summary.NumOps is advisory.
 	var actualNumOps int64
 	for _, streamOps := range byStream {
 		actualNumOps += int64(len(streamOps))
 	}
 
+	out := &WorkerOutput{
+		Recorder:     merged,
+		PeakByStream: peakByStream,
+		// WallNS comes from durationNS (Go monotonic), never from cpustat, whose
+		// Sample is rusage only; this keeps CPU.WallNS == DurationNS by construction.
+		CPU:          results.CPU{UserNS: cpuDelta.UserNS, SysNS: cpuDelta.SysNS, WallNS: durationNS},
+		ActualNumOps: actualNumOps,
+		FirstDoneNS:  firstDoneNS,
+		LastDoneNS:   lastDoneNS,
+	}
+	return out, ctx.Err()
+}
+
+// BuildResults merges one or more WorkerOutputs into the final Results. For a
+// single-node run outs has one element; the distributed coordinator passes one
+// WorkerOutput per worker. Histograms merge losslessly, counters sum, CPU
+// user/sys sum (wall is the max worker wall), and the per-host breakdown plus
+// straggler window are added only for multi-host runs. goSkewNS is the measured
+// Go-delivery skew across workers (0 single-node).
+func BuildResults(outs []*WorkerOutput, opts SchedulerOpts, hdr trace.Header, goSkewNS int64) *results.Results {
+	merged := metrics.NewRecorder()
+	peakByStream := make(map[int64]int64)
+	var cpu results.CPU
+	var totalActualOps, wallNS, firstDoneNS, lastDoneNS int64
+	haveDone := false
+	for _, o := range outs {
+		merged.Merge(o.Recorder)
+		for sid, p := range o.PeakByStream {
+			if p > peakByStream[sid] {
+				peakByStream[sid] = p
+			}
+		}
+		totalActualOps += o.ActualNumOps
+		cpu.UserNS += o.CPU.UserNS
+		cpu.SysNS += o.CPU.SysNS
+		if o.CPU.WallNS > wallNS {
+			wallNS = o.CPU.WallNS
+		}
+		// first-done = earliest worker completion, last-done = latest.
+		if !haveDone || o.LastDoneNS < firstDoneNS {
+			firstDoneNS = o.LastDoneNS
+		}
+		if o.LastDoneNS > lastDoneNS {
+			lastDoneNS = o.LastDoneNS
+		}
+		haveDone = true
+	}
+	cpu.WallNS = wallNS
+
+	speedup := opts.SpeedupFactor
+	if speedup <= 0 {
+		speedup = 1
+	}
 	// Mean inter-arrival: trace duration / actual ops, divided by speedup in
 	// scaled mode so the threshold tracks the compressed real-time cadence.
 	var meanInterArrivalNS int64
-	if actualNumOps > 0 && hdr.Summary.DurationNS > 0 {
-		meanInterArrivalNS = hdr.Summary.DurationNS / actualNumOps
+	if totalActualOps > 0 && hdr.Summary.DurationNS > 0 {
+		meanInterArrivalNS = hdr.Summary.DurationNS / totalActualOps
 		if opts.Mode == "scaled" {
 			meanInterArrivalNS = int64(float64(meanInterArrivalNS) / speedup)
 		}
 	}
 
-	// Use actual op count for coverage; stale advisory header must not hide skips.
+	// Use actual op count for coverage; a stale advisory header must not hide skips.
 	correctedHdr := hdr
-	correctedHdr.Summary.NumOps = actualNumOps
+	correctedHdr.Summary.NumOps = totalActualOps
 
-	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, durationNS)
-	// WallNS comes from durationNS (Go monotonic) — never from cpustat, whose
-	// Sample is rusage only. This keeps CPU.WallNS == DurationNS by construction.
-	res.CPU = results.CPU{UserNS: cpuDelta.UserNS, SysNS: cpuDelta.SysNS, WallNS: durationNS}
+	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, wallNS)
+	res.CPU = cpu
 	res.Fidelity = fidelity.Build(merged, correctedHdr, opts.Mode, meanInterArrivalNS, peakByStream)
-	if err := ctx.Err(); err != nil {
-		return res, err
+
+	// Per-host breakdown and straggler window are meaningful only across workers.
+	if len(outs) > 1 {
+		res.GoDeliverySkewNS = goSkewNS
+		res.Hosts = make([]results.HostResult, 0, len(outs))
+		for _, o := range outs {
+			res.Hosts = append(res.Hosts, results.HostResult{
+				Hostname:     o.Hostname,
+				OpsCompleted: o.Recorder.TotalOps(),
+				BytesMoved:   o.Recorder.Bytes,
+				CPU:          o.CPU,
+				FirstDoneNS:  o.FirstDoneNS,
+				LastDoneNS:   o.LastDoneNS,
+			})
+		}
+		res.Straggler = buildStraggler(firstDoneNS, lastDoneNS, res.OpsCompleted, res.BytesMoved)
 	}
-	return res, nil
+	return res
+}
+
+// buildStraggler computes the first-done/last-done throughput window from the
+// earliest and latest worker completion times.
+func buildStraggler(firstDoneNS, lastDoneNS, ops, bytes int64) *results.StragglerWindow {
+	sw := &results.StragglerWindow{
+		FirstDoneNS: firstDoneNS,
+		LastDoneNS:  lastDoneNS,
+		SkewNS:      lastDoneNS - firstDoneNS,
+	}
+	if firstDoneNS > 0 {
+		secs := float64(firstDoneNS) / 1e9
+		sw.FirstDoneOpsPerSec = float64(ops) / secs
+		sw.FirstDoneGiBPerSec = float64(bytes) / float64(1<<30) / secs
+	}
+	if lastDoneNS > 0 {
+		secs := float64(lastDoneNS) / 1e9
+		sw.LastDoneOpsPerSec = float64(ops) / secs
+		sw.LastDoneGiBPerSec = float64(bytes) / float64(1<<30) / secs
+	}
+	return sw
 }
 
 // dispatchOp executes a single op against eng and returns bytes moved and
