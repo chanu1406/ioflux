@@ -3,7 +3,16 @@
 // events are translated; other categories and unsupported POSIX event names
 // are counted in the import Report and discarded.
 //
-// DFTracer records fname in most events so no dirfd resolution is needed.
+// Two on-disk variants are supported:
+//
+//   - Literal form: each event carries args.fname (the path), args.fd (the
+//     descriptor), and, for positional I/O, args.offset.
+//   - Hashed form (DFTracer 2.x): events reference files by args.fhash, a hash
+//     resolved to a path via "FH" metadata events, and omit fd and offset
+//     entirely. The importer builds the fhash→path table in a metadata pre-pass,
+//     keys handles by file hash, and reconstructs offsets from per-file
+//     sequential cursors.
+//
 // The fd table tracks open handles and sequential file cursors; an explicit
 // args.offset overrides the cursor (positional I/O such as pread64).
 package dftracer
@@ -24,9 +33,16 @@ const (
 	captureMethod      = trace.CaptureMethod("import:dftracer")
 	captureLimitations = "DFTracer POSIX trace; STDIO (fread/fwrite) and MPI-IO events not represented; " +
 		"mmap page-fault I/O not captured; ops on file descriptors opened before tracing are skipped; " +
-		"cross-thread fd sharing not modeled (fd opened by one thread is unresolved when accessed by another)"
+		"cross-thread fd sharing not modeled (fd opened by one thread is unresolved when accessed by another); " +
+		"hashed-filename traces (DFTracer 2.x) resolve paths via FH metadata and reconstruct read/write " +
+		"offsets from sequential per-file cursors, since that format records byte counts but no offsets"
 	generatedBy = "ioflux-import 0.1.0 / dftracer"
 )
+
+// synthFDBase is the starting value for synthetic descriptors assigned to
+// hashed-form file references. It is far above any real fd so synthetic and
+// literal descriptors never collide if a trace mixes both forms.
+const synthFDBase = 1 << 30
 
 // dfEvent is the top-level Chrome Trace Event structure for a DFTracer record.
 type dfEvent struct {
@@ -42,8 +58,12 @@ type dfEvent struct {
 // distinguish absent fields from zero values. Count, ReturnVal, and Ret use
 // json.RawMessage because older DFTracer versions serialized numeric values as
 // JSON strings (e.g. "ret":"131072"); rawInt handles both forms.
+//
+// Fhash references a file by hash (DFTracer 2.x); MetaName/MetaValue carry the
+// path and hash of an "FH" metadata event (args.name / args.value).
 type dfArgs struct {
 	Fname     string          `json:"fname"`
+	Fhash     string          `json:"fhash"`
 	Fd        *int64          `json:"fd"`
 	Offset    *int64          `json:"offset"`
 	Size      *int64          `json:"size"`
@@ -51,6 +71,8 @@ type dfArgs struct {
 	ReturnVal json.RawMessage `json:"return_val"` // preferred return field
 	Ret       json.RawMessage `json:"ret"`        // fallback return field
 	Flags     json.RawMessage `json:"flags"`      // int or string
+	MetaName  string          `json:"name"`       // FH metadata: the file path
+	MetaValue string          `json:"value"`      // FH metadata: the file hash
 }
 
 // rawInt parses a JSON value that may be either a JSON number or a quoted
@@ -97,30 +119,51 @@ type parser struct {
 	streamOrder []pidTID
 	nextStream  int64
 
+	// fhashToPath maps a DFTracer file hash to its path, collected from FH
+	// metadata events in a pre-pass. fhashFD assigns each file hash a stable
+	// synthetic descriptor so the fd table can track hashed-form handles.
+	fhashToPath map[string]string
+	fhashFD     map[string]int
+	nextSynthFD int
+
 	parsedEvents int
 	lineUnparsed int
 }
 
 func newParser() *parser {
 	return &parser{
-		b:          importer.NewBuilder(),
-		fdt:        importer.NewFDTable(),
-		ptToStream: make(map[pidTID]int64),
+		b:           importer.NewBuilder(),
+		fdt:         importer.NewFDTable(),
+		ptToStream:  make(map[pidTID]int64),
+		fhashToPath: make(map[string]string),
+		fhashFD:     make(map[string]int),
 	}
 }
 
 // Import parses a DFTracer .pfw trace from r and writes an imported .ioflux
 // trace to w. Nothing is written to w unless the produced trace passes
 // validation.
+//
+// Hashed-form traces define fhash→path in FH metadata events that may precede
+// the POSIX events using them, so the input is buffered and scanned twice: a
+// metadata pre-pass builds the hash table, then op translation runs.
 func Import(r io.Reader, w io.Writer) (importer.Report, error) {
 	p := newParser()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var lines []string
 	for sc.Scan() {
-		p.line(sc.Text())
+		lines = append(lines, sc.Text())
 	}
 	if err := sc.Err(); err != nil {
 		return importer.Report{}, fmt.Errorf("dftracer: read: %w", err)
+	}
+
+	for _, ln := range lines {
+		p.scanMeta(ln) // pass 1: fhash→path from FH metadata
+	}
+	for _, ln := range lines {
+		p.line(ln) // pass 2: translate events
 	}
 
 	if p.parsedEvents == 0 && p.lineUnparsed > 0 {
@@ -135,6 +178,23 @@ func Import(r io.Reader, w io.Writer) (importer.Report, error) {
 		Notes:              p.notes(),
 	}
 	return p.b.WriteTo(w, meta)
+}
+
+// scanMeta records fhash→path mappings from FH metadata events. It updates no
+// report counters; the translation pass owns those.
+func (p *parser) scanMeta(raw string) {
+	s := strings.TrimSpace(raw)
+	if len(s) == 0 || s[0] != '{' {
+		return
+	}
+	s = strings.TrimRight(s, ",")
+	var ev dfEvent
+	if json.Unmarshal([]byte(s), &ev) != nil {
+		return
+	}
+	if ev.Cat == "dftracer" && ev.Name == "FH" && ev.Args.MetaValue != "" && ev.Args.MetaName != "" {
+		p.fhashToPath[ev.Args.MetaValue] = ev.Args.MetaName
+	}
 }
 
 func (p *parser) line(raw string) {
@@ -163,14 +223,17 @@ func (p *parser) line(raw string) {
 	}
 	p.parsedEvents++
 
-	if ev.Cat != "POSIX" {
+	switch ev.Cat {
+	case "POSIX":
+		t := int64(ev.Ts * 1000) // microseconds → nanoseconds
+		stream := p.stream(pidTID{ev.Pid, ev.Tid})
+		p.dispatch(stream, t, ev.Name, &ev.Args)
+	case "dftracer":
+		// Trace bookkeeping (FH/HH/SH/start/end/thread_name): consumed in the
+		// metadata pass, not an I/O op — neither emitted nor counted as skipped.
+	default:
 		p.b.Skip("non_posix_event")
-		return
 	}
-
-	t := int64(ev.Ts * 1000) // microseconds → nanoseconds
-	stream := p.stream(pidTID{ev.Pid, ev.Tid})
-	p.dispatch(stream, t, ev.Name, &ev.Args)
 }
 
 func (p *parser) dispatch(stream, t int64, name string, a *dfArgs) {
@@ -196,25 +259,85 @@ func (p *parser) dispatch(stream, t int64, name string, a *dfArgs) {
 	}
 }
 
+// synthFD returns a stable synthetic descriptor for a file hash, assigning a new
+// one on first sighting. The fd table then tracks hashed-form handles through
+// the same code path as literal descriptors.
+func (p *parser) synthFD(fhash string) int {
+	if fd, ok := p.fhashFD[fhash]; ok {
+		return fd
+	}
+	fd := synthFDBase + p.nextSynthFD
+	p.nextSynthFD++
+	p.fhashFD[fhash] = fd
+	return fd
+}
+
+// resolvePath returns the file path for an event: the literal fname when
+// present, otherwise the path mapped from fhash via FH metadata. ok is false
+// when a hashed reference names an undefined hash, or no file is identified.
+func (p *parser) resolvePath(a *dfArgs) (string, bool) {
+	if a.Fname != "" {
+		return a.Fname, true
+	}
+	if a.Fhash != "" {
+		path, ok := p.fhashToPath[a.Fhash]
+		return path, ok
+	}
+	return "", false
+}
+
+// resolveFDKey returns the fd-table key for an I/O event: the literal fd when
+// present, otherwise a synthetic descriptor derived from the file hash. ok is
+// false when the event identifies no descriptor or hash.
+func (p *parser) resolveFDKey(a *dfArgs) (int, bool) {
+	if a.Fd != nil {
+		return int(*a.Fd), true
+	}
+	if a.Fhash != "" {
+		return p.synthFD(a.Fhash), true
+	}
+	return 0, false
+}
+
 func (p *parser) doOpen(stream, t int64, a *dfArgs) {
-	rv, ok := a.retVal()
-	if !ok || rv < 0 {
+	rv, hasRV := a.retVal()
+	if hasRV && rv < 0 {
 		p.b.Skip("failed_open")
 		return
 	}
-	if a.Fname == "" {
-		p.b.Skip("unparseable_event")
+	path, ok := p.resolvePath(a)
+	if !ok {
+		if a.Fhash != "" {
+			p.b.Skip("unresolved_fhash")
+		} else {
+			p.b.Skip("unparseable_event")
+		}
 		return
 	}
 	mode, flags, isDir, isApp := parseOpenFlags(a.Flags)
 	if isDir {
-		// Directory fds not needed for resolution in DFTracer (fname is always
-		// present), so we discard directory opens entirely.
+		// Directory fds not needed for resolution in DFTracer (the path is
+		// always recoverable), so directory opens are discarded entirely.
 		return
 	}
-	newFD := int(rv)
-	tgt := p.b.Target(a.Fname, trace.TargetFile)
-	h := p.fdt.Open(stream, newFD, tgt, a.Fname, isApp)
+
+	// Descriptor key: literal form returns the fd in return_val; hashed form
+	// carries no fd, so a synthetic descriptor is keyed off the file hash.
+	var fdKey int
+	switch {
+	case a.Fd != nil:
+		fdKey = int(*a.Fd)
+	case hasRV:
+		fdKey = int(rv)
+	case a.Fhash != "":
+		fdKey = p.synthFD(a.Fhash)
+	default:
+		p.b.Skip("failed_open")
+		return
+	}
+
+	tgt := p.b.Target(path, trace.TargetFile)
+	h := p.fdt.Open(stream, fdKey, tgt, path, isApp)
 	op := trace.Op{T: t, S: stream, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h), Mode: mode}
 	if len(flags) > 0 {
 		op.Flags = flags
@@ -223,12 +346,12 @@ func (p *parser) doOpen(stream, t int64, a *dfArgs) {
 }
 
 func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind, positional bool) {
-	if a.Fd == nil {
+	fdKey, ok := p.resolveFDKey(a)
+	if !ok {
 		p.b.Skip("unresolved_fd")
 		return
 	}
-	fd := int(*a.Fd)
-	e, ok := p.fdt.Resolve(stream, fd)
+	e, ok := p.fdt.Resolve(stream, fdKey)
 	if !ok || !e.HasHandle {
 		p.b.Skip("unresolved_fd")
 		return
@@ -258,22 +381,22 @@ func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind, positional 
 		off = *a.Offset
 	} else {
 		off = e.Cursor
-		p.fdt.Advance(stream, fd, n)
+		p.fdt.Advance(stream, fdKey, n)
 	}
 	p.b.Add(trace.Op{T: t, S: stream, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n)})
 }
 
 func (p *parser) doClose(stream, t int64, a *dfArgs) {
-	if a.Fd == nil {
+	fdKey, ok := p.resolveFDKey(a)
+	if !ok {
 		return
 	}
-	fd := int(*a.Fd)
 	rv, _ := a.retVal()
 	if rv < 0 {
 		p.b.Skip("failed_syscall")
 		return
 	}
-	h, hadHandle := p.fdt.Close(stream, fd)
+	h, hadHandle := p.fdt.Close(stream, fdKey)
 	if !hadHandle {
 		return
 	}
@@ -281,18 +404,20 @@ func (p *parser) doClose(stream, t int64, a *dfArgs) {
 }
 
 func (p *parser) doLseek(stream int64, a *dfArgs) {
-	if a.Fd == nil {
+	fdKey, ok := p.resolveFDKey(a)
+	if !ok {
 		return
 	}
 	pos, ok := a.retVal()
 	if !ok || pos < 0 {
 		return
 	}
-	p.fdt.SetCursor(stream, int(*a.Fd), pos)
+	p.fdt.SetCursor(stream, fdKey, pos)
 }
 
 func (p *parser) doFsync(stream, t int64, a *dfArgs) {
-	if a.Fd == nil {
+	fdKey, ok := p.resolveFDKey(a)
+	if !ok {
 		p.b.Skip("unparseable_event")
 		return
 	}
@@ -301,7 +426,7 @@ func (p *parser) doFsync(stream, t int64, a *dfArgs) {
 		p.b.Skip("failed_syscall")
 		return
 	}
-	e, ok := p.fdt.Resolve(stream, int(*a.Fd))
+	e, ok := p.fdt.Resolve(stream, fdKey)
 	if !ok || !e.HasHandle {
 		p.b.Skip("unresolved_fd")
 		return

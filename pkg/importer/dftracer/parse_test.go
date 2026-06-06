@@ -415,6 +415,79 @@ func TestImport_RealDFTracerGzip(t *testing.T) {
 	assertValid(t, buf.Bytes())
 }
 
+// hashedTrace models the DFTracer 2.x on-disk format: files are referenced by
+// args.fhash (resolved via "FH" metadata events), events carry no fd and no
+// offset, and dftracer-category metadata is interleaved. Two threads (tids)
+// each read one file; one open references an undefined hash.
+const hashedTrace = `[
+{"name":"FH","cat":"dftracer","pid":100,"tid":100,"ph":"M","args":{"hhash":"hh","name":"/data/shard0.bin","value":"aaa"}}
+{"name":"FH","cat":"dftracer","pid":100,"tid":101,"ph":"M","args":{"hhash":"hh","name":"/data/shard1.bin","value":"bbb"}}
+{"name":"start","cat":"dftracer","pid":100,"tid":100,"ts":1.0,"dur":0.0,"ph":"X","args":{"version":"v2.0.3"}}
+{"name":"open64","cat":"POSIX","pid":100,"tid":100,"ts":10.0,"dur":1.0,"ph":"X","args":{"hhash":"hh","flags":524288,"fhash":"aaa"}}
+{"name":"read","cat":"POSIX","pid":100,"tid":100,"ts":11.0,"dur":2.0,"ph":"X","args":{"hhash":"hh","ret":4096,"count":4096,"fhash":"aaa"}}
+{"name":"read","cat":"POSIX","pid":100,"tid":100,"ts":12.0,"dur":2.0,"ph":"X","args":{"hhash":"hh","ret":2048,"count":2048,"fhash":"aaa"}}
+{"name":"close","cat":"POSIX","pid":100,"tid":100,"ts":13.0,"dur":1.0,"ph":"X","args":{"hhash":"hh","ret":0,"fhash":"aaa"}}
+{"name":"open64","cat":"POSIX","pid":100,"tid":101,"ts":10.0,"dur":1.0,"ph":"X","args":{"hhash":"hh","flags":0,"fhash":"bbb"}}
+{"name":"read","cat":"POSIX","pid":100,"tid":101,"ts":11.0,"dur":2.0,"ph":"X","args":{"hhash":"hh","ret":8192,"count":8192,"fhash":"bbb"}}
+{"name":"close","cat":"POSIX","pid":100,"tid":101,"ts":13.0,"dur":1.0,"ph":"X","args":{"hhash":"hh","ret":0,"fhash":"bbb"}}
+{"name":"open64","cat":"POSIX","pid":100,"tid":100,"ts":20.0,"dur":1.0,"ph":"X","args":{"hhash":"hh","flags":0,"fhash":"undefined999"}}
+]`
+
+func TestImport_HashedFormat(t *testing.T) {
+	var buf bytes.Buffer
+	rep, err := dftracer.Import(strings.NewReader(hashedTrace), &buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+
+	// tid100: OPEN READ(0,4096) READ(4096,2048) CLOSE = 4
+	// tid101: OPEN READ(0,8192) CLOSE = 3  → 7 ops, 2 streams, 2 targets.
+	if rep.NumOps != 7 || rep.NumStreams != 2 || rep.NumTargets != 2 {
+		t.Errorf("report = %d ops / %d streams / %d targets; want 7/2/2",
+			rep.NumOps, rep.NumStreams, rep.NumTargets)
+	}
+	// The open of an undefined hash is the only skip; dftracer-category metadata
+	// (FH/start) must not be counted as skipped ops.
+	if rep.SkippedReasons["unresolved_fhash"] != 1 {
+		t.Errorf("unresolved_fhash = %d, want 1", rep.SkippedReasons["unresolved_fhash"])
+	}
+	if rep.SkippedOps != 1 {
+		t.Errorf("SkippedOps = %d, want 1 (metadata must not count as skips)", rep.SkippedOps)
+	}
+
+	hdr, ops := readTrace(t, buf.Bytes())
+	names := map[string]bool{}
+	for _, tg := range hdr.Targets {
+		names[tg.Name] = true
+	}
+	if !names["/data/shard0.bin"] || !names["/data/shard1.bin"] {
+		t.Errorf("targets not resolved from fhash; got %v", targetNames(hdr))
+	}
+
+	// Offsets must be reconstructed from per-file cursors (no offset in source).
+	var sawRead0, sawRead4096, sawRead8192 bool
+	for _, op := range ops {
+		if op.Op != trace.OpRead || op.Off == nil || op.Len == nil {
+			continue
+		}
+		switch {
+		case *op.Off == 0 && *op.Len == 4096:
+			sawRead0 = true
+		case *op.Off == 4096 && *op.Len == 2048:
+			sawRead4096 = true
+		case *op.Off == 0 && *op.Len == 8192:
+			sawRead8192 = true
+		}
+	}
+	if !sawRead0 || !sawRead4096 {
+		t.Error("shard0 reads must be cursor-tracked at off=0 then off=4096")
+	}
+	if !sawRead8192 {
+		t.Error("shard1 read must be at off=0 len=8192")
+	}
+}
+
 func TestImport_MultiStream(t *testing.T) {
 	// Two processes each open fd=3; distinct streams must have non-colliding handles.
 	var buf bytes.Buffer
