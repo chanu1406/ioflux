@@ -63,6 +63,10 @@ type WorkerOutput struct {
 	// times, relative to its run start.
 	FirstDoneNS int64
 	LastDoneNS  int64
+	// EngineLimitations are honesty notes the engine recorded during the run
+	// (e.g. O_DIRECT not honored). The coordinator unions them into RunEnv so a
+	// distributed run reports them as faithfully as a single-node run.
+	EngineLimitations []string
 }
 
 // schedule runs all streams of a single (in-process) worker and builds the
@@ -115,6 +119,13 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 	cpuStart := cpustat.Now()
 
 	isTimeline := opts.Mode == "timeline" || opts.Mode == "scaled"
+
+	// Fire one immediate (0,0) tick so a coordinator can timestamp when this
+	// worker actually began running — the basis for the Go-delivery skew diagnostic.
+	// It is monotonic with later ticks and never exceeds final totals.
+	if opts.Progress != nil {
+		opts.Progress(0, 0)
+	}
 
 	var wg sync.WaitGroup
 	for sid, ops := range byStream {
@@ -334,6 +345,13 @@ func BuildResults(outs []*WorkerOutput, opts SchedulerOpts, hdr trace.Header, go
 	res.CPU = cpu
 	res.Fidelity = fidelity.Build(merged, correctedHdr, opts.Mode, meanInterArrivalNS, peakByStream)
 
+	// Union per-worker engine limitations (e.g. O_DIRECT fallback) into the report
+	// so distributed runs stay as honest as single-node ones about what the backend
+	// actually did. Deduplicated, since workers on the same filesystem repeat them.
+	if lims := unionEngineLimitations(outs); len(lims) > 0 {
+		res.RunEnv.EngineLimitations = append(res.RunEnv.EngineLimitations, lims...)
+	}
+
 	// Per-host breakdown and straggler window are meaningful only across workers.
 	if len(outs) > 1 {
 		res.GoDeliverySkewNS = goSkewNS
@@ -351,6 +369,23 @@ func BuildResults(outs []*WorkerOutput, opts SchedulerOpts, hdr trace.Header, go
 		res.Straggler = buildStraggler(outs, res.OpsCompleted, res.BytesMoved)
 	}
 	return res
+}
+
+// unionEngineLimitations collects the distinct engine-limitation notes reported
+// by the workers, preserving first-seen order.
+func unionEngineLimitations(outs []*WorkerOutput) []string {
+	seen := make(map[string]struct{})
+	var lims []string
+	for _, o := range outs {
+		for _, l := range o.EngineLimitations {
+			if _, ok := seen[l]; ok {
+				continue
+			}
+			seen[l] = struct{}{}
+			lims = append(lims, l)
+		}
+	}
+	return lims
 }
 
 // buildStraggler computes the completion-skew window across workers. Idle workers

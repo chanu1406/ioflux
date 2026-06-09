@@ -1,17 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync"
 
 	"github.com/chanuollala/ioflux/pkg/cluster"
 	"github.com/chanuollala/ioflux/pkg/engine"
-	"github.com/chanuollala/ioflux/pkg/engine/localfile"
 	s3engine "github.com/chanuollala/ioflux/pkg/engine/s3"
-	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -33,6 +34,8 @@ Flags:
   --prepare <mode>      Dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source
   --source-root <path>  Local source path for --prepare materialize-from-source
   --cache-mode <mode>   Cache state: cold | warm (default cold)
+  --hosts <list>        Comma-separated worker addresses (e.g. hostA:7800,hostB:7800).
+                        Omit for a single-node run (an in-process worker).
   -o <path>             Output path for results.json (required; use - for stdout)
   --csv <path>          Append a CSV row to this file (optional; header written once)
 
@@ -78,6 +81,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		speedup          float64
 		outPath          string
 		csvPath          string
+		hosts            string
 		targetMapPath    string
 		allowPassthrough bool
 		prepareMode      string
@@ -94,6 +98,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
 	fs.StringVar(&outPath, "o", "", "output path for results.json (required; - for stdout)")
 	fs.StringVar(&csvPath, "csv", "", "append a CSV row to this file (optional)")
+	fs.StringVar(&hosts, "hosts", "", "comma-separated worker addresses; empty = single-node in-process worker")
 	fs.StringVar(&targetMapPath, "target-map", "", "path to YAML target-map config (optional)")
 	fs.BoolVar(&allowPassthrough, "allow-passthrough", false, "allow unmatched targets to pass through unchanged")
 	fs.StringVar(&prepareMode, "prepare", "", "dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source")
@@ -142,76 +147,86 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// Open and parse trace.
-	f, err := os.Open(tracePath)
+	// Read the trace into memory; the plan inlines it for every worker.
+	traceBytes, err := os.ReadFile(tracePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux run: open trace: %v\n", err)
 		return 2
 	}
-	defer f.Close()
-
-	r, err := trace.NewReader(f)
+	r, err := trace.NewReader(bytes.NewReader(traceBytes))
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux run: parse trace: %v\n", err)
 		return 1
 	}
 	hdr := r.Header()
 
-	eng, bucket, err := buildRunEngine(cluster.EngineSpec{
+	spec := cluster.EngineSpec{
 		Name:           engineName,
 		CacheMode:      cacheMode,
 		AllowDirect:    allowDirect,
 		DirectFallback: directFallback,
 		DirectAlign:    directAlign,
 		S3:             s3Cfg,
-	}, hdr)
-	if err != nil {
+	}
+	// Pre-flight: validate the engine config now so usage errors (missing bucket,
+	// bad multipart size) fail fast as exit-2 before any distribution. The worker
+	// rebuilds the engine from the same spec at PREPARE.
+	if _, _, err := buildRunEngine(spec, hdr); err != nil {
 		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
 		return 2
 	}
 
-	var tmap *targetmap.Map
+	var rewriteRules []targetmap.Rule
 	if targetMapPath != "" {
-		tmap, err = targetmap.Load(targetMapPath)
+		tmap, err := targetmap.Load(targetMapPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
 			return 1
 		}
-		if allowPassthrough {
-			tmap.AllowPassthrough = true
+		rewriteRules = tmap.Rules
+		allowPassthrough = allowPassthrough || tmap.AllowPassthrough
+	}
+
+	plan := cluster.Plan{
+		TracePath:        tracePath,
+		TraceBytes:       traceBytes,
+		Engine:           spec,
+		Mode:             mode,
+		MaxInflight:      maxInflight,
+		SpeedupFactor:    speedup,
+		TargetRewrite:    rewriteRules,
+		AllowPassthrough: allowPassthrough,
+		PrepareMode:      prepareMode,
+		SourceRoot:       sourceRoot,
+		CacheMode:        cacheMode,
+	}
+
+	workers, err := buildWorkers(hosts)
+	if err != nil {
+		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+		return 2
+	}
+	defer closeWorkers(workers)
+
+	coord := &cluster.Coordinator{}
+	// Live per-host progress + warnings only for distributed runs, so single-node
+	// output stays quiet and unchanged.
+	if len(workers) > 1 {
+		var pmu sync.Mutex
+		coord.Progress = func(host string, ops, b int64) {
+			pmu.Lock()
+			defer pmu.Unlock()
+			fmt.Fprintf(stderr, "  [%s] %d ops   %s\n", host, ops, fmtBytes(b))
+		}
+		coord.Logf = func(format string, args ...any) {
+			fmt.Fprintf(stderr, "ioflux run: "+format+"\n", args...)
 		}
 	}
 
-	plan := replay.Plan{
-		TracePath:     tracePath,
-		Engine:        eng,
-		EngineName:    engineName,
-		Mode:          mode,
-		MaxInflight:   maxInflight,
-		SpeedupFactor: speedup,
-		TargetMap:     tmap,
-		Bucket:        bucket,
-		PrepareMode:   prepareMode,
-		SourceRoot:    sourceRoot,
-		CacheMode:     cacheMode,
-	}
-	exec, err := replay.Prepare(plan, r)
+	res, err := coord.Run(context.Background(), plan, workers)
 	if err != nil {
-		fmt.Fprintf(stderr, "ioflux run: prepare: %v\n", err)
+		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
 		return 1
-	}
-
-	res, err := exec.Run(context.Background())
-	if err != nil {
-		fmt.Fprintf(stderr, "ioflux run: replay: %v\n", err)
-		return 1
-	}
-
-	// Collect engine limitations (e.g. O_DIRECT fallback) into the results.
-	if lfe, ok := eng.(*localfile.LocalFileEngine); ok {
-		if lims := lfe.Limitations(); len(lims) > 0 {
-			res.RunEnv.EngineLimitations = lims
-		}
 	}
 
 	// Write output.
@@ -252,6 +267,44 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// buildWorkers returns the workers for a run. An empty hosts string yields a
+// single in-process worker (single-node); otherwise each comma-separated address
+// is dialed as a gRPC worker. Both paths drive the same Coordinator code.
+func buildWorkers(hosts string) ([]cluster.Worker, error) {
+	addrs := splitHosts(hosts)
+	if len(addrs) == 0 {
+		return []cluster.Worker{cluster.NewLocalWorker(cluster.NewSession())}, nil
+	}
+	workers := make([]cluster.Worker, 0, len(addrs))
+	for _, addr := range addrs {
+		w, err := cluster.DialWorker(addr)
+		if err != nil {
+			closeWorkers(workers)
+			return nil, fmt.Errorf("dial worker %q: %w", addr, err)
+		}
+		workers = append(workers, w)
+	}
+	return workers, nil
+}
+
+// splitHosts parses a comma-separated host list, trimming spaces and dropping
+// empty entries.
+func splitHosts(hosts string) []string {
+	var addrs []string
+	for _, h := range strings.Split(hosts, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			addrs = append(addrs, h)
+		}
+	}
+	return addrs
+}
+
+func closeWorkers(workers []cluster.Worker) {
+	for _, w := range workers {
+		_ = w.Close()
+	}
 }
 
 func buildRunEngine(spec cluster.EngineSpec, hdr trace.Header) (engine.Engine, string, error) {

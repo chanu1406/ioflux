@@ -79,6 +79,9 @@ func (a *assumeExisting) Prepare(ctx context.Context, targets, _ []trace.TargetI
 	var stats Stats
 	useHead := eng.Caps().ObjectAPI
 	for _, tgt := range targets {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		var info engine.ObjectInfo
 		var err error
 		if useHead {
@@ -111,6 +114,9 @@ func (m *materializeSynthetic) Prepare(ctx context.Context, targets, _ []trace.T
 	buf := make([]byte, prepareChunkSize) // allocated once; reused across all targets
 
 	for _, tgt := range targets {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		size, ok := sizes[tgt.Name]
 		if !ok || size == 0 {
 			return stats, fmt.Errorf("prepare: materialize-synthetic: target %q: size unknown and no READ/WRITE ops found; re-run with --prepare assume-existing if target is already provisioned", tgt.Name)
@@ -183,6 +189,12 @@ func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64,
 	}
 	var off int64
 	for off < size {
+		// Check cancellation each chunk so a single large target stops promptly
+		// (engine writes may not observe ctx themselves).
+		if err := ctx.Err(); err != nil {
+			_ = eng.Close(ctx, h)
+			return err
+		}
 		n := int64(len(buf))
 		if remaining := size - off; remaining < n {
 			n = remaining
@@ -247,6 +259,9 @@ func (m *materializeFromSource) Prepare(ctx context.Context, targets, originalTa
 	}
 
 	for i, tgt := range targets {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		srcPath := filepath.Join(m.root, originalTargets[i].Name)
 		if err := copyTarget(ctx, eng, tgt.Name, srcPath, buf); err != nil {
 			return stats, fmt.Errorf("prepare: materialize-from-source: %w", err)
@@ -278,6 +293,11 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 	}
 	var off int64
 	for {
+		// Check cancellation each chunk so a single large copy stops promptly.
+		if err := ctx.Err(); err != nil {
+			_ = eng.Close(ctx, h)
+			return err
+		}
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			written, writeErr := eng.Write(ctx, h, off, buf[:n])

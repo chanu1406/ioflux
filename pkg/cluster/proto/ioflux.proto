@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+// Package clusterpb defines the IOFlux coordinator/worker wire protocol.
+// Workers are gRPC servers; the coordinator dials each worker as a client.
+package clusterpb;
+
+option go_package = "github.com/chanuollala/ioflux/pkg/cluster/proto;clusterpb";
+
+// Worker is the service a replay worker exposes. The coordinator drives it
+// through the phase protocol: Register, Prepare (barrier), Run (streamed
+// heartbeat), Collect.
+service Worker {
+  // Register returns the worker's identity for version/capability checks.
+  rpc Register(RegisterRequest) returns (WorkerInfo);
+  // Prepare loads+validates the trace, builds the engine, runs dataset prep,
+  // and applies cache controls. A successful response is the PREPARE barrier ack.
+  rpc Prepare(Plan) returns (PrepareAck);
+  // Run replays the assigned streams. The response stream carries periodic
+  // Progress heartbeats; the server closing the stream signals Finished (DONE).
+  rpc Run(GoSignal) returns (stream Progress);
+  // Collect returns the worker's raw output for the coordinator to merge.
+  rpc Collect(CollectRequest) returns (WorkerResults);
+}
+
+message RegisterRequest {
+  // coordinator_version lets a worker reject a mismatched coordinator too.
+  string coordinator_version = 1;
+}
+
+message WorkerInfo {
+  string hostname = 1;
+  int32 cpus = 2;
+  string version = 3;
+}
+
+// S3Config mirrors pkg/engine/s3.Config.
+message S3Config {
+  string endpoint = 1;
+  string region = 2;
+  string bucket = 3;
+  bool path_style = 4;
+  string access_key = 5;
+  string secret_key = 6;
+  string session_token = 7;
+  int64 multipart_threshold = 8;
+  int64 multipart_part_size = 9;
+  bool disable_http_keep_alive = 10;
+  bool head_on_open = 11;
+}
+
+// EngineSpec mirrors cluster.EngineSpec.
+message EngineSpec {
+  string name = 1;
+  string cache_mode = 2;
+  bool allow_direct = 3;
+  bool direct_fallback = 4;
+  int64 direct_align = 5;
+  S3Config s3 = 6;
+  map<string, int64> target_sizes = 7;
+}
+
+// TargetRule mirrors targetmap.Rule.
+message TargetRule {
+  string from = 1;
+  string to = 2;
+}
+
+// Plan is one worker's share of a run (cluster.Plan). The trace is inlined as
+// bytes; a shared trace_ref path is a future optimization for very large traces.
+message Plan {
+  string trace_path = 1;
+  bytes trace_bytes = 2;
+  repeated int64 assigned_streams = 3;
+  EngineSpec engine = 4;
+  string mode = 5;
+  int32 max_inflight = 6;
+  double speedup_factor = 7;
+  repeated TargetRule target_rewrite = 8;
+  bool allow_passthrough = 9;
+  string prepare_mode = 10;
+  string source_root = 11;
+  string cache_mode = 12;
+}
+
+// PrepStats mirrors prepare.Stats.
+message PrepStats {
+  int32 verified = 1;
+  int32 created = 2;
+  int32 copied = 3;
+  int32 skipped_size_unknown = 4;
+  int32 derived_size_from_ops = 5;
+  bool touched_same_data = 6;
+}
+
+// CacheResult mirrors cache.Result.
+message CacheResult {
+  repeated string actions = 1;
+  repeated string limitations = 2;
+  int32 primed = 3;
+}
+
+message PrepareAck {
+  PrepStats prep_stats = 1;
+  CacheResult cache_result = 2;
+}
+
+// GoSignal starts the RUN phase. go_epoch_ns is the coordinator's logical T0 in
+// its own clock; a remote worker schedules from its own monotonic now at receipt
+// (no cross-host wall-clock sync is assumed), so this is advisory.
+message GoSignal {
+  int64 go_epoch_ns = 1;
+}
+
+message Progress {
+  int64 ops = 1;
+  int64 bytes = 2;
+}
+
+message CollectRequest {}
+
+// HistSnapshot mirrors metrics.HistSnapshot — a lossless HDR snapshot.
+message HistSnapshot {
+  int64 low = 1;
+  int64 high = 2;
+  int32 sig_figs = 3;
+  repeated int64 counts = 4;
+}
+
+// RecorderSnapshot mirrors metrics.RecorderSnapshot.
+message RecorderSnapshot {
+  map<string, HistSnapshot> histograms = 1;
+  HistSnapshot drift_hist = 2;
+  HistSnapshot completion_lag_hist = 3;
+  map<string, int64> counts = 4;
+  int64 bytes = 5;
+  int64 errors = 6;
+  int64 backlog_events = 7;
+  int64 backlog_blocked_ns = 8;
+  int64 max_inflight_depth = 9;
+  int64 peak_inflight = 10;
+}
+
+// CPU mirrors results.CPU.
+message CPU {
+  int64 user_ns = 1;
+  int64 sys_ns = 2;
+  int64 wall_ns = 3;
+}
+
+// WorkerResults mirrors replay.WorkerOutput (recorder serialized losslessly).
+message WorkerResults {
+  RecorderSnapshot recorder = 1;
+  CPU cpu = 2;
+  int64 actual_num_ops = 3;
+  int64 first_done_ns = 4;
+  int64 last_done_ns = 5;
+  string hostname = 6;
+  map<int64, int64> peak_by_stream = 7;
+  // engine_limitations are honesty notes the engine recorded during the run
+  // (e.g. O_DIRECT not honored on this filesystem), surfaced in the report.
+  repeated string engine_limitations = 8;
+}

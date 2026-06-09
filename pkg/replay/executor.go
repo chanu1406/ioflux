@@ -51,11 +51,15 @@ type Plan struct {
 
 // Executor holds the loaded, validated plan ready for execution.
 type Executor struct {
-	plan      Plan
-	hdr       trace.Header
-	byStream  map[int64][]trace.Op
-	allOps    []trace.Op
-	prepStats prepare.Stats
+	plan     Plan
+	hdr      trace.Header
+	byStream map[int64][]trace.Op
+	allOps   []trace.Op
+	// originalTargets is the pre-rewrite target slice, kept so Materialize can
+	// locate source files for materialize-from-source.
+	originalTargets []trace.TargetInfo
+	prepStats       prepare.Stats
+	materialized    bool
 }
 
 // Prepare loads all ops from r, validates that every op is compatible with
@@ -113,21 +117,35 @@ func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
 		}
 	}
 
-	// Dataset preparation — runs before the replay executor (and Recorder) is
-	// constructed, so its I/O is never credited to results.
-	var prepStats prepare.Stats
-	if plan.PrepareMode != "" {
-		prep, err := prepare.For(prepare.Mode(plan.PrepareMode), plan.SourceRoot)
-		if err != nil {
-			return nil, fmt.Errorf("replay: prepare: dataset prep: %w", err)
-		}
-		prepStats, err = prep.Prepare(context.Background(), hdr.Targets, originalTargets, ops, plan.Engine)
-		if err != nil {
-			return nil, fmt.Errorf("replay: prepare: dataset prep: %w", err)
-		}
-	}
+	// Dataset preparation is deferred to Materialize so it honors a caller's
+	// context (a cancelled PREPARE phase must not keep materializing data).
+	return &Executor{plan: plan, hdr: hdr, byStream: byStream, allOps: ops, originalTargets: originalTargets}, nil
+}
 
-	return &Executor{plan: plan, hdr: hdr, byStream: byStream, allOps: ops, prepStats: prepStats}, nil
+// Materialize runs dataset preparation against the backend for the configured
+// PrepareMode. It is the side-effecting half of the PREPARE phase, kept separate
+// from trace loading so it honors ctx: a coordinator cancelling PREPARE (or a
+// dropped connection) stops in-progress materialization instead of letting a
+// large copy run to completion. It is idempotent (a no-op after the first call)
+// and a no-op when no PrepareMode is configured. Its I/O is never credited to
+// results — it runs before the Recorder exists.
+func (e *Executor) Materialize(ctx context.Context) (prepare.Stats, error) {
+	if e.materialized {
+		return e.prepStats, nil
+	}
+	if e.plan.PrepareMode != "" {
+		prep, err := prepare.For(prepare.Mode(e.plan.PrepareMode), e.plan.SourceRoot)
+		if err != nil {
+			return prepare.Stats{}, fmt.Errorf("replay: materialize: %w", err)
+		}
+		stats, err := prep.Prepare(ctx, e.hdr.Targets, e.originalTargets, e.allOps, e.plan.Engine)
+		if err != nil {
+			return prepare.Stats{}, fmt.Errorf("replay: materialize: %w", err)
+		}
+		e.prepStats = stats
+	}
+	e.materialized = true
+	return e.prepStats, nil
 }
 
 func formatValidationErrors(rep trace.Report) string {
@@ -185,7 +203,11 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
 	}
 
-	// Apply cache-state controls before the measured run.
+	// Dataset preparation and cache-state controls run before the measured run,
+	// so their I/O is never credited to results.
+	if _, err := e.Materialize(ctx); err != nil {
+		return nil, err
+	}
 	cacheRes := e.ApplyCache(ctx)
 
 	planInfo := results.PlanInfo{
