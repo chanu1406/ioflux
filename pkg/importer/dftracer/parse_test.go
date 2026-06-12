@@ -78,6 +78,26 @@ func targetNames(hdr trace.Header) []string {
 	return ns
 }
 
+func TestImport_PreservesDurations(t *testing.T) {
+	input := `[
+{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","flags":0,"return_val":3}},
+{"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.5,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":4,"return_val":4}},
+{"name":"close","cat":"POSIX","ph":"X","ts":1020.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"return_val":0}}
+]`
+	var buf bytes.Buffer
+	if _, err := dftracer.Import(strings.NewReader(input), &buf); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+	_, ops := readTrace(t, buf.Bytes())
+	if len(ops) != 3 {
+		t.Fatalf("ops=%d, want 3", len(ops))
+	}
+	if ops[1].Dur == nil || *ops[1].Dur != 5_500 {
+		t.Fatalf("READ dur=%v, want 5500ns", ops[1].Dur)
+	}
+}
+
 func TestImport_Basic(t *testing.T) {
 	in, err := os.ReadFile("testdata/basic.pfw")
 	if err != nil {

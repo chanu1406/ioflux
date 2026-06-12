@@ -212,6 +212,7 @@ type Op struct {
 	Flags []string `json:"flags,omitempty"`
 	Off   *int64   `json:"off,omitempty"`
 	Len   *int64   `json:"len,omitempty"`
+	Dur   *int64   `json:"dur,omitempty"`
 }
 
 // Ptr returns a pointer to v. Convenience for constructing Op values in

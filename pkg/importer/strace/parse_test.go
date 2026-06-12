@@ -75,6 +75,19 @@ func assertValid(t *testing.T, b []byte) {
 	}
 }
 
+func TestImport_PreservesDurations(t *testing.T) {
+	_, _, ops := importString(t, `3201  10:00:00.000000 openat(AT_FDCWD, "/data/a.bin", O_RDONLY) = 3 <0.000010>
+3201  10:00:00.000100 read(3, "x"..., 4) = 4 <0.000123>
+3201  10:00:00.000200 close(3) = 0 <0.000020>
+`)
+	if len(ops) != 3 {
+		t.Fatalf("ops=%d, want 3", len(ops))
+	}
+	if ops[1].Dur == nil || *ops[1].Dur != 123_000 {
+		t.Fatalf("READ dur=%v, want 123000ns", ops[1].Dur)
+	}
+}
+
 func TestImport_Basic(t *testing.T) {
 	in, err := os.ReadFile("testdata/basic.strace")
 	if err != nil {

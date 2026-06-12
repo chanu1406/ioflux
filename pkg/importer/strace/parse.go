@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/chanuollala/ioflux/pkg/importer"
@@ -22,7 +23,7 @@ const (
 	captureMethod      = "import:strace"
 	captureLimitations = "strace syscall trace; mmap page-fault I/O not captured; " +
 		"ops on file descriptors opened before tracing or shared across threads are skipped; " +
-		"STDIO/socket/non-file syscalls and durations ignored"
+		"STDIO/socket/non-file syscalls ignored; strace -T durations are preserved as optional op metadata"
 	generatedBy = "ioflux-import 0.1.0 / strace"
 )
 
@@ -171,30 +172,31 @@ func (p *parser) handle(pid, tNS int64, name, args, ret string) {
 	// Absolute time; the Builder rebases all ops to the global minimum so the
 	// trace starts at t=0 regardless of emission order.
 	t := tNS
+	ret, dur := splitRetDuration(ret)
 	a := splitArgs(args)
 	switch name {
 	case "open", "open64":
-		p.doOpen(s, t, a, ret, false, false)
+		p.doOpen(s, t, a, ret, dur, false, false)
 	case "openat":
-		p.doOpen(s, t, a, ret, true, false)
+		p.doOpen(s, t, a, ret, dur, true, false)
 	case "openat2":
-		p.doOpen(s, t, a, ret, true, true)
+		p.doOpen(s, t, a, ret, dur, true, true)
 	case "creat":
-		p.doCreat(s, t, a, ret)
+		p.doCreat(s, t, a, ret, dur)
 	case "read", "read64", "pread64", "pread":
-		p.doRW(s, t, name, a, ret, trace.OpRead)
+		p.doRW(s, t, name, a, ret, dur, trace.OpRead)
 	case "write", "write64", "pwrite64", "pwrite":
-		p.doRW(s, t, name, a, ret, trace.OpWrite)
+		p.doRW(s, t, name, a, ret, dur, trace.OpWrite)
 	case "close":
-		p.doClose(s, t, a, ret)
+		p.doClose(s, t, a, ret, dur)
 	case "fsync", "fdatasync":
-		p.doFsync(s, t, a, ret)
+		p.doFsync(s, t, a, ret, dur)
 	case "lseek", "lseek64", "_llseek":
 		p.doLseek(s, a, ret)
 	case "stat", "stat64", "lstat", "lstat64", "access", "statx", "newfstatat":
-		p.doStatPath(s, t, name, a, ret)
+		p.doStatPath(s, t, name, a, ret, dur)
 	case "fstat", "fstat64", "fstatfs":
-		p.doFstat(s, t, a, ret)
+		p.doFstat(s, t, a, ret, dur)
 	default:
 		// Non-file syscalls (mmap, brk, futex, socket I/O, ...) are ignored,
 		// not counted: counting every such call would drown the Report.
@@ -208,11 +210,29 @@ func failedRet(ret string) bool {
 	return ok && n < 0
 }
 
+func splitRetDuration(ret string) (string, *int64) {
+	ret = strings.TrimSpace(ret)
+	if !strings.HasSuffix(ret, ">") {
+		return ret, nil
+	}
+	open := strings.LastIndex(ret, "<")
+	if open < 0 {
+		return ret, nil
+	}
+	raw := strings.TrimSpace(ret[open+1 : len(ret)-1])
+	secs, err := strconv.ParseFloat(raw, 64)
+	if err != nil || secs < 0 {
+		return ret, nil
+	}
+	ns := int64(secs * 1e9)
+	return strings.TrimSpace(ret[:open]), &ns
+}
+
 // doOpen handles open/openat/openat2/creat-style opens. at is true for the
 // openat family (a[0] is the dirfd); how is true for openat2, whose flags live
 // inside an open_how struct ({flags=..., mode=..., resolve=...}) rather than a
 // bare flag string.
-func (p *parser) doOpen(s, t int64, a []string, ret string, at, how bool) {
+func (p *parser) doOpen(s, t int64, a []string, ret string, dur *int64, at, how bool) {
 	fd, ok := parseLeadingInt(ret)
 	if !ok || fd < 0 {
 		p.b.Skip("failed_open")
@@ -260,14 +280,14 @@ func (p *parser) doOpen(s, t int64, a []string, ret string, at, how bool) {
 	}
 	tgt := p.b.Target(path, trace.TargetFile)
 	h := p.fdt.Open(s, int(fd), tgt, path, isApp)
-	op := trace.Op{T: t, S: s, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h), Mode: mode}
+	op := trace.Op{T: t, S: s, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h), Mode: mode, Dur: dur}
 	if len(flags) > 0 {
 		op.Flags = flags
 	}
 	p.b.Add(op)
 }
 
-func (p *parser) doCreat(s, t int64, a []string, ret string) {
+func (p *parser) doCreat(s, t int64, a []string, ret string, dur *int64) {
 	fd, ok := parseLeadingInt(ret)
 	if !ok || fd < 0 {
 		p.b.Skip("failed_open")
@@ -286,11 +306,11 @@ func (p *parser) doCreat(s, t int64, a []string, ret string) {
 	h := p.fdt.Open(s, int(fd), tgt, path, false)
 	p.b.Add(trace.Op{
 		T: t, S: s, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h),
-		Mode: trace.ModeWrite, Flags: []string{"create", "trunc"},
+		Mode: trace.ModeWrite, Flags: []string{"create", "trunc"}, Dur: dur,
 	})
 }
 
-func (p *parser) doRW(s, t int64, name string, a []string, ret string, kind trace.OpKind) {
+func (p *parser) doRW(s, t int64, name string, a []string, ret string, dur *int64, kind trace.OpKind) {
 	if len(a) < 1 {
 		p.b.Skip("unparsed_line")
 		return
@@ -342,10 +362,10 @@ func (p *parser) doRW(s, t int64, name string, a []string, ret string, kind trac
 		off = e.Cursor
 		p.fdt.Advance(s, int(fd), n)
 	}
-	p.b.Add(trace.Op{T: t, S: s, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n)})
+	p.b.Add(trace.Op{T: t, S: s, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n), Dur: dur})
 }
 
-func (p *parser) doClose(s, t int64, a []string, ret string) {
+func (p *parser) doClose(s, t int64, a []string, ret string, dur *int64) {
 	if len(a) < 1 {
 		return
 	}
@@ -363,10 +383,10 @@ func (p *parser) doClose(s, t int64, a []string, ret string) {
 	if !hadHandle {
 		return // directory entry or untracked fd: consume silently
 	}
-	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpClose, H: trace.Ptr(h)})
+	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpClose, H: trace.Ptr(h), Dur: dur})
 }
 
-func (p *parser) doFsync(s, t int64, a []string, ret string) {
+func (p *parser) doFsync(s, t int64, a []string, ret string, dur *int64) {
 	if len(a) < 1 {
 		p.b.Skip("unparsed_line")
 		return
@@ -385,7 +405,7 @@ func (p *parser) doFsync(s, t int64, a []string, ret string) {
 		p.b.Skip("unresolved_fd")
 		return
 	}
-	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpFsync, H: trace.Ptr(e.Handle)})
+	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpFsync, H: trace.Ptr(e.Handle), Dur: dur})
 }
 
 func (p *parser) doLseek(s int64, a []string, ret string) {
@@ -403,7 +423,7 @@ func (p *parser) doLseek(s int64, a []string, ret string) {
 	p.fdt.SetCursor(s, int(fd), pos)
 }
 
-func (p *parser) doStatPath(s, t int64, name string, a []string, ret string) {
+func (p *parser) doStatPath(s, t int64, name string, a []string, ret string, dur *int64) {
 	if failedRet(ret) {
 		// e.g. access("/missing", F_OK) = -1 ENOENT: the file was not present,
 		// so it must not become a STAT target.
@@ -451,10 +471,10 @@ func (p *parser) doStatPath(s, t int64, name string, a []string, ret string) {
 		}
 	}
 	tgt := p.b.Target(path, trace.TargetFile)
-	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpStat, Tgt: trace.Ptr(tgt)})
+	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpStat, Tgt: trace.Ptr(tgt), Dur: dur})
 }
 
-func (p *parser) doFstat(s, t int64, a []string, ret string) {
+func (p *parser) doFstat(s, t int64, a []string, ret string, dur *int64) {
 	if failedRet(ret) {
 		p.b.Skip("failed_syscall")
 		return
@@ -469,7 +489,7 @@ func (p *parser) doFstat(s, t int64, a []string, ret string) {
 		return
 	}
 	tgt := p.b.Target(path, trace.TargetFile)
-	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpStat, Tgt: trace.Ptr(tgt)})
+	p.b.Add(trace.Op{T: t, S: s, Op: trace.OpStat, Tgt: trace.Ptr(tgt), Dur: dur})
 }
 
 // fdTarget resolves an fd argument to a file path: it prefers the path recorded

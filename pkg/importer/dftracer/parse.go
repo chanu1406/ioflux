@@ -48,7 +48,8 @@ const synthFDBase = 1 << 30
 type dfEvent struct {
 	Name string  `json:"name"`
 	Cat  string  `json:"cat"`
-	Ts   float64 `json:"ts"` // microseconds
+	Ts   float64 `json:"ts"`  // microseconds
+	Dur  float64 `json:"dur"` // microseconds
 	Pid  int64   `json:"pid"`
 	Tid  int64   `json:"tid"`
 	Args dfArgs  `json:"args"`
@@ -226,8 +227,13 @@ func (p *parser) line(raw string) {
 	switch ev.Cat {
 	case "POSIX":
 		t := int64(ev.Ts * 1000) // microseconds → nanoseconds
+		var dur *int64
+		if ev.Dur > 0 {
+			ns := int64(ev.Dur * 1000)
+			dur = &ns
+		}
 		stream := p.stream(pidTID{ev.Pid, ev.Tid})
-		p.dispatch(stream, t, ev.Name, &ev.Args)
+		p.dispatch(stream, t, ev.Name, dur, &ev.Args)
 	case "dftracer":
 		// Trace bookkeeping (FH/HH/SH/start/end/thread_name): consumed in the
 		// metadata pass, not an I/O op — neither emitted nor counted as skipped.
@@ -236,24 +242,24 @@ func (p *parser) line(raw string) {
 	}
 }
 
-func (p *parser) dispatch(stream, t int64, name string, a *dfArgs) {
+func (p *parser) dispatch(stream, t int64, name string, dur *int64, a *dfArgs) {
 	switch name {
 	case "open", "open64", "openat", "creat":
-		p.doOpen(stream, t, a)
+		p.doOpen(stream, t, dur, a)
 	case "read":
-		p.doRW(stream, t, a, trace.OpRead, false)
+		p.doRW(stream, t, dur, a, trace.OpRead, false)
 	case "pread64", "pread":
-		p.doRW(stream, t, a, trace.OpRead, true)
+		p.doRW(stream, t, dur, a, trace.OpRead, true)
 	case "write":
-		p.doRW(stream, t, a, trace.OpWrite, false)
+		p.doRW(stream, t, dur, a, trace.OpWrite, false)
 	case "pwrite64", "pwrite":
-		p.doRW(stream, t, a, trace.OpWrite, true)
+		p.doRW(stream, t, dur, a, trace.OpWrite, true)
 	case "close":
-		p.doClose(stream, t, a)
+		p.doClose(stream, t, dur, a)
 	case "lseek", "lseek64":
 		p.doLseek(stream, a)
 	case "fsync", "fdatasync":
-		p.doFsync(stream, t, a)
+		p.doFsync(stream, t, dur, a)
 	default:
 		p.b.Skip("unsupported_event")
 	}
@@ -299,7 +305,7 @@ func (p *parser) resolveFDKey(a *dfArgs) (int, bool) {
 	return 0, false
 }
 
-func (p *parser) doOpen(stream, t int64, a *dfArgs) {
+func (p *parser) doOpen(stream, t int64, dur *int64, a *dfArgs) {
 	rv, hasRV := a.retVal()
 	if hasRV && rv < 0 {
 		p.b.Skip("failed_open")
@@ -338,14 +344,14 @@ func (p *parser) doOpen(stream, t int64, a *dfArgs) {
 
 	tgt := p.b.Target(path, trace.TargetFile)
 	h := p.fdt.Open(stream, fdKey, tgt, path, isApp)
-	op := trace.Op{T: t, S: stream, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h), Mode: mode}
+	op := trace.Op{T: t, S: stream, Op: trace.OpOpen, Tgt: trace.Ptr(tgt), H: trace.Ptr(h), Mode: mode, Dur: dur}
 	if len(flags) > 0 {
 		op.Flags = flags
 	}
 	p.b.Add(op)
 }
 
-func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind, positional bool) {
+func (p *parser) doRW(stream, t int64, dur *int64, a *dfArgs, kind trace.OpKind, positional bool) {
 	fdKey, ok := p.resolveFDKey(a)
 	if !ok {
 		p.b.Skip("unresolved_fd")
@@ -383,10 +389,10 @@ func (p *parser) doRW(stream, t int64, a *dfArgs, kind trace.OpKind, positional 
 		off = e.Cursor
 		p.fdt.Advance(stream, fdKey, n)
 	}
-	p.b.Add(trace.Op{T: t, S: stream, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n)})
+	p.b.Add(trace.Op{T: t, S: stream, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n), Dur: dur})
 }
 
-func (p *parser) doClose(stream, t int64, a *dfArgs) {
+func (p *parser) doClose(stream, t int64, dur *int64, a *dfArgs) {
 	fdKey, ok := p.resolveFDKey(a)
 	if !ok {
 		return
@@ -400,7 +406,7 @@ func (p *parser) doClose(stream, t int64, a *dfArgs) {
 	if !hadHandle {
 		return
 	}
-	p.b.Add(trace.Op{T: t, S: stream, Op: trace.OpClose, H: trace.Ptr(h)})
+	p.b.Add(trace.Op{T: t, S: stream, Op: trace.OpClose, H: trace.Ptr(h), Dur: dur})
 }
 
 func (p *parser) doLseek(stream int64, a *dfArgs) {
@@ -415,7 +421,7 @@ func (p *parser) doLseek(stream int64, a *dfArgs) {
 	p.fdt.SetCursor(stream, fdKey, pos)
 }
 
-func (p *parser) doFsync(stream, t int64, a *dfArgs) {
+func (p *parser) doFsync(stream, t int64, dur *int64, a *dfArgs) {
 	fdKey, ok := p.resolveFDKey(a)
 	if !ok {
 		p.b.Skip("unparseable_event")
@@ -431,7 +437,7 @@ func (p *parser) doFsync(stream, t int64, a *dfArgs) {
 		p.b.Skip("unresolved_fd")
 		return
 	}
-	p.b.Add(trace.Op{T: t, S: stream, Op: trace.OpFsync, H: trace.Ptr(e.Handle)})
+	p.b.Add(trace.Op{T: t, S: stream, Op: trace.OpFsync, H: trace.Ptr(e.Handle), Dur: dur})
 }
 
 func (p *parser) stream(pt pidTID) int64 {

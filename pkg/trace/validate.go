@@ -55,6 +55,13 @@ func (r *Report) addWarning(line int, field, msg string) {
 // iteration. Spec violations are returned via Report.Errors so a CLI user sees
 // every problem in one pass.
 func Validate(r *Reader) (Report, error) {
+	return ValidateWithOps(r, nil)
+}
+
+// ValidateWithOps is Validate plus a per-op callback invoked after structural
+// checks for the op. It lets callers collect replay metadata during the same
+// streaming pass instead of buffering and validating a second copy.
+func ValidateWithOps(r *Reader, onOp func(Op) error) (Report, error) {
 	rep := Report{
 		Header:  r.Header(),
 		Streams: map[int64]int64{},
@@ -155,6 +162,15 @@ func Validate(r *Reader) (Report, error) {
 			requireTarget(line, op, rep.Header, &rep)
 			forbidHandle(line, op, &rep)
 			forbidPositional(line, op, &rep)
+		}
+
+		if op.Dur != nil && *op.Dur < 0 {
+			rep.addError(line, "dur", fmt.Sprintf("dur %d must be non-negative", *op.Dur))
+		}
+		if onOp != nil {
+			if err := onOp(op); err != nil {
+				return rep, err
+			}
 		}
 	}
 
