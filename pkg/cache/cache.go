@@ -67,6 +67,8 @@ func applyCold(eng engine.Engine, targets []trace.TargetInfo) Result {
 			acts, lims := applyPOSIXCold(fileTargets)
 			res.Actions = acts
 			res.Limitations = lims
+			res.Limitations = append(res.Limitations,
+				"cold: device, array, controller, and filesystem metadata caches are outside POSIX fadvise control")
 		}
 	}
 

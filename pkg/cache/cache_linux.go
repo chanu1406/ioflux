@@ -19,6 +19,12 @@ func applyPOSIXCold(targets []trace.TargetInfo) (actions, limitations []string) 
 			limitations = append(limitations, fmt.Sprintf("cold: cannot open %q for fadvise: %v", tgt.Name, err))
 			continue
 		}
+		if err := f.Sync(); err != nil {
+			limitations = append(limitations, fmt.Sprintf("cold: sync %q before fadvise: %v", tgt.Name, err))
+			_ = f.Close()
+			continue
+		}
+		actions = append(actions, fmt.Sprintf("cold: synced %q before fadvise", tgt.Name))
 		ferr := unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 		f.Close()
 		if ferr != nil {

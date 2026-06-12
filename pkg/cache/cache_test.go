@@ -3,6 +3,10 @@ package cache_test
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/cache"
@@ -39,6 +43,29 @@ func TestColdSkipsPOSIXForNonPageCacheEngine(t *testing.T) {
 	res := cache.Apply(context.Background(), cache.ModeCold, mem.New(), tgts)
 	if len(res.Limitations) == 0 {
 		t.Error("expected limitation when engine lacks OS page cache")
+	}
+}
+
+func TestColdLinuxRecordsSyncBeforeFadvise(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-only fadvise behavior")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.dat")
+	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	res := cache.Apply(context.Background(), cache.ModeCold, localfile.New(), []trace.TargetInfo{
+		{ID: 0, Name: path, Kind: trace.TargetFile, Size: 4},
+	})
+	if len(res.Actions) < 2 {
+		t.Fatalf("Actions=%v, want sync and fadvise actions", res.Actions)
+	}
+	if !strings.Contains(res.Actions[0], "synced") {
+		t.Fatalf("first action=%q, want sync before fadvise; actions=%v", res.Actions[0], res.Actions)
+	}
+	if !strings.Contains(res.Actions[1], "fadvised DONTNEED") {
+		t.Fatalf("second action=%q, want fadvise; actions=%v", res.Actions[1], res.Actions)
 	}
 }
 
