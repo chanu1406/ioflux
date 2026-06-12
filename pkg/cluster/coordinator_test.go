@@ -1,6 +1,7 @@
 package cluster_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/chanuollala/ioflux/pkg/metrics"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
+	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
 // localWorkers returns n in-process workers, each wrapping a fresh Session.
@@ -213,5 +215,69 @@ func TestCoordinator_VersionMismatch(t *testing.T) {
 	c := &cluster.Coordinator{}
 	if _, err := c.Run(context.Background(), memPlan(traceBytes, nil), []cluster.Worker{stale}); err == nil {
 		t.Fatal("Run with a version-mismatched worker succeeded, want error")
+	}
+}
+
+type prepareModeWorker struct {
+	mu          sync.Mutex
+	prepareMode string
+}
+
+func (w *prepareModeWorker) Register(context.Context) (cluster.WorkerInfo, error) {
+	return cluster.WorkerInfo{Hostname: "prep", CPUs: 1, Version: cluster.Version}, nil
+}
+func (w *prepareModeWorker) Prepare(_ context.Context, p cluster.Plan) (cluster.PrepareResult, error) {
+	w.mu.Lock()
+	w.prepareMode = p.PrepareMode
+	w.mu.Unlock()
+	return cluster.PrepareResult{}, nil
+}
+func (w *prepareModeWorker) Run(context.Context, time.Time, func(ops, bytes int64)) error { return nil }
+func (w *prepareModeWorker) Collect(context.Context) (*replay.WorkerOutput, error) {
+	return &replay.WorkerOutput{Recorder: metrics.NewRecorder(), PeakByStream: map[int64]int64{}}, nil
+}
+func (w *prepareModeWorker) Close() error { return nil }
+func (w *prepareModeWorker) mode() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.prepareMode
+}
+
+func emptyTrace(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "obj", Kind: trace.TargetObject, Size: 1}},
+		Summary:       trace.Summary{NumOps: 0, NumStreams: 0},
+	}); err != nil {
+		t.Fatalf("WriteHeader: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestCoordinator_SharedPrepareVerifiesAfterWorkerZero(t *testing.T) {
+	workers := []*prepareModeWorker{{}, {}}
+	cworkers := []cluster.Worker{workers[0], workers[1]}
+	plan := memPlan(emptyTrace(t), nil)
+	plan.Engine.Name = "s3"
+	plan.PrepareMode = "materialize-synthetic"
+
+	res, err := (&cluster.Coordinator{}).Run(context.Background(), plan, cworkers)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if workers[0].mode() != "materialize-synthetic" {
+		t.Fatalf("worker0 PrepareMode=%q, want materialize-synthetic", workers[0].mode())
+	}
+	if workers[1].mode() != "assume-existing" {
+		t.Fatalf("worker1 PrepareMode=%q, want assume-existing verification", workers[1].mode())
+	}
+	if res.Plan.PrepareScope != cluster.PrepareScopeShared {
+		t.Fatalf("PrepareScope=%q, want shared", res.Plan.PrepareScope)
 	}
 }

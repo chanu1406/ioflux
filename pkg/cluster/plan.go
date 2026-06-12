@@ -9,7 +9,30 @@ import (
 // Version identifies the coordinator/worker protocol. A worker whose Version
 // differs from the coordinator's is rejected at REGISTER, since a stale worker
 // could silently mis-replay a plan it does not fully understand.
-const Version = "0.1.0"
+//
+// 0.2.0: PrepareStream chunked trace transfer; the plan gained prepare_scope
+// and fill_mode/fill_seed, which an 0.1.0 worker would silently ignore while
+// the coordinator records them as applied.
+const Version = "0.2.0"
+
+const (
+	PrepareScopeShared    = "shared"
+	PrepareScopePerWorker = "per-worker"
+)
+
+// ResolvePrepareScope returns the configured prepare scope or the backend
+// default. Shared object stores should be materialized once; process-local and
+// node-local backends need per-worker preparation.
+func ResolvePrepareScope(p Plan) string {
+	switch p.PrepareScope {
+	case PrepareScopeShared, PrepareScopePerWorker:
+		return p.PrepareScope
+	}
+	if p.Engine.Name == "s3" {
+		return PrepareScopeShared
+	}
+	return PrepareScopePerWorker
+}
 
 // Plan is the transport-agnostic description of one worker's share of a replay
 // run. The coordinator builds it once and hands an identical copy (differing
@@ -42,10 +65,15 @@ type Plan struct {
 
 	// PrepareMode selects dataset preparation; empty skips it. SourceRoot is the
 	// local path for materialize-from-source.
-	PrepareMode string
-	SourceRoot  string
+	PrepareMode  string
+	PrepareScope string
+	SourceRoot   string
 	// CacheMode is "cold" or "warm"; empty skips cache controls.
 	CacheMode string
+	// FillMode is "seeded" or "zero". Empty defaults to seeded.
+	FillMode string
+	// FillSeed controls deterministic seeded payload fill. 0 uses the default.
+	FillSeed int64
 }
 
 // WorkerInfo is a worker's identity, returned by REGISTER.

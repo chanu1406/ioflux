@@ -15,6 +15,10 @@ service Worker {
   // Prepare loads+validates the trace, builds the engine, runs dataset prep,
   // and applies cache controls. A successful response is the PREPARE barrier ack.
   rpc Prepare(Plan) returns (PrepareAck);
+  // PrepareStream is the large-trace variant of Prepare. The first chunk
+  // carries Plan metadata with trace_bytes empty; following chunks carry trace
+  // bytes. A successful response is the PREPARE barrier ack.
+  rpc PrepareStream(stream PrepareChunk) returns (PrepareAck);
   // Run replays the assigned streams. The response stream carries periodic
   // Progress heartbeats; the server closing the stream signals Finished (DONE).
   rpc Run(GoSignal) returns (stream Progress);
@@ -80,6 +84,14 @@ message Plan {
   string prepare_mode = 10;
   string source_root = 11;
   string cache_mode = 12;
+  string prepare_scope = 13;
+  string fill_mode = 14;
+  int64 fill_seed = 15;
+}
+
+message PrepareChunk {
+  Plan plan = 1;
+  bytes trace_chunk = 2;
 }
 
 // PrepStats mirrors prepare.Stats.
@@ -116,6 +128,14 @@ message Progress {
   int64 bytes = 2;
 }
 
+message ProgressPoint {
+  int64 elapsed_ns = 1;
+  int64 ops = 2;
+  int64 bytes = 3;
+  int64 ops_delta = 4;
+  int64 bytes_delta = 5;
+}
+
 message CollectRequest {}
 
 // HistSnapshot mirrors metrics.HistSnapshot — a lossless HDR snapshot.
@@ -138,6 +158,8 @@ message RecorderSnapshot {
   int64 backlog_blocked_ns = 8;
   int64 max_inflight_depth = 9;
   int64 peak_inflight = 10;
+  map<string, HistSnapshot> service_histograms = 11;
+  int64 short_reads = 12;
 }
 
 // CPU mirrors results.CPU.
@@ -159,4 +181,5 @@ message WorkerResults {
   // engine_limitations are honesty notes the engine recorded during the run
   // (e.g. O_DIRECT not honored on this filesystem), surfaced in the report.
   repeated string engine_limitations = 8;
+  repeated ProgressPoint time_series = 9;
 }

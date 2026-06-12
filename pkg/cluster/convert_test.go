@@ -48,8 +48,11 @@ func TestPlanProtoRoundTrip(t *testing.T) {
 		TargetRewrite:    []targetmap.Rule{{From: "/mnt/a/", To: "s3://bench/a/"}, {From: "/mnt/b/", To: "s3://bench/b/"}},
 		AllowPassthrough: true,
 		PrepareMode:      "materialize-synthetic",
+		PrepareScope:     PrepareScopeShared,
 		SourceRoot:       "/src",
 		CacheMode:        "cold",
+		FillMode:         "seeded",
+		FillSeed:         99,
 	}
 
 	wire, err := proto.Marshal(planToProto(in))
@@ -74,6 +77,7 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	rec := metrics.NewRecorder()
 	for i := int64(1); i <= 1000; i++ {
 		rec.Record(trace.OpRead, i*1000, 4096, false)
+		rec.RecordService(trace.OpRead, i*900)
 		rec.RecordDrift(i * 10)
 		rec.RecordCompletionLag(i * 20)
 	}
@@ -83,6 +87,7 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	rec.BacklogBlockedNS = 12345
 	rec.MaxInflightDepth = 9
 	rec.PeakInflight = 1
+	rec.ShortReads = 2
 
 	wire, err := proto.Marshal(recorderSnapshotToProto(rec.Export()))
 	if err != nil {
@@ -102,6 +107,9 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	}
 	if got.Errors != rec.Errors {
 		t.Errorf("Errors=%d, want %d", got.Errors, rec.Errors)
+	}
+	if got.ShortReads != rec.ShortReads {
+		t.Errorf("ShortReads=%d, want %d", got.ShortReads, rec.ShortReads)
 	}
 	if got.BacklogEvents != rec.BacklogEvents || got.BacklogBlockedNS != rec.BacklogBlockedNS {
 		t.Errorf("backlog counters mismatch: got (%d,%d) want (%d,%d)",
@@ -123,6 +131,9 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	if got.CompletionLagHist.Percentile(99) != rec.CompletionLagHist.Percentile(99) {
 		t.Errorf("completion-lag p99 mismatch")
 	}
+	if got.ServiceHistogram(trace.OpRead).Percentile(99) != rec.ServiceHistogram(trace.OpRead).Percentile(99) {
+		t.Errorf("service histogram p99 mismatch")
+	}
 }
 
 // TestWorkerOutputProtoRoundTrip checks the full WorkerResults message: recorder,
@@ -138,6 +149,7 @@ func TestWorkerOutputProtoRoundTrip(t *testing.T) {
 		ActualNumOps: 1,
 		FirstDoneNS:  111,
 		LastDoneNS:   222,
+		TimeSeries:   []results.ProgressPoint{{ElapsedNS: 1_000_000_000, Ops: 1, Bytes: 4096, OpsDelta: 1, BytesDelta: 4096}},
 	}
 
 	wire, err := proto.Marshal(workerOutputToProto(out))
@@ -161,5 +173,8 @@ func TestWorkerOutputProtoRoundTrip(t *testing.T) {
 	}
 	if got.Recorder.Count(trace.OpRead) != 1 {
 		t.Errorf("recorder READ count=%d, want 1", got.Recorder.Count(trace.OpRead))
+	}
+	if !reflect.DeepEqual(got.TimeSeries, out.TimeSeries) {
+		t.Errorf("TimeSeries=%v, want %v", got.TimeSeries, out.TimeSeries)
 	}
 }

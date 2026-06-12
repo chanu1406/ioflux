@@ -35,8 +35,11 @@ func planToProto(p Plan) *clusterpb.Plan {
 		TargetRewrite:    rules,
 		AllowPassthrough: p.AllowPassthrough,
 		PrepareMode:      p.PrepareMode,
+		PrepareScope:     p.PrepareScope,
 		SourceRoot:       p.SourceRoot,
 		CacheMode:        p.CacheMode,
+		FillMode:         p.FillMode,
+		FillSeed:         p.FillSeed,
 	}
 }
 
@@ -56,8 +59,11 @@ func planFromProto(pb *clusterpb.Plan) Plan {
 		TargetRewrite:    rules,
 		AllowPassthrough: pb.GetAllowPassthrough(),
 		PrepareMode:      pb.GetPrepareMode(),
+		PrepareScope:     pb.GetPrepareScope(),
 		SourceRoot:       pb.GetSourceRoot(),
 		CacheMode:        pb.GetCacheMode(),
+		FillMode:         pb.GetFillMode(),
+		FillSeed:         pb.GetFillSeed(),
 	}
 }
 
@@ -195,6 +201,7 @@ func workerOutputToProto(out *replay.WorkerOutput) *clusterpb.WorkerResults {
 		Hostname:          out.Hostname,
 		PeakByStream:      out.PeakByStream,
 		EngineLimitations: out.EngineLimitations,
+		TimeSeries:        progressPointsToProto(out.TimeSeries),
 	}
 }
 
@@ -207,6 +214,7 @@ func workerOutputFromProto(pb *clusterpb.WorkerResults) *replay.WorkerOutput {
 		Hostname:          pb.GetHostname(),
 		PeakByStream:      pb.GetPeakByStream(),
 		EngineLimitations: pb.GetEngineLimitations(),
+		TimeSeries:        progressPointsFromProto(pb.GetTimeSeries()),
 	}
 	if c := pb.GetCpu(); c != nil {
 		out.CPU = results.CPU{UserNS: c.GetUserNs(), SysNS: c.GetSysNs(), WallNS: c.GetWallNs()}
@@ -217,21 +225,54 @@ func workerOutputFromProto(pb *clusterpb.WorkerResults) *replay.WorkerOutput {
 	return out
 }
 
+func progressPointsToProto(points []results.ProgressPoint) []*clusterpb.ProgressPoint {
+	out := make([]*clusterpb.ProgressPoint, len(points))
+	for i, p := range points {
+		out[i] = &clusterpb.ProgressPoint{
+			ElapsedNs:  p.ElapsedNS,
+			Ops:        p.Ops,
+			Bytes:      p.Bytes,
+			OpsDelta:   p.OpsDelta,
+			BytesDelta: p.BytesDelta,
+		}
+	}
+	return out
+}
+
+func progressPointsFromProto(points []*clusterpb.ProgressPoint) []results.ProgressPoint {
+	out := make([]results.ProgressPoint, len(points))
+	for i, p := range points {
+		out[i] = results.ProgressPoint{
+			ElapsedNS:  p.GetElapsedNs(),
+			Ops:        p.GetOps(),
+			Bytes:      p.GetBytes(),
+			OpsDelta:   p.GetOpsDelta(),
+			BytesDelta: p.GetBytesDelta(),
+		}
+	}
+	return out
+}
+
 // --- RecorderSnapshot / HistSnapshot ---
 
 func recorderSnapshotToProto(s metrics.RecorderSnapshot) *clusterpb.RecorderSnapshot {
 	pb := &clusterpb.RecorderSnapshot{
-		Histograms:       make(map[string]*clusterpb.HistSnapshot, len(s.Histograms)),
-		Counts:           make(map[string]int64, len(s.Counts)),
-		Bytes:            s.Bytes,
-		Errors:           s.Errors,
-		BacklogEvents:    s.BacklogEvents,
-		BacklogBlockedNs: s.BacklogBlockedNS,
-		MaxInflightDepth: s.MaxInflightDepth,
-		PeakInflight:     s.PeakInflight,
+		Histograms:        make(map[string]*clusterpb.HistSnapshot, len(s.Histograms)),
+		Counts:            make(map[string]int64, len(s.Counts)),
+		Bytes:             s.Bytes,
+		Errors:            s.Errors,
+		BacklogEvents:     s.BacklogEvents,
+		BacklogBlockedNs:  s.BacklogBlockedNS,
+		MaxInflightDepth:  s.MaxInflightDepth,
+		PeakInflight:      s.PeakInflight,
+		ShortReads:        s.ShortReads,
+		ServiceHistograms: make(map[string]*clusterpb.HistSnapshot, len(s.ServiceHistograms)),
 	}
 	for kind, h := range s.Histograms {
 		pb.Histograms[string(kind)] = histSnapshotToProto(h)
+	}
+	for kind, h := range s.ServiceHistograms {
+		pb.ServiceHistograms[string(kind)] = histSnapshotToProto(h)
 	}
 	for kind, c := range s.Counts {
 		pb.Counts[string(kind)] = c
@@ -247,20 +288,25 @@ func recorderSnapshotToProto(s metrics.RecorderSnapshot) *clusterpb.RecorderSnap
 
 func recorderSnapshotFromProto(pb *clusterpb.RecorderSnapshot) metrics.RecorderSnapshot {
 	s := metrics.RecorderSnapshot{
-		Histograms: make(map[trace.OpKind]metrics.HistSnapshot),
-		Counts:     make(map[trace.OpKind]int64),
+		Histograms:        make(map[trace.OpKind]metrics.HistSnapshot),
+		ServiceHistograms: make(map[trace.OpKind]metrics.HistSnapshot),
+		Counts:            make(map[trace.OpKind]int64),
 	}
 	if pb == nil {
 		return s
 	}
 	s.Bytes = pb.GetBytes()
 	s.Errors = pb.GetErrors()
+	s.ShortReads = pb.GetShortReads()
 	s.BacklogEvents = pb.GetBacklogEvents()
 	s.BacklogBlockedNS = pb.GetBacklogBlockedNs()
 	s.MaxInflightDepth = pb.GetMaxInflightDepth()
 	s.PeakInflight = pb.GetPeakInflight()
 	for kind, h := range pb.GetHistograms() {
 		s.Histograms[trace.OpKind(kind)] = histSnapshotFromProto(h)
+	}
+	for kind, h := range pb.GetServiceHistograms() {
+		s.ServiceHistograms[trace.OpKind(kind)] = histSnapshotFromProto(h)
 	}
 	for kind, c := range pb.GetCounts() {
 		s.Counts[trace.OpKind(kind)] = c

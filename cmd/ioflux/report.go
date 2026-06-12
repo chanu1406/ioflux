@@ -95,20 +95,16 @@ func printRunReport(w io.Writer, res *results.Results) {
 	// --- Per-op latency table ---
 	if len(res.PerOpStats) > 0 {
 		fmt.Fprintln(w)
-		fmt.Fprintf(w, "Latency (µs):\n")
-		fmt.Fprintf(w, "  %-8s %8s %8s %8s %8s %8s %8s\n",
-			"Op", "Count", "p50", "p90", "p99", "p999", "max")
-		for _, s := range res.PerOpStats {
-			fmt.Fprintf(w, "  %-8s %8d %8s %8s %8s %8s %8s\n",
-				s.OpType,
-				s.Count,
-				fmtUS(s.P50NS),
-				fmtUS(s.P90NS),
-				fmtUS(s.P99NS),
-				fmtUS(s.P999NS),
-				fmtUS(s.MaxNS),
-			)
-		}
+		printOpStatsTable(w, "Latency (µs):", res.PerOpStats)
+	}
+
+	// In timeline/scaled mode the headline latency is coordinated-omission
+	// corrected (completion − intended arrival); the service-time table shows
+	// what the backend itself did, so the two are worth separating. In asap
+	// mode they are the same measurement, so the second table is omitted.
+	if (plan.Mode == "timeline" || plan.Mode == "scaled") && len(res.ServiceTimeStats) > 0 {
+		fmt.Fprintln(w)
+		printOpStatsTable(w, "Service time (µs, excludes schedule wait):", res.ServiceTimeStats)
 	}
 
 	// --- CPU ---
@@ -192,7 +188,11 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 
 	if fid.LowFidelity {
-		fmt.Fprintf(w, "  low-fidelity:   YES — %s\n", fid.LowFidelityReason)
+		if fid.LowFidelityCategory != "" {
+			fmt.Fprintf(w, "  low-fidelity:   YES [%s] — %s\n", fid.LowFidelityCategory, fid.LowFidelityReason)
+		} else {
+			fmt.Fprintf(w, "  low-fidelity:   YES — %s\n", fid.LowFidelityReason)
+		}
 	} else {
 		fmt.Fprintf(w, "  low-fidelity:   no\n")
 	}
@@ -201,6 +201,10 @@ func printRunReport(w io.Writer, res *results.Results) {
 	var warnings []string
 	if res.Errors > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d op error(s)", res.Errors))
+	}
+	if res.ShortReads > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d short read(s): backend returned fewer bytes than the trace requested (undersized targets?)", res.ShortReads))
 	}
 	warnings = append(warnings, env.EngineLimitations...)
 	warnings = append(warnings, env.CacheLimitations...)
@@ -213,6 +217,24 @@ func printRunReport(w io.Writer, res *results.Results) {
 		for _, msg := range warnings {
 			fmt.Fprintf(w, "  ! %s\n", msg)
 		}
+	}
+}
+
+// printOpStatsTable renders one per-op percentile table under the given title.
+func printOpStatsTable(w io.Writer, title string, stats []results.PerOpStats) {
+	fmt.Fprintf(w, "%s\n", title)
+	fmt.Fprintf(w, "  %-8s %8s %8s %8s %8s %8s %8s\n",
+		"Op", "Count", "p50", "p90", "p99", "p999", "max")
+	for _, s := range stats {
+		fmt.Fprintf(w, "  %-8s %8d %8s %8s %8s %8s %8s\n",
+			s.OpType,
+			s.Count,
+			fmtUS(s.P50NS),
+			fmtUS(s.P90NS),
+			fmtUS(s.P99NS),
+			fmtUS(s.P999NS),
+			fmtUS(s.MaxNS),
+		)
 	}
 }
 

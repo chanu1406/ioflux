@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -110,15 +111,10 @@ func (c *Coordinator) Run(ctx context.Context, plan Plan, workers []Worker) (*re
 	}
 
 	// 3. PREPARE — barrier: every worker must ack before any worker runs.
-	preps := make([]PrepareResult, len(workers))
-	for i, w := range workers {
-		wp := plan
-		wp.AssignedStreams = assignments[i]
-		pr, err := w.Prepare(ctx, wp)
-		if err != nil {
-			return nil, fmt.Errorf("cluster: coordinator: prepare worker %d (%s): %w", i, infos[i].Hostname, err)
-		}
-		preps[i] = pr
+	plan.PrepareScope = ResolvePrepareScope(plan)
+	preps, err := c.prepareWorkers(ctx, plan, workers, infos, assignments)
+	if err != nil {
+		return nil, err
 	}
 
 	// 4. RUN — fan out a shared logical T0; cancel all on any failure (DONE barrier
@@ -194,6 +190,81 @@ func firstRunError(errs []error, infos []WorkerInfo) error {
 	return canceled
 }
 
+func (c *Coordinator) prepareWorkers(
+	ctx context.Context,
+	plan Plan,
+	workers []Worker,
+	infos []WorkerInfo,
+	assignments [][]int64,
+) ([]PrepareResult, error) {
+	preps := make([]PrepareResult, len(workers))
+	switch plan.PrepareScope {
+	case PrepareScopeShared:
+		if len(workers) == 0 {
+			return preps, nil
+		}
+		wp := plan
+		wp.AssignedStreams = assignments[0]
+		pr, err := workers[0].Prepare(ctx, wp)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: coordinator: prepare worker 0 (%s): %w", infos[0].Hostname, err)
+		}
+		preps[0] = pr
+		if len(workers) == 1 {
+			return preps, nil
+		}
+		verifyPlan := plan
+		if verifyPlan.PrepareMode != "" {
+			verifyPlan.PrepareMode = "assume-existing"
+			verifyPlan.SourceRoot = ""
+		}
+		verifyPreps, err := prepareWorkerRange(ctx, verifyPlan, workers, infos, assignments, 1)
+		if err != nil {
+			return nil, err
+		}
+		copy(preps[1:], verifyPreps[1:])
+		return preps, nil
+	case PrepareScopePerWorker:
+		return prepareWorkerRange(ctx, plan, workers, infos, assignments, 0)
+	default:
+		return nil, fmt.Errorf("cluster: coordinator: unsupported prepare scope %q", plan.PrepareScope)
+	}
+}
+
+func prepareWorkerRange(
+	ctx context.Context,
+	plan Plan,
+	workers []Worker,
+	infos []WorkerInfo,
+	assignments [][]int64,
+	start int,
+) ([]PrepareResult, error) {
+	preps := make([]PrepareResult, len(workers))
+	errs := make([]error, len(workers))
+	var wg sync.WaitGroup
+	for i := start; i < len(workers); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			wp := plan
+			wp.AssignedStreams = assignments[i]
+			pr, err := workers[i].Prepare(ctx, wp)
+			if err != nil {
+				errs[i] = fmt.Errorf("cluster: coordinator: prepare worker %d (%s): %w", i, infos[i].Hostname, err)
+				return
+			}
+			preps[i] = pr
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return preps, nil
+}
+
 // schedulerOpts builds the PlanInfo + RunEnv for BuildResults. Dataset-prep and
 // cache metadata are taken from one representative worker: every worker
 // materializes the full target table identically (see Session.Prepare), so
@@ -203,6 +274,7 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 	if len(preps) > 0 {
 		prep = preps[0]
 	}
+	fill := payload.Config{Mode: payload.Mode(plan.FillMode), Seed: plan.FillSeed}.Normalize()
 	planInfo := results.PlanInfo{
 		TracePath:                 plan.TracePath,
 		Engine:                    plan.Engine.Name,
@@ -214,6 +286,9 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 		NumOps:                    hdr.Summary.NumOps,
 		TotalBytes:                hdr.Summary.TotalBytes,
 		PrepareMode:               plan.PrepareMode,
+		PrepareScope:              plan.PrepareScope,
+		FillMode:                  string(fill.Mode),
+		FillSeed:                  fill.Seed,
 		PrepareTouchedSameData:    prep.PrepStats.TouchedSameData || (plan.CacheMode == "warm" && prep.CacheResult.Primed > 0),
 		PrepareVerified:           prep.PrepStats.Verified,
 		PrepareCreated:            prep.PrepStats.Created,
@@ -232,6 +307,7 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 		SpeedupFactor: plan.SpeedupFactor,
 		PlanInfo:      planInfo,
 		RunEnv:        runEnv,
+		Fill:          fill,
 	}
 }
 

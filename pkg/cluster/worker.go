@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sync"
@@ -59,7 +60,14 @@ func (s *Session) Info() WorkerInfo {
 // written before any worker reads. The coordinator therefore records one
 // worker's PrepareResult rather than summing across workers.
 func (s *Session) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
-	r, err := trace.NewReader(bytes.NewReader(p.TraceBytes))
+	return s.PrepareReader(ctx, p, bytes.NewReader(p.TraceBytes))
+}
+
+// PrepareReader is Prepare with the trace supplied as a streamable reader. It
+// is used by the gRPC PrepareStream path to avoid holding a second giant trace
+// byte slice on the worker.
+func (s *Session) PrepareReader(ctx context.Context, p Plan, traceData io.Reader) (PrepareResult, error) {
+	r, err := trace.NewReader(traceData)
 	if err != nil {
 		return PrepareResult{}, fmt.Errorf("cluster: prepare: parse trace: %w", err)
 	}
@@ -88,7 +96,7 @@ func (s *Session) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
 		}
 	}
 
-	exec, err := replay.Prepare(replay.Plan{
+	exec, err := replay.PrepareAssigned(replay.Plan{
 		TracePath:     p.TracePath,
 		Engine:        eng,
 		EngineName:    p.Engine.Name,
@@ -100,7 +108,9 @@ func (s *Session) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
 		PrepareMode:   p.PrepareMode,
 		SourceRoot:    p.SourceRoot,
 		CacheMode:     p.CacheMode,
-	}, r)
+		FillMode:      p.FillMode,
+		FillSeed:      p.FillSeed,
+	}, r, p.AssignedStreams)
 	if err != nil {
 		return PrepareResult{}, fmt.Errorf("cluster: prepare: %w", err)
 	}
@@ -111,10 +121,6 @@ func (s *Session) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
 	if err != nil {
 		return PrepareResult{}, fmt.Errorf("cluster: prepare: %w", err)
 	}
-
-	// Restrict execution to the coordinator-assigned streams. An empty set is a
-	// legitimately idle worker (workers > streams), which runs nothing.
-	exec = exec.WithStreams(p.AssignedStreams)
 
 	cacheRes := exec.ApplyCache(ctx)
 

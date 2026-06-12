@@ -13,6 +13,7 @@ import (
 	"github.com/chanuollala/ioflux/pkg/cluster"
 	"github.com/chanuollala/ioflux/pkg/engine"
 	s3engine "github.com/chanuollala/ioflux/pkg/engine/s3"
+	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -32,8 +33,11 @@ Flags:
   --target-map <path>   Path to a YAML target-map config (optional)
   --allow-passthrough   Allow targets that match no rule to pass through unchanged
   --prepare <mode>      Dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source
+  --prepare-scope <s>   Dataset prep scope: shared | per-worker (default: s3 shared, mem/local per-worker)
   --source-root <path>  Local source path for --prepare materialize-from-source
   --cache-mode <mode>   Cache state: cold | warm (default cold)
+  --fill <mode>         Write/materialization payload fill: seeded | zero (default seeded)
+  --fill-seed <n>       Seed for deterministic payload fill (default 1)
   --hosts <list>        Comma-separated worker addresses (e.g. hostA:7800,hostB:7800).
                         Omit for a single-node run (an in-process worker).
   -o <path>             Output path for results.json (required; use - for stdout)
@@ -85,7 +89,10 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		targetMapPath    string
 		allowPassthrough bool
 		prepareMode      string
+		prepareScope     string
 		sourceRoot       string
+		fillMode         string
+		fillSeed         int64
 		allowDirect      bool
 		directFallback   bool
 		directAlign      int64
@@ -102,7 +109,10 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&targetMapPath, "target-map", "", "path to YAML target-map config (optional)")
 	fs.BoolVar(&allowPassthrough, "allow-passthrough", false, "allow unmatched targets to pass through unchanged")
 	fs.StringVar(&prepareMode, "prepare", "", "dataset prep mode: assume-existing | materialize-synthetic | materialize-from-source")
+	fs.StringVar(&prepareScope, "prepare-scope", "", "dataset prep scope: shared | per-worker")
 	fs.StringVar(&sourceRoot, "source-root", "", "local source path for --prepare materialize-from-source")
+	fs.StringVar(&fillMode, "fill", string(payload.ModeSeeded), "payload fill mode: seeded | zero")
+	fs.Int64Var(&fillSeed, "fill-seed", payload.DefaultSeed, "seed for deterministic payload fill")
 	fs.BoolVar(&allowDirect, "allow-direct", false, "enable O_DIRECT for trace OPEN ops carrying the direct flag (local engine, Linux only)")
 	fs.BoolVar(&directFallback, "direct-fallback", false, "fall back to buffered I/O when O_DIRECT is unsupported by the filesystem")
 	fs.Int64Var(&directAlign, "direct-align", 0, "O_DIRECT block alignment in bytes (0 = auto-detect from filesystem)")
@@ -145,6 +155,17 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	if mode == "scaled" && speedup <= 0 {
 		fmt.Fprintf(stderr, "ioflux run: --speedup must be > 0 for --mode scaled, got %v\n", speedup)
 		return 2
+	}
+	if prepareScope != "" && prepareScope != cluster.PrepareScopeShared && prepareScope != cluster.PrepareScopePerWorker {
+		fmt.Fprintf(stderr, "ioflux run: unsupported --prepare-scope %q (want shared | per-worker)\n", prepareScope)
+		return 2
+	}
+	if fillMode != string(payload.ModeSeeded) && fillMode != string(payload.ModeZero) {
+		fmt.Fprintf(stderr, "ioflux run: unsupported --fill %q (want seeded | zero)\n", fillMode)
+		return 2
+	}
+	if fillSeed == 0 {
+		fillSeed = payload.DefaultSeed
 	}
 
 	// Read the trace into memory; the plan inlines it for every worker.
@@ -197,8 +218,11 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		TargetRewrite:    rewriteRules,
 		AllowPassthrough: allowPassthrough,
 		PrepareMode:      prepareMode,
+		PrepareScope:     prepareScope,
 		SourceRoot:       sourceRoot,
 		CacheMode:        cacheMode,
+		FillMode:         fillMode,
+		FillSeed:         fillSeed,
 	}
 
 	workers, err := buildWorkers(hosts)

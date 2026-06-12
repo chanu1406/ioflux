@@ -1,6 +1,7 @@
 package cluster_test
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/chanuollala/ioflux/pkg/cluster"
+	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
 // bufWorker starts an in-process gRPC worker over a bufconn listener and returns
@@ -18,7 +20,7 @@ import (
 // staying hermetic and fast (no TCP, runs on darwin).
 func bufWorker(t *testing.T) cluster.Worker {
 	t.Helper()
-	lis := bufconn.Listen(1 << 20)
+	lis := bufconn.Listen(8 << 20)
 	gs := grpc.NewServer()
 	cluster.NewServer().RegisterTo(gs)
 	go func() { _ = gs.Serve(lis) }()
@@ -35,6 +37,45 @@ func bufWorker(t *testing.T) cluster.Worker {
 	}
 	t.Cleanup(func() { _ = w.Close() })
 	return w
+}
+
+func largeReadTrace(t *testing.T, readOps int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	hdr := trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "large.dat", Kind: trace.TargetFile, Size: 4096}},
+		Summary: trace.Summary{
+			NumOps:     int64(readOps + 2),
+			NumStreams: 1,
+			TotalBytes: int64(readOps),
+			DurationNS: int64(readOps + 1),
+		},
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("WriteHeader: %v", err)
+	}
+	tgt, h := 0, int64(1)
+	if err := tw.WriteOp(trace.Op{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt, H: &h, Mode: trace.ModeRead}); err != nil {
+		t.Fatalf("WriteOp open: %v", err)
+	}
+	for i := 0; i < readOps; i++ {
+		id := int64(i + 1)
+		off := int64(i % 4096)
+		length := int64(1)
+		if err := tw.WriteOp(trace.Op{T: id, OpID: &id, S: 0, Op: trace.OpRead, H: &h, Off: &off, Len: &length}); err != nil {
+			t.Fatalf("WriteOp read: %v", err)
+		}
+	}
+	closeID := int64(readOps + 1)
+	if err := tw.WriteOp(trace.Op{T: closeID, OpID: &closeID, S: 0, Op: trace.OpClose, H: &h}); err != nil {
+		t.Fatalf("WriteOp close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // TestGRPC_DistributedEquivalence is the M2 headline correctness anchor over the
@@ -85,6 +126,21 @@ func TestGRPC_DistributedEquivalence(t *testing.T) {
 	}
 	if sum != dist.OpsCompleted {
 		t.Errorf("sum of per-host ops=%d, want %d", sum, dist.OpsCompleted)
+	}
+}
+
+func TestGRPC_PrepareStreamLargeTrace(t *testing.T) {
+	traceBytes := largeReadTrace(t, 70_000)
+	if len(traceBytes) <= 4<<20 {
+		t.Fatalf("generated trace size=%d, want >4MiB", len(traceBytes))
+	}
+	w := bufWorker(t)
+	if _, err := w.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	plan := memPlan(traceBytes, []int64{0})
+	if _, err := w.Prepare(context.Background(), plan); err != nil {
+		t.Fatalf("streamed Prepare for %d-byte trace: %v", len(traceBytes), err)
 	}
 }
 

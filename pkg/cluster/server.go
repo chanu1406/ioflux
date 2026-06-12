@@ -2,6 +2,9 @@ package cluster
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -105,6 +108,68 @@ func (s *Server) Prepare(ctx context.Context, pb *clusterpb.Plan) (*clusterpb.Pr
 	return prepareAckToProto(res), nil
 }
 
+// PrepareStream is the large-trace PREPARE path. The first client message must
+// carry Plan metadata; subsequent messages carry trace chunks.
+func (s *Server) PrepareStream(stream grpc.ClientStreamingServer[clusterpb.PrepareChunk, clusterpb.PrepareAck]) error {
+	if !s.acquire() {
+		return status.Error(codes.FailedPrecondition, "worker busy: a run is already in progress")
+	}
+	ack, err := s.prepareStream(stream)
+	if err != nil {
+		s.release()
+		return err
+	}
+	s.refreshLease()
+	return stream.SendAndClose(ack)
+}
+
+func (s *Server) prepareStream(stream grpc.ClientStreamingServer[clusterpb.PrepareChunk, clusterpb.PrepareAck]) (*clusterpb.PrepareAck, error) {
+	first, err := stream.Recv()
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "prepare stream: first chunk: %v", err)
+	}
+	if first.GetPlan() == nil {
+		return nil, status.Error(codes.InvalidArgument, "prepare stream: first chunk missing plan")
+	}
+	p := planFromProto(first.GetPlan())
+	tmp, err := os.CreateTemp("", "ioflux-prepare-*.ioflux")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "prepare stream: temp file: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if chunk := first.GetTraceChunk(); len(chunk) > 0 {
+		if _, err := tmp.Write(chunk); err != nil {
+			return nil, status.Errorf(codes.Internal, "prepare stream: write chunk: %v", err)
+		}
+	}
+	for {
+		msg, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.Aborted, "prepare stream: receive chunk: %v", err)
+		}
+		if msg.GetPlan() != nil {
+			return nil, status.Error(codes.InvalidArgument, "prepare stream: plan may only appear in first chunk")
+		}
+		if _, err := tmp.Write(msg.GetTraceChunk()); err != nil {
+			return nil, status.Errorf(codes.Internal, "prepare stream: write chunk: %v", err)
+		}
+		s.refreshLease()
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, status.Errorf(codes.Internal, "prepare stream: rewind: %v", err)
+	}
+	res, err := s.session.PrepareReader(stream.Context(), p, tmp)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "prepare: %v", err)
+	}
+	return prepareAckToProto(res), nil
+}
+
 // Run replays the prepared streams, sending Progress heartbeats over the stream
 // until it finishes (the stream close is the DONE/Finished signal). It schedules
 // timeline arrivals from the worker's own clock at receipt (no cross-host sync).
@@ -143,6 +208,8 @@ func (s *Server) Collect(_ context.Context, _ *clusterpb.CollectRequest) (*clust
 // heartbeats (PRD §8.9 failure handling) rather than hanging indefinitely.
 func ServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(maxGRPCMessageBytes),
+		grpc.MaxSendMsgSize(maxGRPCMessageBytes),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             10 * time.Second,
 			PermitWithoutStream: true,

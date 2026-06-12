@@ -8,11 +8,18 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	clusterpb "github.com/chanuollala/ioflux/pkg/cluster/proto"
 	"github.com/chanuollala/ioflux/pkg/replay"
+)
+
+const (
+	maxGRPCMessageBytes     = 64 << 20
+	prepareStreamChunkBytes = 1 << 20
 )
 
 // remoteWorker drives a worker over gRPC. It is the distributed counterpart of
@@ -35,6 +42,10 @@ func DialWorker(addr string, extra ...grpc.DialOption) (Worker, error) {
 			Timeout:             10 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(maxGRPCMessageBytes),
+			grpc.MaxCallRecvMsgSize(maxGRPCMessageBytes),
+		),
 	}, extra...)
 	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
@@ -52,11 +63,41 @@ func (w *remoteWorker) Register(ctx context.Context) (WorkerInfo, error) {
 }
 
 func (w *remoteWorker) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
-	ack, err := w.client.Prepare(ctx, planToProto(p))
+	ack, err := w.prepareStream(ctx, p)
+	if status.Code(err) == codes.Unimplemented {
+		ack, err = w.client.Prepare(ctx, planToProto(p))
+	}
 	if err != nil {
 		return PrepareResult{}, fmt.Errorf("cluster: prepare %q: %w", w.addr, err)
 	}
 	return prepareAckFromProto(ack), nil
+}
+
+func (w *remoteWorker) prepareStream(ctx context.Context, p Plan) (*clusterpb.PrepareAck, error) {
+	stream, err := w.client.PrepareStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	traceBytes := p.TraceBytes
+	meta := p
+	meta.TraceBytes = nil
+	// A Send error (typically a bare io.EOF) means the server already
+	// terminated the RPC; the authoritative status — including Unimplemented
+	// from a worker without PrepareStream — only comes from CloseAndRecv, so
+	// Send errors must never be returned directly.
+	if err := stream.Send(&clusterpb.PrepareChunk{Plan: planToProto(meta)}); err != nil {
+		return stream.CloseAndRecv()
+	}
+	for off := 0; off < len(traceBytes); off += prepareStreamChunkBytes {
+		end := off + prepareStreamChunkBytes
+		if end > len(traceBytes) {
+			end = len(traceBytes)
+		}
+		if err := stream.Send(&clusterpb.PrepareChunk{TraceChunk: traceBytes[off:end]}); err != nil {
+			return stream.CloseAndRecv()
+		}
+	}
+	return stream.CloseAndRecv()
 }
 
 func (w *remoteWorker) Run(ctx context.Context, goTime time.Time, progress func(ops, bytes int64)) error {
