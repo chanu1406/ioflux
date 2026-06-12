@@ -26,6 +26,9 @@ var LowFidelityDriftFraction = 0.10
 // (0 or unknown). 10 ms is a reasonable human-perceptible I/O latency floor.
 var LowFidelityDriftFallbackNS = int64(10_000_000) // 10 ms
 
+// LowFidelityDriftFloorNS is the absolute floor for timeline/scaled drift.
+var LowFidelityDriftFloorNS = int64(2_000_000) // 2 ms
+
 // LowFidelityBacklogFraction is the maximum fraction of ops allowed to have
 // been backlog-blocked before the run is flagged low-fidelity.
 var LowFidelityBacklogFraction = 0.05
@@ -64,13 +67,14 @@ type ConcurrencyCheck struct {
 // FidelityReport is attached to every Results and summarises how faithfully
 // the replay reproduced the trace.
 type FidelityReport struct {
-	ScheduleDrift     PercentileSummary `json:"schedule_drift"`
-	CompletionLag     PercentileSummary `json:"completion_lag"`
-	Backlog           BacklogSummary    `json:"backlog"`
-	Coverage          CoverageSummary   `json:"coverage"`
-	ConcurrencyCheck  ConcurrencyCheck  `json:"concurrency_check"`
-	LowFidelity       bool              `json:"low_fidelity"`
-	LowFidelityReason string            `json:"low_fidelity_reason,omitempty"`
+	ScheduleDrift       PercentileSummary `json:"schedule_drift"`
+	CompletionLag       PercentileSummary `json:"completion_lag"`
+	Backlog             BacklogSummary    `json:"backlog"`
+	Coverage            CoverageSummary   `json:"coverage"`
+	ConcurrencyCheck    ConcurrencyCheck  `json:"concurrency_check"`
+	LowFidelity         bool              `json:"low_fidelity"`
+	LowFidelityCategory string            `json:"low_fidelity_category,omitempty"`
+	LowFidelityReason   string            `json:"low_fidelity_reason,omitempty"`
 }
 
 // Build constructs a FidelityReport from the merged post-run recorder,
@@ -121,7 +125,7 @@ func Build(
 	r.ConcurrencyCheck = buildConcurrencyCheck(peakByStream)
 
 	// --- Low-fidelity gate ---
-	r.LowFidelity, r.LowFidelityReason = assessFidelity(r, meanInterArrivalNS, mode)
+	r.LowFidelity, r.LowFidelityCategory, r.LowFidelityReason = assessFidelity(r, meanInterArrivalNS, mode)
 
 	return r
 }
@@ -157,8 +161,11 @@ func buildConcurrencyCheck(peakByStream map[int64]int64) ConcurrencyCheck {
 	return cc
 }
 
-// assessFidelity returns (lowFidelity bool, reason string).
-func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bool, string) {
+// assessFidelity returns (lowFidelity bool, category string, reason string).
+// Drift below LowFidelityDriftFloorNS is host scheduler jitter and never
+// flags; drift above the threshold means the replay fell behind the trace's
+// intended schedule, so the category is "behind_schedule".
+func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bool, string, string) {
 	// Only timeline/scaled modes produce meaningful drift data.
 	isTimeline := mode == "timeline" || mode == "scaled"
 
@@ -166,9 +173,12 @@ func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bo
 		threshold := LowFidelityDriftFallbackNS
 		if meanInterArrivalNS > 0 {
 			threshold = int64(float64(meanInterArrivalNS) * LowFidelityDriftFraction)
+			if threshold < LowFidelityDriftFloorNS {
+				threshold = LowFidelityDriftFloorNS
+			}
 		}
 		if r.ScheduleDrift.P99NS > threshold {
-			return true, fmt.Sprintf(
+			return true, "behind_schedule", fmt.Sprintf(
 				"p99 schedule drift %dns exceeds %.0f%% of mean inter-arrival %dns (threshold %dns)",
 				r.ScheduleDrift.P99NS,
 				LowFidelityDriftFraction*100,
@@ -179,7 +189,7 @@ func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bo
 	}
 
 	if r.Backlog.FractionOpsBacklogged > LowFidelityBacklogFraction {
-		return true, fmt.Sprintf(
+		return true, "backend_backlog", fmt.Sprintf(
 			"%.1f%% of ops were backlog-blocked (threshold %.0f%%)",
 			r.Backlog.FractionOpsBacklogged*100,
 			LowFidelityBacklogFraction*100,
@@ -187,11 +197,11 @@ func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bo
 	}
 
 	if r.Coverage.OpsIssued < r.Coverage.OpsInTrace {
-		return true, fmt.Sprintf(
+		return true, "coverage_gap", fmt.Sprintf(
 			"%d of %d ops were skipped",
 			r.Coverage.OpsSkipped, r.Coverage.OpsInTrace,
 		)
 	}
 
-	return false, ""
+	return false, "", ""
 }

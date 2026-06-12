@@ -175,49 +175,46 @@ func TestBuild_DriftFallback(t *testing.T) {
 	}
 }
 
-// TestBuild_ScaledModeLowersMeanInterArrival verifies that the caller passing a
-// speedup-divided meanInterArrivalNS (as the scheduler does for scaled mode)
-// correctly tightens the low-fidelity drift threshold relative to unscaled.
-func TestBuild_ScaledModeLowersMeanInterArrival(t *testing.T) {
-	// 600µs drift: below the 1ms threshold for 10ms mean (1x), above the 500µs
-	// threshold for 5ms mean (2x speedup). Both use mode "scaled".
-	const drift = int64(600_000) // 600 µs
+// TestBuild_DriftFloorProtectsSubMillisecondCadence verifies that small
+// scheduler jitter on very dense traces is not flagged low-fidelity merely
+// because 10% of mean inter-arrival is below the practical OS scheduling floor.
+func TestBuild_DriftFloorProtectsSubMillisecondCadence(t *testing.T) {
+	const drift = int64(600_000) // 600 us
 
 	recHF := makeRecorder([]int64{drift}, []int64{drift}, 0, 1)
 	hdr := makeHdr(1, 0)
-	repHF := fidelity.Build(recHF, hdr, "scaled", 10_000_000, nil) // 10ms mean → 1ms threshold
+	repHF := fidelity.Build(recHF, hdr, "scaled", 5_000_000, nil) // 10% = 500us, floor = 2ms
 	if repHF.LowFidelity {
-		t.Errorf("10ms mean: LowFidelity=true for 600µs drift, want false; reason=%q", repHF.LowFidelityReason)
+		t.Errorf("5ms mean: LowFidelity=true for 600us drift, want false; reason=%q", repHF.LowFidelityReason)
 	}
 
-	recLF := makeRecorder([]int64{drift}, []int64{drift}, 0, 1)
-	repLF := fidelity.Build(recLF, hdr, "scaled", 5_000_000, nil) // 5ms mean (2x) → 500µs threshold
+	const largeDrift = int64(3_000_000) // 3 ms
+	recLF := makeRecorder([]int64{largeDrift}, []int64{largeDrift}, 0, 1)
+	repLF := fidelity.Build(recLF, hdr, "scaled", 5_000_000, nil)
 	if !repLF.LowFidelity {
-		t.Errorf("5ms mean (2x scaled): LowFidelity=false for 600µs drift, want true")
+		t.Errorf("5ms mean: LowFidelity=false for 3ms drift, want true")
+	}
+	if repLF.LowFidelityCategory != "behind_schedule" {
+		t.Errorf("LowFidelityCategory=%q, want behind_schedule", repLF.LowFidelityCategory)
 	}
 }
 
-// TestBuild_ScaledSlowdownRaisesThreshold verifies that a speedup < 1 (slowdown)
-// widens the drift threshold. With 0.5× speedup a 10ms mean becomes 20ms in
-// real time, so the threshold doubles and a 1.5ms drift stays high-fidelity.
+// TestBuild_ScaledSlowdownRaisesThreshold verifies that larger real-time mean
+// inter-arrival values widen the drift threshold once they exceed the 2ms floor.
 func TestBuild_ScaledSlowdownRaisesThreshold(t *testing.T) {
-	// 1.5ms drift:
-	//   - unscaled (10ms mean → 1ms threshold): low fidelity
-	//   - 0.5x speedup (20ms real mean → 2ms threshold): high fidelity
-	const drift = int64(1_500_000) // 1.5 ms
+	const drift = int64(2_500_000) // 2.5 ms
 
 	recLF := makeRecorder([]int64{drift}, []int64{drift}, 0, 1)
 	hdr := makeHdr(1, 0)
-	repLF := fidelity.Build(recLF, hdr, "scaled", 10_000_000, nil) // 10ms mean → 1ms threshold
+	repLF := fidelity.Build(recLF, hdr, "scaled", 10_000_000, nil) // 10% = 1ms, floor = 2ms
 	if !repLF.LowFidelity {
-		t.Errorf("10ms mean: LowFidelity=false for 1.5ms drift, want true")
+		t.Errorf("10ms mean: LowFidelity=false for 2.5ms drift, want true")
 	}
 
 	recHF := makeRecorder([]int64{drift}, []int64{drift}, 0, 1)
-	// 0.5x slowdown: scheduler passes 10ms / 0.5 = 20ms mean → 2ms threshold
-	repHF := fidelity.Build(recHF, hdr, "scaled", 20_000_000, nil)
+	repHF := fidelity.Build(recHF, hdr, "scaled", 30_000_000, nil) // 10% = 3ms
 	if repHF.LowFidelity {
-		t.Errorf("20ms mean (0.5x slowdown): LowFidelity=true for 1.5ms drift, want false; reason=%q", repHF.LowFidelityReason)
+		t.Errorf("30ms mean: LowFidelity=true for 2.5ms drift, want false; reason=%q", repHF.LowFidelityReason)
 	}
 }
 
