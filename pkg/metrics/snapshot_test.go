@@ -140,3 +140,31 @@ func assertHistogramEqual(t *testing.T, name string, got, want *metrics.Histogra
 		t.Fatalf("%s Mean=%f, want %f", name, got.Mean(), want.Mean())
 	}
 }
+
+// TestHistogramExportTrimsTrailingZeros pins the trim/pad contract: Export
+// drops the (large) all-zero bucket tail and Import reconstructs it, with
+// percentiles, totals, and max surviving the round trip — including values at
+// the very top of the trackable range, whose buckets only exist after padding.
+func TestHistogramExportTrimsTrailingZeros(t *testing.T) {
+	h := metrics.New()
+	h.RecordValue(5_000)
+	h.RecordValue(150_000)
+
+	// A histogram covering 1µs–100s has tens of thousands of buckets; two small
+	// samples must export far fewer counts than that.
+	s := h.Export()
+	if len(s.Counts) == 0 || len(s.Counts) >= 10_000 {
+		t.Fatalf("Export Counts len=%d, want a trimmed prefix (non-empty, < 10000)", len(s.Counts))
+	}
+	got := metrics.ImportHistogram(s)
+	assertHistogramEqual(t, "trimmed", got, h)
+
+	// A sample near the top of the range exercises re-padding: merging into the
+	// reimported histogram must not index past the shortened counts array.
+	top := metrics.New()
+	top.RecordValue(99_000_000_000)
+	got.Merge(top)
+	if got.Max() < 98_000_000_000 {
+		t.Fatalf("Max=%d after merging top-of-range sample, want ~99s", got.Max())
+	}
+}

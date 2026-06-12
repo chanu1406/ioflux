@@ -24,6 +24,9 @@ type PlanInfo struct {
 	NumOps                    int64   `json:"num_ops"`
 	TotalBytes                int64   `json:"total_bytes"`
 	PrepareMode               string  `json:"prepare_mode,omitempty"`
+	PrepareScope              string  `json:"prepare_scope,omitempty"`
+	FillMode                  string  `json:"fill_mode,omitempty"`
+	FillSeed                  int64   `json:"fill_seed,omitempty"`
 	PrepareTouchedSameData    bool    `json:"prepare_touched_same_data,omitempty"`
 	PrepareVerified           int     `json:"prepare_verified,omitempty"`
 	PrepareCreated            int     `json:"prepare_created,omitempty"`
@@ -51,6 +54,15 @@ type DriftStats struct {
 	P999NS int64   `json:"p999_ns"`
 	MaxNS  int64   `json:"max_ns"`
 	MeanNS float64 `json:"mean_ns"`
+}
+
+// ProgressPoint records cumulative progress at a point in the run.
+type ProgressPoint struct {
+	ElapsedNS  int64 `json:"elapsed_ns"`
+	Ops        int64 `json:"ops"`
+	Bytes      int64 `json:"bytes"`
+	OpsDelta   int64 `json:"ops_delta,omitempty"`
+	BytesDelta int64 `json:"bytes_delta,omitempty"`
 }
 
 // RunEnv records the environment state applied before the RUN phase.
@@ -104,7 +116,9 @@ type Results struct {
 	OpsCompleted     int64        `json:"ops_completed"`
 	BytesMoved       int64        `json:"bytes_moved"`
 	Errors           int64        `json:"errors"`
+	ShortReads       int64        `json:"short_reads,omitempty"`
 	PerOpStats       []PerOpStats `json:"per_op_stats"`
+	ServiceTimeStats []PerOpStats `json:"service_time_stats,omitempty"`
 	BacklogEvents    int64        `json:"backlog_events"`
 	BacklogBlockedNS int64        `json:"backlog_blocked_ns"`
 	// MaxInflightDepth is the peak concurrent in-flight op count.
@@ -112,6 +126,11 @@ type Results struct {
 	ScheduleDrift    DriftStats              `json:"schedule_drift"`
 	CPU              CPU                     `json:"cpu"`
 	Fidelity         fidelity.FidelityReport `json:"fidelity"`
+	// HistogramSnapshot is the merged recorder in lossless form, so saved runs
+	// can be re-merged or re-queried at arbitrary percentiles. (omitempty has
+	// no effect on a struct field; the snapshot is always present.)
+	HistogramSnapshot metrics.RecorderSnapshot `json:"histogram_snapshot"`
+	TimeSeries        []ProgressPoint          `json:"time_series,omitempty"`
 
 	// Hosts, Straggler, and GoDeliverySkewNS are populated only for distributed
 	// (multi-host) runs; single-node runs omit them so their output is unchanged.
@@ -125,6 +144,7 @@ type Results struct {
 func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64) *Results {
 	kinds := rec.OpKinds()
 	stats := make([]PerOpStats, 0, len(kinds))
+	serviceStats := make([]PerOpStats, 0, len(kinds))
 	for _, k := range kinds {
 		h := rec.Histogram(k)
 		if h == nil {
@@ -140,19 +160,34 @@ func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64
 			MaxNS:  h.Max(),
 			MeanNS: h.Mean(),
 		})
+		if sh := rec.ServiceHistogram(k); sh != nil {
+			serviceStats = append(serviceStats, PerOpStats{
+				OpType: string(k),
+				Count:  rec.Count(k),
+				P50NS:  sh.Percentile(50),
+				P90NS:  sh.Percentile(90),
+				P99NS:  sh.Percentile(99),
+				P999NS: sh.Percentile(99.9),
+				MaxNS:  sh.Max(),
+				MeanNS: sh.Mean(),
+			})
+		}
 	}
 	r := &Results{
-		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-		Plan:             plan,
-		RunEnv:           runEnv,
-		DurationNS:       durationNS,
-		OpsCompleted:     rec.TotalOps(),
-		BytesMoved:       rec.Bytes,
-		Errors:           rec.Errors,
-		PerOpStats:       stats,
-		BacklogEvents:    rec.BacklogEvents,
-		BacklogBlockedNS: rec.BacklogBlockedNS,
-		MaxInflightDepth: rec.MaxInflightDepth,
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		Plan:              plan,
+		RunEnv:            runEnv,
+		DurationNS:        durationNS,
+		OpsCompleted:      rec.TotalOps(),
+		BytesMoved:        rec.Bytes,
+		Errors:            rec.Errors,
+		ShortReads:        rec.ShortReads,
+		PerOpStats:        stats,
+		ServiceTimeStats:  serviceStats,
+		BacklogEvents:     rec.BacklogEvents,
+		BacklogBlockedNS:  rec.BacklogBlockedNS,
+		MaxInflightDepth:  rec.MaxInflightDepth,
+		HistogramSnapshot: rec.Export(),
 	}
 	if dh := rec.DriftHist; dh != nil {
 		r.ScheduleDrift = DriftStats{

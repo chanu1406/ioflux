@@ -10,10 +10,12 @@ import (
 // replay stream. Not safe for concurrent use; use one Recorder per stream and
 // Merge after all streams finish.
 type Recorder struct {
-	hists  map[trace.OpKind]*Histogram
-	counts map[trace.OpKind]int64
-	Bytes  int64
-	Errors int64
+	hists        map[trace.OpKind]*Histogram
+	serviceHists map[trace.OpKind]*Histogram
+	counts       map[trace.OpKind]int64
+	Bytes        int64
+	Errors       int64
+	ShortReads   int64
 
 	// BacklogEvents is the number of times an op had to wait for a semaphore
 	// slot because the worker-level MaxInflight cap was reached.
@@ -42,8 +44,9 @@ type Recorder struct {
 // NewRecorder returns an empty Recorder.
 func NewRecorder() *Recorder {
 	return &Recorder{
-		hists:  make(map[trace.OpKind]*Histogram),
-		counts: make(map[trace.OpKind]int64),
+		hists:        make(map[trace.OpKind]*Histogram),
+		serviceHists: make(map[trace.OpKind]*Histogram),
+		counts:       make(map[trace.OpKind]int64),
 	}
 }
 
@@ -96,6 +99,23 @@ func (r *Recorder) Record(kind trace.OpKind, latencyNS, bytesN int64, errored bo
 	}
 }
 
+// RecordService records pure backend service time for one op, excluding any
+// timeline backlog wait that may be included in headline latency.
+func (r *Recorder) RecordService(kind trace.OpKind, serviceNS int64) {
+	if serviceNS < 0 {
+		serviceNS = 0
+	}
+	h, ok := r.serviceHists[kind]
+	if !ok {
+		h = New()
+		r.serviceHists[kind] = h
+	}
+	h.RecordValue(serviceNS)
+}
+
+// RecordShortRead counts a replay op that returned engine.ErrShortRead.
+func (r *Recorder) RecordShortRead() { r.ShortReads++ }
+
 // Merge adds all samples and counters from other into r. Called from the
 // single-threaded aggregation step after all stream goroutines complete.
 func (r *Recorder) Merge(other *Recorder) {
@@ -110,6 +130,15 @@ func (r *Recorder) Merge(other *Recorder) {
 	}
 	r.Bytes += other.Bytes
 	r.Errors += other.Errors
+	r.ShortReads += other.ShortReads
+	for kind, oh := range other.serviceHists {
+		h, ok := r.serviceHists[kind]
+		if !ok {
+			h = New()
+			r.serviceHists[kind] = h
+		}
+		h.Merge(oh)
+	}
 	r.BacklogEvents += other.BacklogEvents
 	r.BacklogBlockedNS += other.BacklogBlockedNS
 	if other.MaxInflightDepth > r.MaxInflightDepth {
@@ -136,6 +165,11 @@ func (r *Recorder) Merge(other *Recorder) {
 // recorded.
 func (r *Recorder) Histogram(kind trace.OpKind) *Histogram {
 	return r.hists[kind]
+}
+
+// ServiceHistogram returns the service-time Histogram for kind, or nil.
+func (r *Recorder) ServiceHistogram(kind trace.OpKind) *Histogram {
+	return r.serviceHists[kind]
 }
 
 // Count returns the ops-completed count for kind.
