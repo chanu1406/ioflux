@@ -486,6 +486,67 @@ func TestRunRecordsEngineErrorsWithoutReturningFatalError(t *testing.T) {
 	}
 }
 
+func TestRunRecordsShortReadsAndServiceTime(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	off0 := int64(0)
+	readLen := int64(1024)
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeRead},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpRead, H: &h0, Off: &off0, Len: &readLen},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpClose, H: &h0},
+	}
+	hdr := trace.Header{
+		Version:       trace.TraceFormatVersion,
+		Kind:          trace.TraceSynthetic,
+		TimeUnit:      trace.TimeUnitNanoseconds,
+		CaptureMethod: trace.CaptureSynthetic,
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "short.dat", Kind: trace.TargetFile, Size: 512}},
+		Summary:       trace.Summary{NumOps: int64(len(ops)), NumStreams: 1, TotalBytes: readLen, DurationNS: 2},
+	}
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := memEngineForTrace(hdr)
+	exec, err := replay.Prepare(replay.Plan{Engine: eng, EngineName: "mem", Mode: "asap"}, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("Errors=%d, want 0 for ErrShortRead", res.Errors)
+	}
+	if res.ShortReads != 1 {
+		t.Fatalf("ShortReads=%d, want 1", res.ShortReads)
+	}
+	if res.BytesMoved != 512 {
+		t.Fatalf("BytesMoved=%d, want actual short-read bytes 512", res.BytesMoved)
+	}
+	if len(res.ServiceTimeStats) == 0 {
+		t.Fatal("ServiceTimeStats empty")
+	}
+	if res.HistogramSnapshot.ShortReads != 1 {
+		t.Fatalf("snapshot ShortReads=%d, want 1", res.HistogramSnapshot.ShortReads)
+	}
+	if _, ok := res.HistogramSnapshot.ServiceHistograms[trace.OpRead]; !ok {
+		t.Fatal("snapshot missing READ service histogram")
+	}
+}
+
 // TestExplicitGroupZeroAllowed verifies that ops with "group":0 (nil vs explicit
 // zero both mean the default group) pass Prepare. Only truly non-zero groups
 // should be rejected.

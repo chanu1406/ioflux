@@ -8,15 +8,14 @@ package replay
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/chanuollala/ioflux/pkg/cache"
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/prepare"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/targetmap"
@@ -47,6 +46,10 @@ type Plan struct {
 	SourceRoot string
 	// CacheMode is "cold" or "warm". Empty means skip cache controls.
 	CacheMode string
+	// FillMode is "seeded" or "zero". Empty defaults to seeded.
+	FillMode string
+	// FillSeed controls deterministic seeded payload fill. 0 uses the default.
+	FillSeed int64
 }
 
 // Executor holds the loaded, validated plan ready for execution.
@@ -54,7 +57,7 @@ type Executor struct {
 	plan     Plan
 	hdr      trace.Header
 	byStream map[int64][]trace.Op
-	allOps   []trace.Op
+	prepMeta prepare.Metadata
 	// originalTargets is the pre-rewrite target slice, kept so Materialize can
 	// locate source files for materialize-from-source.
 	originalTargets []trace.TargetInfo
@@ -67,28 +70,24 @@ type Executor struct {
 // whose header has already been parsed by trace.NewReader. Prepare consumes
 // the remainder of r (the op lines).
 func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
+	return prepareInternal(plan, r, nil, true)
+}
+
+// PrepareAssigned is Prepare optimized for a distributed worker. It validates
+// the full trace and derives full-target preparation metadata, but retains only
+// ops whose stream ID is listed in streamIDs. A nil or empty streamIDs slice is
+// a legitimate idle assignment.
+func PrepareAssigned(plan Plan, r *trace.Reader, streamIDs []int64) (*Executor, error) {
+	return prepareInternal(plan, r, streamIDs, false)
+}
+
+func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStreams bool) (*Executor, error) {
 	hdr := r.Header()
 
 	byStream := make(map[int64][]trace.Op)
-	var ops []trace.Op
-	for {
-		op, err := r.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("replay: prepare: read op: %w", err)
-		}
-		ops = append(ops, op)
-		byStream[op.S] = append(byStream[op.S], op)
-	}
-
-	rep, err := trace.ValidateLoadedRaw(r.HeaderRaw(), ops)
-	if err != nil {
-		return nil, fmt.Errorf("replay: prepare: validate trace: %w", err)
-	}
-	if !rep.OK() {
-		return nil, fmt.Errorf("replay: prepare: invalid trace: %s", formatValidationErrors(rep))
+	wantStreams := make(map[int64]struct{}, len(streamIDs))
+	for _, sid := range streamIDs {
+		wantStreams[sid] = struct{}{}
 	}
 
 	// Apply target map rewrite before caps check so that post-rewrite kinds
@@ -106,20 +105,78 @@ func Prepare(plan Plan, r *trace.Reader) (*Executor, error) {
 	}
 
 	caps := plan.Engine.Caps()
-	for _, ops := range byStream {
-		for _, op := range ops {
-			if op.Group != nil && *op.Group != 0 {
-				return nil, fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
-			}
-			if err := checkOpCaps(op, caps); err != nil {
-				return nil, fmt.Errorf("replay: prepare: %w", err)
-			}
+	prepMeta := prepare.Metadata{
+		Extents: make(map[int]int64),
+		Fill: payload.Config{
+			Mode: payload.Mode(plan.FillMode),
+			Seed: plan.FillSeed,
+		}.Normalize(),
+	}
+	handleToTarget := make(map[int64]int)
+	rep, err := trace.ValidateWithOps(r, func(op trace.Op) error {
+		if op.Group != nil && *op.Group != 0 {
+			return fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
 		}
+		if err := checkOpCaps(op, caps); err != nil {
+			return fmt.Errorf("replay: prepare: %w", err)
+		}
+		updatePrepMetadata(prepMeta, handleToTarget, op)
+		if loadAllStreams {
+			byStream[op.S] = append(byStream[op.S], op)
+			return nil
+		}
+		if _, ok := wantStreams[op.S]; ok {
+			byStream[op.S] = append(byStream[op.S], op)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replay: prepare: validate trace: %w", err)
+	}
+	if !rep.OK() {
+		return nil, fmt.Errorf("replay: prepare: invalid trace: %s", formatValidationErrors(rep))
 	}
 
 	// Dataset preparation is deferred to Materialize so it honors a caller's
 	// context (a cancelled PREPARE phase must not keep materializing data).
-	return &Executor{plan: plan, hdr: hdr, byStream: byStream, allOps: ops, originalTargets: originalTargets}, nil
+	return &Executor{plan: plan, hdr: hdr, byStream: byStream, prepMeta: prepMeta, originalTargets: originalTargets}, nil
+}
+
+func updatePrepMetadata(meta prepare.Metadata, handleToTarget map[int64]int, op trace.Op) {
+	switch op.Op {
+	case trace.OpOpen:
+		if op.H != nil && op.Tgt != nil {
+			handleToTarget[*op.H] = *op.Tgt
+		}
+	case trace.OpRead, trace.OpWrite:
+		if op.H == nil || op.Off == nil || op.Len == nil {
+			return
+		}
+		idx, ok := handleToTarget[*op.H]
+		if !ok {
+			return
+		}
+		end := *op.Off + *op.Len
+		if end > meta.Extents[idx] {
+			meta.Extents[idx] = end
+		}
+	case trace.OpClose:
+		if op.H != nil {
+			delete(handleToTarget, *op.H)
+		}
+	case trace.OpGet, trace.OpPut:
+		if op.Tgt == nil || op.Len == nil {
+			return
+		}
+		off := int64(0)
+		if op.Off != nil {
+			off = *op.Off
+		}
+		end := off + *op.Len
+		if end > meta.Extents[*op.Tgt] {
+			meta.Extents[*op.Tgt] = end
+		}
+	}
 }
 
 // Materialize runs dataset preparation against the backend for the configured
@@ -138,7 +195,12 @@ func (e *Executor) Materialize(ctx context.Context) (prepare.Stats, error) {
 		if err != nil {
 			return prepare.Stats{}, fmt.Errorf("replay: materialize: %w", err)
 		}
-		stats, err := prep.Prepare(ctx, e.hdr.Targets, e.originalTargets, e.allOps, e.plan.Engine)
+		var stats prepare.Stats
+		if mp, ok := prep.(prepare.MetadataPreparer); ok {
+			stats, err = mp.PrepareWithMetadata(ctx, e.hdr.Targets, e.originalTargets, e.prepMeta, e.plan.Engine)
+		} else {
+			stats, err = prep.Prepare(ctx, e.hdr.Targets, e.originalTargets, nil, e.plan.Engine)
+		}
 		if err != nil {
 			return prepare.Stats{}, fmt.Errorf("replay: materialize: %w", err)
 		}
@@ -221,6 +283,8 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		NumOps:                    e.hdr.Summary.NumOps,
 		TotalBytes:                e.hdr.Summary.TotalBytes,
 		PrepareMode:               e.plan.PrepareMode,
+		FillMode:                  string(e.prepMeta.Fill.Mode),
+		FillSeed:                  e.prepMeta.Fill.Seed,
 		PrepareTouchedSameData:    e.prepStats.TouchedSameData || (e.plan.CacheMode == "warm" && cacheRes.Primed > 0),
 		PrepareVerified:           e.prepStats.Verified,
 		PrepareCreated:            e.prepStats.Created,
@@ -240,6 +304,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		RunStart:      time.Now(),
 		PlanInfo:      planInfo,
 		RunEnv:        runEnv,
+		Fill:          e.prepMeta.Fill,
 	}
 	return schedule(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }
@@ -305,6 +370,7 @@ func (e *Executor) RunWorker(ctx context.Context, runStart time.Time, progress f
 		SpeedupFactor: e.plan.SpeedupFactor,
 		RunStart:      runStart,
 		Progress:      progress,
+		Fill:          e.prepMeta.Fill,
 	}
 	return runStreams(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }

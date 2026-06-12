@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/chanuollala/ioflux/pkg/engine"
 	"github.com/chanuollala/ioflux/pkg/fidelity"
 	"github.com/chanuollala/ioflux/pkg/metrics"
+	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
@@ -44,6 +46,9 @@ type SchedulerOpts struct {
 
 	// ProgressInterval is the cadence for Progress callbacks. 0 defaults to 1s.
 	ProgressInterval time.Duration
+
+	// Fill controls deterministic write/PUT payload generation.
+	Fill payload.Config
 }
 
 // WorkerOutput is the raw result of replaying one worker's assigned streams.
@@ -67,6 +72,7 @@ type WorkerOutput struct {
 	// (e.g. O_DIRECT not honored). The coordinator unions them into RunEnv so a
 	// distributed run reports them as faithfully as a single-node run.
 	EngineLimitations []string
+	TimeSeries        []results.ProgressPoint
 }
 
 // schedule runs all streams of a single (in-process) worker and builds the
@@ -97,6 +103,7 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 	if speedup <= 0 {
 		speedup = 1
 	}
+	fill := opts.Fill.Normalize()
 
 	var (
 		currentInflight  atomic.Int64
@@ -138,7 +145,7 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 			defer func() {
 				resultsCh <- streamResult{sid: sid, rec: rec, completionNS: time.Since(wallStart).Nanoseconds()}
 			}()
-			handleMap := make(map[int64]engine.Handle)
+			handleMap := make(map[int64]replayHandle)
 			buf := make([]byte, 64*1024)
 			var streamInflight int64
 
@@ -200,7 +207,15 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 					rec.RecordDrift(driftNS)
 				}
 
-				bytesN, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf)
+				bytesN, shortRead, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf, fill)
+				serviceNS := time.Since(serviceStart).Nanoseconds()
+				if serviceNS < 0 {
+					serviceNS = 0
+				}
+				rec.RecordService(op.Op, serviceNS)
+				if shortRead {
+					rec.RecordShortRead()
+				}
 
 				// In timeline/scaled, latency must capture the full backlog
 				// (coordinated-omission: include the time spent waiting for the
@@ -226,30 +241,48 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 		}(sid, ops)
 	}
 
-	// Stream cumulative progress on a ticker while the run is in flight. The
-	// progressWG ensures no callback fires after runStreams returns.
+	// Stream cumulative progress on a ticker while the run is in flight and keep
+	// the same cumulative points for results.json.
 	var progressWG sync.WaitGroup
 	stopProgress := make(chan struct{})
-	if opts.Progress != nil {
-		interval := opts.ProgressInterval
-		if interval <= 0 {
-			interval = time.Second
-		}
-		progressWG.Add(1)
-		go func() {
-			defer progressWG.Done()
-			t := time.NewTicker(interval)
-			defer t.Stop()
-			for {
-				select {
-				case <-t.C:
-					opts.Progress(opsDone.Load(), bytesDone.Load())
-				case <-stopProgress:
-					return
-				}
-			}
-		}()
+	interval := opts.ProgressInterval
+	if interval <= 0 {
+		interval = time.Second
 	}
+	var seriesMu sync.Mutex
+	var series []results.ProgressPoint
+	var lastSeriesOps, lastSeriesBytes int64
+	recordProgressPoint := func(elapsedNS, ops, bytes int64) {
+		pt := results.ProgressPoint{
+			ElapsedNS:  elapsedNS,
+			Ops:        ops,
+			Bytes:      bytes,
+			OpsDelta:   ops - lastSeriesOps,
+			BytesDelta: bytes - lastSeriesBytes,
+		}
+		lastSeriesOps, lastSeriesBytes = ops, bytes
+		series = append(series, pt)
+	}
+	progressWG.Add(1)
+	go func() {
+		defer progressWG.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				ops, bytes := opsDone.Load(), bytesDone.Load()
+				seriesMu.Lock()
+				recordProgressPoint(time.Since(wallStart).Nanoseconds(), ops, bytes)
+				seriesMu.Unlock()
+				if opts.Progress != nil {
+					opts.Progress(ops, bytes)
+				}
+			case <-stopProgress:
+				return
+			}
+		}
+	}()
 
 	wg.Wait()
 	close(stopProgress)
@@ -258,6 +291,13 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 
 	durationNS := time.Since(wallStart).Nanoseconds()
 	cpuDelta := cpustat.Now().Sub(cpuStart)
+	finalOps, finalBytes := opsDone.Load(), bytesDone.Load()
+	seriesMu.Lock()
+	if len(series) == 0 || series[len(series)-1].Ops != finalOps || series[len(series)-1].Bytes != finalBytes {
+		recordProgressPoint(durationNS, finalOps, finalBytes)
+	}
+	seriesOut := append([]results.ProgressPoint(nil), series...)
+	seriesMu.Unlock()
 
 	merged := metrics.NewRecorder()
 	peakByStream := make(map[int64]int64, len(byStream))
@@ -292,6 +332,7 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 		ActualNumOps: actualNumOps,
 		FirstDoneNS:  firstDoneNS,
 		LastDoneNS:   lastDoneNS,
+		TimeSeries:   seriesOut,
 	}
 	return out, ctx.Err()
 }
@@ -344,6 +385,7 @@ func BuildResults(outs []*WorkerOutput, opts SchedulerOpts, hdr trace.Header, go
 	res := results.Build(opts.PlanInfo, opts.RunEnv, merged, wallNS)
 	res.CPU = cpu
 	res.Fidelity = fidelity.Build(merged, correctedHdr, opts.Mode, meanInterArrivalNS, peakByStream)
+	res.TimeSeries = mergeTimeSeries(outs)
 
 	// Union per-worker engine limitations (e.g. O_DIRECT fallback) into the report
 	// so distributed runs stay as honest as single-node ones about what the backend
@@ -369,6 +411,56 @@ func BuildResults(outs []*WorkerOutput, opts SchedulerOpts, hdr trace.Header, go
 		res.Straggler = buildStraggler(outs, res.OpsCompleted, res.BytesMoved)
 	}
 	return res
+}
+
+func mergeTimeSeries(outs []*WorkerOutput) []results.ProgressPoint {
+	if len(outs) == 0 {
+		return nil
+	}
+	if len(outs) == 1 {
+		return append([]results.ProgressPoint(nil), outs[0].TimeSeries...)
+	}
+	type hostPoint struct {
+		ops   int64
+		bytes int64
+	}
+	byBucket := make(map[int64]map[int]hostPoint)
+	for i, out := range outs {
+		for _, pt := range out.TimeSeries {
+			bucket := pt.ElapsedNS / int64(time.Second)
+			if _, ok := byBucket[bucket]; !ok {
+				byBucket[bucket] = make(map[int]hostPoint)
+			}
+			byBucket[bucket][i] = hostPoint{ops: pt.Ops, bytes: pt.Bytes}
+		}
+	}
+	buckets := make([]int64, 0, len(byBucket))
+	for b := range byBucket {
+		buckets = append(buckets, b)
+	}
+	sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
+	out := make([]results.ProgressPoint, 0, len(buckets))
+	var lastOps, lastBytes int64
+	lastByHost := make(map[int]hostPoint)
+	for _, b := range buckets {
+		for i, pt := range byBucket[b] {
+			lastByHost[i] = pt
+		}
+		var ops, bytes int64
+		for _, pt := range lastByHost {
+			ops += pt.ops
+			bytes += pt.bytes
+		}
+		out = append(out, results.ProgressPoint{
+			ElapsedNS:  b * int64(time.Second),
+			Ops:        ops,
+			Bytes:      bytes,
+			OpsDelta:   ops - lastOps,
+			BytesDelta: bytes - lastBytes,
+		})
+		lastOps, lastBytes = ops, bytes
+	}
+	return out
 }
 
 // unionEngineLimitations collects the distinct engine-limitation notes reported
@@ -456,9 +548,10 @@ func dispatchOp(
 	op trace.Op,
 	eng engine.Engine,
 	hdr trace.Header,
-	handleMap map[int64]engine.Handle,
+	handleMap map[int64]replayHandle,
 	bufp *[]byte,
-) (bytesN int64, opErr error) {
+	fill payload.Config,
+) (bytesN int64, shortRead bool, opErr error) {
 	buf := *bufp
 	defer func() { *bufp = buf }()
 
@@ -469,35 +562,41 @@ func dispatchOp(
 		flags := parseOpenFlags(op.Flags)
 		h, err := eng.Open(ctx, name, mode, flags)
 		if err == nil {
-			handleMap[*op.H] = h
+			handleMap[*op.H] = replayHandle{handle: h, target: name}
 		}
 		opErr = err
 
 	case trace.OpRead:
-		h := handleMap[*op.H]
+		rh := handleMap[*op.H]
 		off, length := *op.Off, *op.Len
 		buf = growBuf(buf, length)
-		n, err := eng.Read(ctx, h, off, length, buf[:length])
+		n, err := eng.Read(ctx, rh.handle, off, length, buf[:length])
 		bytesN = int64(n)
 		if errors.Is(err, engine.ErrShortRead) {
+			shortRead = true
 			err = nil
 		}
 		opErr = err
 
 	case trace.OpWrite:
-		h := handleMap[*op.H]
+		rh := handleMap[*op.H]
 		off, length := *op.Off, *op.Len
 		buf = growBuf(buf, length)
-		n, err := eng.Write(ctx, h, off, buf[:length])
+		opID := int64(0)
+		if op.OpID != nil {
+			opID = *op.OpID
+		}
+		payload.Fill(buf[:length], fill, opID, rh.target, off)
+		n, err := eng.Write(ctx, rh.handle, off, buf[:length])
 		bytesN = int64(n)
 		opErr = err
 
 	case trace.OpFsync:
-		opErr = eng.Fsync(ctx, handleMap[*op.H])
+		opErr = eng.Fsync(ctx, handleMap[*op.H].handle)
 
 	case trace.OpClose:
-		h := handleMap[*op.H]
-		opErr = eng.Close(ctx, h)
+		rh := handleMap[*op.H]
+		opErr = eng.Close(ctx, rh.handle)
 		if opErr == nil {
 			delete(handleMap, *op.H)
 		}
@@ -509,6 +608,11 @@ func dispatchOp(
 		key := hdr.Targets[*op.Tgt].Name
 		length := *op.Len
 		buf = growBuf(buf, length)
+		opID := int64(0)
+		if op.OpID != nil {
+			opID = *op.OpID
+		}
+		payload.Fill(buf[:length], fill, opID, key, 0)
 		opErr = eng.Put(ctx, key, bytes.NewReader(buf[:length]), length)
 
 	case trace.OpGet:
@@ -517,6 +621,10 @@ func dispatchOp(
 		buf = growBuf(buf, length)
 		n, err := eng.Get(ctx, key, off, length, buf[:length])
 		bytesN = int64(n)
+		if errors.Is(err, engine.ErrShortRead) {
+			shortRead = true
+			err = nil
+		}
 		opErr = err
 
 	case trace.OpHead:
@@ -526,7 +634,12 @@ func dispatchOp(
 		opErr = eng.Delete(ctx, hdr.Targets[*op.Tgt].Name)
 	}
 
-	return bytesN, opErr
+	return bytesN, shortRead, opErr
+}
+
+type replayHandle struct {
+	handle engine.Handle
+	target string
 }
 
 // parseOpenFlags translates trace OPEN flags into engine flags.
