@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/engine/mem"
+	"github.com/chanuollala/ioflux/pkg/payload"
 )
 
 // TestWritePOSIXHonorsCancellation proves a single large target write stops on
@@ -16,7 +17,7 @@ func TestWritePOSIXHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := writePOSIX(ctx, eng, "huge", 64<<20, make([]byte, prepareChunkSize))
+	err := writePOSIX(ctx, eng, "huge", 64<<20, make([]byte, prepareChunkSize), payload.Config{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("writePOSIX with cancelled ctx err=%v, want context.Canceled", err)
 	}

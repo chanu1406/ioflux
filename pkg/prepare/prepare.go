@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
+	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
@@ -42,6 +43,43 @@ type Stats struct {
 	TouchedSameData    bool // true when prep I/O overlaps with replay read targets
 }
 
+// Metadata is the lightweight trace-derived preparation input retained by the
+// replay executor. It avoids keeping every op in memory just to derive target
+// extents for materialization.
+type Metadata struct {
+	Extents map[int]int64
+	Fill    payload.Config
+}
+
+// MetadataFromOps computes the metadata needed by prepare modes from an op
+// slice. It exists for tests and callers still using the legacy Preparer method.
+func MetadataFromOps(_ []trace.TargetInfo, ops []trace.Op, fill payload.Config) Metadata {
+	meta := Metadata{
+		Extents: make(map[int]int64),
+		Fill:    fill.Normalize(),
+	}
+
+	handleToIdx := make(map[int64]int)
+	for _, op := range ops {
+		if op.Op == trace.OpOpen && op.H != nil && op.Tgt != nil {
+			handleToIdx[*op.H] = *op.Tgt
+			continue
+		}
+		if (op.Op != trace.OpRead && op.Op != trace.OpWrite) || op.Off == nil || op.Len == nil || op.H == nil {
+			continue
+		}
+		idx, ok := handleToIdx[*op.H]
+		if !ok {
+			continue
+		}
+		end := *op.Off + *op.Len
+		if end > meta.Extents[idx] {
+			meta.Extents[idx] = end
+		}
+	}
+	return meta
+}
+
 // Preparer performs dataset preparation before replay starts. targets is the
 // rewritten target slice the engine will see; originalTargets is the
 // pre-rewrite slice from the trace header (originalTargets == targets when no
@@ -49,6 +87,12 @@ type Stats struct {
 // locate source files; other modes ignore it.
 type Preparer interface {
 	Prepare(ctx context.Context, targets, originalTargets []trace.TargetInfo, ops []trace.Op, eng engine.Engine) (Stats, error)
+}
+
+// MetadataPreparer is implemented by preparers that can use lightweight
+// metadata instead of a retained full op slice.
+type MetadataPreparer interface {
+	PrepareWithMetadata(ctx context.Context, targets, originalTargets []trace.TargetInfo, meta Metadata, eng engine.Engine) (Stats, error)
 }
 
 // For returns a Preparer for mode. sourceRoot is required only for
@@ -109,7 +153,12 @@ func (a *assumeExisting) Prepare(ctx context.Context, targets, _ []trace.TargetI
 type materializeSynthetic struct{}
 
 func (m *materializeSynthetic) Prepare(ctx context.Context, targets, _ []trace.TargetInfo, ops []trace.Op, eng engine.Engine) (Stats, error) {
-	sizes := computeRequiredSizes(targets, ops)
+	return m.PrepareWithMetadata(ctx, targets, nil, MetadataFromOps(targets, ops, payload.Config{}), eng)
+}
+
+func (m *materializeSynthetic) PrepareWithMetadata(ctx context.Context, targets, _ []trace.TargetInfo, meta Metadata, eng engine.Engine) (Stats, error) {
+	meta.Fill = meta.Fill.Normalize()
+	sizes := computeRequiredSizes(targets, meta)
 	var stats Stats
 	buf := make([]byte, prepareChunkSize) // allocated once; reused across all targets
 
@@ -121,11 +170,11 @@ func (m *materializeSynthetic) Prepare(ctx context.Context, targets, _ []trace.T
 		if !ok || size == 0 {
 			return stats, fmt.Errorf("prepare: materialize-synthetic: target %q: size unknown and no READ/WRITE ops found; re-run with --prepare assume-existing if target is already provisioned", tgt.Name)
 		}
-		if err := writeTarget(ctx, eng, tgt.Name, size, buf); err != nil {
+		if err := writeTarget(ctx, eng, tgt.Name, size, buf, meta.Fill); err != nil {
 			return stats, fmt.Errorf("prepare: materialize-synthetic: %w", err)
 		}
 		stats.Created++
-		if tgt.Size == 0 {
+		if tgt.Size == 0 && meta.Extents[tgt.ID] > 0 {
 			stats.DerivedSizeFromOps++
 		}
 	}
@@ -133,56 +182,32 @@ func (m *materializeSynthetic) Prepare(ctx context.Context, targets, _ []trace.T
 	return stats, nil
 }
 
-// computeRequiredSizes returns the minimum required byte size per target.
-// It uses TargetInfo.Size when > 0; otherwise it scans ops for max(off+len).
-func computeRequiredSizes(targets []trace.TargetInfo, ops []trace.Op) map[string]int64 {
+// computeRequiredSizes returns the minimum required byte size per target. It
+// uses TargetInfo.Size when > 0; otherwise it uses metadata extents.
+func computeRequiredSizes(targets []trace.TargetInfo, meta Metadata) map[string]int64 {
 	sizes := make(map[string]int64, len(targets))
 	for _, tgt := range targets {
 		if tgt.Size > 0 {
 			sizes[tgt.Name] = tgt.Size
-		}
-	}
-
-	// Map handle → target index from OPEN ops so we can look up targets for
-	// READ/WRITE ops (which carry h, not tgt).
-	handleToIdx := make(map[int64]int)
-	for _, op := range ops {
-		if op.Op == trace.OpOpen && op.H != nil && op.Tgt != nil {
-			handleToIdx[*op.H] = *op.Tgt
-		}
-	}
-
-	// For targets with Size==0, derive from max(off+len) of READ/WRITE ops.
-	for _, op := range ops {
-		if (op.Op != trace.OpRead && op.Op != trace.OpWrite) || op.Off == nil || op.Len == nil || op.H == nil {
 			continue
 		}
-		idx, ok := handleToIdx[*op.H]
-		if !ok || idx >= len(targets) {
-			continue
-		}
-		tgt := targets[idx]
-		if tgt.Size > 0 {
-			continue // authoritative size already covers this target
-		}
-		end := *op.Off + *op.Len
-		if cur := sizes[tgt.Name]; end > cur {
-			sizes[tgt.Name] = end
+		if size := meta.Extents[tgt.ID]; size > 0 {
+			sizes[tgt.Name] = size
 		}
 	}
 	return sizes
 }
 
-// writeTarget creates or replaces target with size zero bytes, streamed in
-// prepareChunkSize chunks from buf.
-func writeTarget(ctx context.Context, eng engine.Engine, name string, size int64, buf []byte) error {
+// writeTarget creates or replaces target with size bytes, streamed in
+// prepareChunkSize chunks from buf using the configured fill mode.
+func writeTarget(ctx context.Context, eng engine.Engine, name string, size int64, buf []byte, fill payload.Config) error {
 	if eng.Caps().ObjectAPI {
-		return eng.Put(ctx, name, &zeroReadSeeker{size: size}, size)
+		return eng.Put(ctx, name, &fillReadSeeker{name: name, size: size, fill: fill.Normalize()}, size)
 	}
-	return writePOSIX(ctx, eng, name, size, buf)
+	return writePOSIX(ctx, eng, name, size, buf, fill.Normalize())
 }
 
-func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64, buf []byte) error {
+func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64, buf []byte, fill payload.Config) error {
 	h, err := eng.Open(ctx, name, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)
 	if err != nil {
 		return fmt.Errorf("writeTarget %q: open: %w", name, err)
@@ -199,6 +224,7 @@ func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64,
 		if remaining := size - off; remaining < n {
 			n = remaining
 		}
+		payload.Fill(buf[:n], fill, 0, name, off)
 		written, writeErr := eng.Write(ctx, h, off, buf[:n])
 		off += int64(written)
 		if writeErr != nil {
@@ -206,15 +232,23 @@ func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64,
 			return fmt.Errorf("writeTarget %q: write at %d: %w", name, off-int64(written), writeErr)
 		}
 	}
+	if eng.Caps().Durable {
+		if err := eng.Fsync(ctx, h); err != nil {
+			_ = eng.Close(ctx, h)
+			return fmt.Errorf("writeTarget %q: fsync: %w", name, err)
+		}
+	}
 	return eng.Close(ctx, h)
 }
 
-// zeroReadSeeker is a seekable source of zero bytes used for Put-based materialization.
-type zeroReadSeeker struct {
+// fillReadSeeker is a seekable source used for Put-based materialization.
+type fillReadSeeker struct {
+	name      string
 	off, size int64
+	fill      payload.Config
 }
 
-func (z *zeroReadSeeker) Read(p []byte) (int, error) {
+func (z *fillReadSeeker) Read(p []byte) (int, error) {
 	if z.off >= z.size {
 		return 0, io.EOF
 	}
@@ -222,14 +256,12 @@ func (z *zeroReadSeeker) Read(p []byte) (int, error) {
 	if remain := z.size - z.off; remain < n {
 		n = remain
 	}
-	for i := int64(0); i < n; i++ {
-		p[i] = 0
-	}
+	payload.Fill(p[:n], z.fill, 0, z.name, z.off)
 	z.off += n
 	return int(n), nil
 }
 
-func (z *zeroReadSeeker) Seek(offset int64, whence int) (int64, error) {
+func (z *fillReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
 	case io.SeekStart:
 		z.off = offset
@@ -292,6 +324,7 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 		return fmt.Errorf("open dest %q: %w", name, err)
 	}
 	var off int64
+	caps := eng.Caps()
 	for {
 		// Check cancellation each chunk so a single large copy stops promptly.
 		if err := ctx.Err(); err != nil {
@@ -313,6 +346,12 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 		if readErr != nil {
 			_ = eng.Close(ctx, h)
 			return fmt.Errorf("read source %q: %w", srcPath, readErr)
+		}
+	}
+	if caps.Durable {
+		if err := eng.Fsync(ctx, h); err != nil {
+			_ = eng.Close(ctx, h)
+			return fmt.Errorf("fsync dest %q: %w", name, err)
 		}
 	}
 	return eng.Close(ctx, h)

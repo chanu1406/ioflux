@@ -201,6 +201,22 @@ func TestMaterializeSynthetic_PosixCreatesAllTargets(t *testing.T) {
 			t.Errorf("%s: size=%d, want %d", p, fi.Size(), tgts[i].Size)
 		}
 	}
+	content, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if allZero(content) {
+		t.Fatal("materialize-synthetic default fill produced all-zero content")
+	}
+}
+
+func allZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestMaterializeSynthetic_DerivesSizeFromOps(t *testing.T) {
