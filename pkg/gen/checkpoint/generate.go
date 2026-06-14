@@ -22,6 +22,7 @@ package checkpoint
 import (
 	"fmt"
 	"io"
+	"math"
 	"slices"
 
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -280,6 +281,8 @@ func ValidateParams(p Params) error {
 		return fmt.Errorf("gen: write-block must be > 0, got %d", p.WriteBlock)
 	case p.NumCheckpoints <= 0:
 		return fmt.Errorf("gen: num-checkpoints must be > 0, got %d", p.NumCheckpoints)
+	case math.IsNaN(p.CheckpointIntervalSec) || math.IsInf(p.CheckpointIntervalSec, 0):
+		return fmt.Errorf("gen: checkpoint-interval must be a finite number, got %v", p.CheckpointIntervalSec)
 	case p.CheckpointIntervalSec < 0:
 		return fmt.Errorf("gen: checkpoint-interval must be >= 0, got %v", p.CheckpointIntervalSec)
 	case p.Fsync != FsyncPerFile && p.Fsync != FsyncFinal && p.Fsync != FsyncNone:

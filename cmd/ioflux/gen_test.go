@@ -38,12 +38,50 @@ func TestGenCmd_NoArgsExitsTwo(t *testing.T) {
 
 // TestGenCmd_UnknownProfileExitsTwo ensures an unrecognised profile is rejected.
 func TestGenCmd_UnknownProfileExitsTwo(t *testing.T) {
-	code, _, stderr := runGenCLI([]string{"checkpoint-write"})
+	code, _, stderr := runGenCLI([]string{"no-such-profile"})
 	if code != 2 {
 		t.Fatalf("exit=%d want 2", code)
 	}
 	if !strings.Contains(stderr, "unknown profile") {
 		t.Errorf("stderr should mention unknown profile, got: %s", stderr)
+	}
+}
+
+// TestGenCmd_CheckpointWrite generates a checkpoint-write trace to a temp file
+// and confirms it is non-empty and carries the checkpoint profile and synthetic
+// kind in its header.
+func TestGenCmd_CheckpointWrite(t *testing.T) {
+	tmp, err := os.CreateTemp("", "ioflux-ckpt-*.ioflux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	code, stdout, stderr := runGenCLI([]string{
+		"checkpoint-write",
+		"--model-size", "256KiB",
+		"--writer-ranks", "4",
+		"--write-block", "32KiB",
+		"--num-checkpoints", "2",
+		"--fsync", "per-file",
+		"-o", tmp.Name(),
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "wrote") {
+		t.Errorf("stdout should confirm write, got: %s", stdout)
+	}
+	data, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"profile":"checkpoint-write"`) {
+		t.Errorf("trace header missing checkpoint-write profile")
+	}
+	if !strings.Contains(string(data), `"kind":"synthetic"`) {
+		t.Errorf("trace header should be kind synthetic")
 	}
 }
 

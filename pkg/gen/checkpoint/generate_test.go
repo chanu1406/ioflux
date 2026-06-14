@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/gen/checkpoint"
@@ -138,6 +139,35 @@ func TestStructure(t *testing.T) {
 	}
 }
 
+// TestRemainderFolding verifies the model remainder is folded into the last
+// rank's shard so the per-checkpoint shard sizes sum to exactly ModelSize.
+func TestRemainderFolding(t *testing.T) {
+	p := smallParams()
+	p.ModelSize = 100001
+	p.WriterRanks = 7
+	p.WriteBlock = 4096
+	p.NumCheckpoints = 1
+
+	hdr, _ := readOps(t, mustGenerate(t, p))
+	base := p.ModelSize / int64(p.WriterRanks)
+	rem := p.ModelSize % int64(p.WriterRanks)
+
+	var sum int64
+	for i, tgt := range hdr.Targets {
+		want := base
+		if i == p.WriterRanks-1 {
+			want += rem
+		}
+		if tgt.Size != want {
+			t.Errorf("target %d size = %d, want %d", i, tgt.Size, want)
+		}
+		sum += tgt.Size
+	}
+	if sum != p.ModelSize {
+		t.Errorf("sum of shard sizes %d != ModelSize %d", sum, p.ModelSize)
+	}
+}
+
 // TestFsyncCounts verifies the three fsync policies emit FSYNC ops correctly:
 // per-file once per shard file, none never, final only the last checkpoint's.
 func TestFsyncCounts(t *testing.T) {
@@ -230,6 +260,8 @@ func TestValidateParams(t *testing.T) {
 		{"zero-write-block", func(p *checkpoint.Params) { p.WriteBlock = 0 }},
 		{"zero-checkpoints", func(p *checkpoint.Params) { p.NumCheckpoints = 0 }},
 		{"negative-interval", func(p *checkpoint.Params) { p.CheckpointIntervalSec = -1 }},
+		{"nan-interval", func(p *checkpoint.Params) { p.CheckpointIntervalSec = math.NaN() }},
+		{"inf-interval", func(p *checkpoint.Params) { p.CheckpointIntervalSec = math.Inf(1) }},
 		{"bad-fsync", func(p *checkpoint.Params) { p.Fsync = "sometimes" }},
 	}
 	for _, tc := range cases {

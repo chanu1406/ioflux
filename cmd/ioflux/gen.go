@@ -8,10 +8,23 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/chanuollala/ioflux/pkg/gen/checkpoint"
 	"github.com/chanuollala/ioflux/pkg/gen/trainingread"
 )
 
-const genUsage = `Usage:
+const genUsage = `ioflux gen — generate a synthetic trace.
+
+Usage:
+  ioflux gen <profile> [flags] -o trace.ioflux
+
+Profiles:
+  training-read     Sharded WebDataset-style multi-worker read workload.
+  checkpoint-write  Multi-rank sharded checkpoint write workload.
+
+Run 'ioflux gen <profile> -h' for profile-specific flags.
+`
+
+const genTrainingReadUsage = `Usage:
   ioflux gen training-read [flags] -o trace.ioflux
 
 Generate a synthetic training-read trace (sharded WebDataset-style).
@@ -41,23 +54,61 @@ Exit code:
   2   usage error or I/O failure
 `
 
-// runGen is the entry point for the `gen` subcommand.
+const genCheckpointUsage = `Usage:
+  ioflux gen checkpoint-write [flags] -o trace.ioflux
+
+Generate a synthetic checkpoint-write trace (multi-rank sharded checkpoint).
+
+The model is split into one shard per writer rank; each rank writes its shard as
+a file (open, write, optional fsync, close). Several checkpoints may be emitted,
+separated by --checkpoint-interval, to model periodic checkpointing.
+
+Flags:
+  -o <path>                  Output file (required; use - for stdout)
+  --model-size <size>        Total checkpoint size (default 16GiB; accepts KiB/MiB/GiB or bytes)
+  --writer-ranks <n>         Concurrent writer streams / shards (default 8)
+  --write-block <size>       Write call size (default 4MiB; accepts KiB/MiB/GiB or bytes)
+  --num-checkpoints <n>      Number of checkpoint bursts (default 1)
+  --checkpoint-interval <s>  Seconds between bursts (default 0; 0 = single dense burst)
+  --fsync <policy>           Durability: per-file | final | none (default per-file)
+
+Size arguments accept a plain integer (bytes) or a suffix: KiB, MiB, GiB (binary),
+KB, MB, GB (decimal), or K/M/G (binary aliases).
+
+Output is byte-identical for the same flags. The trace header does not include a
+timestamp so that reproducible trace artifacts can be compared directly.
+
+Exit code:
+  0   trace written successfully
+  1   generation error (invalid params)
+  2   usage error or I/O failure
+`
+
+// runGen is the entry point for the `gen` subcommand. It dispatches to a
+// per-profile generator.
 func runGen(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, genUsage)
 		return 2
 	}
-	if args[0] != "training-read" {
-		fmt.Fprintf(stderr, "ioflux gen: unknown profile %q\n\nSupported profiles: training-read\n", args[0])
+	switch args[0] {
+	case "training-read":
+		return runGenTrainingRead(args[1:], stdout, stderr)
+	case "checkpoint-write":
+		return runGenCheckpoint(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "ioflux gen: unknown profile %q\n\nSupported profiles: training-read, checkpoint-write\n", args[0])
 		return 2
 	}
-	args = args[1:]
+}
 
+// runGenTrainingRead generates a synthetic training-read trace.
+func runGenTrainingRead(args []string, stdout, stderr io.Writer) int {
 	p := trainingread.DefaultParams()
 
 	fs := flag.NewFlagSet("gen training-read", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Usage = func() { fmt.Fprint(stderr, genUsage) }
+	fs.Usage = func() { fmt.Fprint(stderr, genTrainingReadUsage) }
 
 	var out string
 	fs.StringVar(&out, "o", "", "output file (required; - for stdout)")
@@ -77,7 +128,7 @@ func runGen(args []string, stdout, stderr io.Writer) int {
 	}
 	if out == "" {
 		fmt.Fprintln(stderr, "ioflux gen: -o is required")
-		fmt.Fprint(stderr, genUsage)
+		fmt.Fprint(stderr, genTrainingReadUsage)
 		return 2
 	}
 
@@ -102,6 +153,63 @@ func runGen(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if err := trainingread.Generate(p, w); err != nil {
+		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
+		return 2
+	}
+
+	if out != "-" {
+		fmt.Fprintf(stdout, "wrote %s\n", out)
+	}
+	return 0
+}
+
+// runGenCheckpoint generates a synthetic checkpoint-write trace.
+func runGenCheckpoint(args []string, stdout, stderr io.Writer) int {
+	p := checkpoint.DefaultParams()
+
+	fs := flag.NewFlagSet("gen checkpoint-write", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, genCheckpointUsage) }
+
+	var out string
+	fs.StringVar(&out, "o", "", "output file (required; - for stdout)")
+	fs.Var(newBytesFlag(&p.ModelSize), "model-size", "total checkpoint size (e.g. 16GiB)")
+	fs.IntVar(&p.WriterRanks, "writer-ranks", p.WriterRanks, "concurrent writer streams / shards")
+	fs.Var(newBytesFlag(&p.WriteBlock), "write-block", "write call size (e.g. 4MiB)")
+	fs.IntVar(&p.NumCheckpoints, "num-checkpoints", p.NumCheckpoints, "number of checkpoint bursts")
+	fs.Float64Var(&p.CheckpointIntervalSec, "checkpoint-interval", p.CheckpointIntervalSec, "seconds between bursts (0 = single burst)")
+	fs.StringVar(&p.Fsync, "fsync", p.Fsync, "durability: per-file | final | none")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if out == "" {
+		fmt.Fprintln(stderr, "ioflux gen: -o is required")
+		fmt.Fprint(stderr, genCheckpointUsage)
+		return 2
+	}
+
+	// Validate params before touching the output file so invalid flags never
+	// truncate an existing trace.
+	if err := checkpoint.ValidateParams(p); err != nil {
+		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
+		return 1
+	}
+
+	var w io.Writer
+	if out == "-" {
+		w = stdout
+	} else {
+		f, err := os.Create(out)
+		if err != nil {
+			fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
+			return 2
+		}
+		defer f.Close()
+		w = f
+	}
+
+	if err := checkpoint.Generate(p, w); err != nil {
 		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
 		return 2
 	}
