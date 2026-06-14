@@ -279,6 +279,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		MaxInflight:               e.plan.MaxInflight,
 		SpeedupFactor:             e.plan.SpeedupFactor,
 		TraceKind:                 string(e.hdr.Kind),
+		Profile:                   e.hdr.Profile,
 		NumStreams:                e.hdr.Summary.NumStreams,
 		NumOps:                    e.hdr.Summary.NumOps,
 		TotalBytes:                e.hdr.Summary.TotalBytes,

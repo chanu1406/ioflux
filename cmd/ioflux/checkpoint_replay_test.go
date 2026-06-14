@@ -71,6 +71,9 @@ func TestCheckpointReplay_Local_EndToEnd(t *testing.T) {
 	if res.Plan.TraceKind != "synthetic" {
 		t.Errorf("trace_kind=%q, want synthetic", res.Plan.TraceKind)
 	}
+	if res.Plan.Profile != "checkpoint-write" {
+		t.Errorf("profile=%q, want checkpoint-write", res.Plan.Profile)
+	}
 	if res.Errors != 0 {
 		t.Errorf("errors=%d, want 0", res.Errors)
 	}
@@ -98,5 +101,63 @@ func TestCheckpointReplay_Local_EndToEnd(t *testing.T) {
 		t.Errorf("checkpoint_0000 dir not created: %v", err)
 	} else if len(entries) != ranks {
 		t.Errorf("checkpoint_0000 has %d shard files, want %d", len(entries), ranks)
+	}
+}
+
+// TestCheckpointReplay_Mem_FsyncNone replays a checkpoint-write trace
+// generated with --fsync none against the mem engine. The mem engine's
+// Caps.Durable is false, so it rejects FSYNC at PREPARE; a trace with no
+// FSYNC ops must replay cleanly.
+func TestCheckpointReplay_Mem_FsyncNone(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "ckpt.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	const modelSize = 128 << 10
+
+	if code, _, stderr := runGenCLI([]string{
+		"checkpoint-write",
+		"--model-size", "128KiB",
+		"--writer-ranks", "2",
+		"--write-block", "32KiB",
+		"--num-checkpoints", "1",
+		"--fsync", "none",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("gen checkpoint-write exit=%d; stderr=%s", code, stderr)
+	}
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--mode", "asap",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("run checkpoint trace (mem, fsync=none) exit=%d; stderr=%s", code, stderr)
+	}
+
+	raw, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res results.Results
+	if err := json.Unmarshal(raw, &res); err != nil {
+		t.Fatalf("parse results.json: %v", err)
+	}
+
+	if res.Plan.Profile != "checkpoint-write" {
+		t.Errorf("profile=%q, want checkpoint-write", res.Plan.Profile)
+	}
+	if res.Errors != 0 {
+		t.Errorf("errors=%d, want 0", res.Errors)
+	}
+	if want := int64(modelSize); res.BytesMoved != want {
+		t.Errorf("bytes_moved=%d, want %d", res.BytesMoved, want)
+	}
+	for _, s := range res.PerOpStats {
+		if s.OpType == "FSYNC" {
+			t.Errorf("per_op_stats should not contain FSYNC when --fsync none")
+		}
 	}
 }

@@ -163,6 +163,32 @@ func TestReportCmd_ValidResults(t *testing.T) {
 	}
 }
 
+// TestReportCmd_HeaderShowsProfile verifies the single-report header
+// distinguishes profiles, e.g. "synthetic/checkpoint-write" vs a bare trace
+// kind when no profile is recorded.
+func TestReportCmd_HeaderShowsProfile(t *testing.T) {
+	res := makeTestResults()
+	res.Plan.TraceKind = "synthetic"
+	res.Plan.Profile = "checkpoint-write"
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "synthetic/checkpoint-write") {
+		t.Errorf("output should show kind/profile; got:\n%s", out)
+	}
+}
+
 func TestReportCmd_MultiHostDistribution(t *testing.T) {
 	res := makeTestResults()
 	res.GoDeliverySkewNS = 1_500_000
@@ -347,6 +373,73 @@ func TestReportCmd_Stdin(t *testing.T) {
 	}
 	if !strings.Contains(out, "imported") {
 		t.Errorf("stdin read did not produce expected output; got:\n%s", out)
+	}
+}
+
+// TestReportCmd_Comparison verifies the two-file `report A.json B.json` mode:
+// both reports' trace paths, profiles, and dominant-op latency tables appear,
+// alongside the headline scalar delta table.
+func TestReportCmd_Comparison(t *testing.T) {
+	a := makeTestResults()
+	a.Plan.Profile = "training-read"
+
+	b := makeTestResults()
+	b.Plan.TracePath = "/data/ckpt.json"
+	b.Plan.Profile = "checkpoint-write"
+	b.DurationNS = 1_000_000_000
+	b.BytesMoved = 134217728
+	b.PerOpStats = []results.PerOpStats{
+		{OpType: "WRITE", Count: 8, P50NS: 1_000_000, P90NS: 2_000_000, P99NS: 3_000_000, P999NS: 4_000_000, MaxNS: 5_000_000},
+		{OpType: "FSYNC", Count: 8, P50NS: 500_000, P90NS: 600_000, P99NS: 700_000, P999NS: 800_000, MaxNS: 900_000},
+	}
+
+	dir := t.TempDir()
+	pA := filepath.Join(dir, "a.json")
+	pB := filepath.Join(dir, "b.json")
+	for p, res := range map[string]*results.Results{pA: a, pB: b} {
+		data, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, out, stderr := runReportCLI([]string{pA, pB})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+
+	for _, want := range []string{
+		"Comparing two reports:",
+		"/data/trace.ioflux",
+		"/data/ckpt.json",
+		"training-read",
+		"checkpoint-write",
+		"duration",
+		"ops/s",
+		"GiB/s",
+		"CPU user",
+		"low-fidelity",
+		"A (READ) latency",
+		"B (WRITE) latency",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("comparison output missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+// TestReportCmd_TooManyArgsExitsTwo ensures more than two report paths is a
+// usage error.
+func TestReportCmd_TooManyArgsExitsTwo(t *testing.T) {
+	code, _, stderr := runReportCLI([]string{"a.json", "b.json", "c.json"})
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2", code)
+	}
+	if !strings.Contains(stderr, "Usage:") {
+		t.Errorf("stderr should contain usage; got %q", stderr)
 	}
 }
 

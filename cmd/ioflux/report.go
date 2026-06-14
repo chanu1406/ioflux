@@ -12,8 +12,13 @@ import (
 
 const reportUsage = `Usage:
   ioflux report <results.json>
+  ioflux report <a.json> <b.json>
 
 Pretty-print a saved run report. Pass - to read from stdin.
+
+Given two reports, print a side-by-side comparison of their headline scalars
+(throughput, CPU, duration, fidelity) and each side's dominant data-op latency
+— e.g. to compare a checkpoint-write report against a training-read report.
 
 Exit codes:
   0   report printed
@@ -29,12 +34,36 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if fs.NArg() != 1 {
+
+	switch fs.NArg() {
+	case 1:
+		res, code := loadResults(fs.Arg(0), stderr)
+		if code != 0 {
+			return code
+		}
+		printRunReport(stdout, res)
+		return 0
+	case 2:
+		a, code := loadResults(fs.Arg(0), stderr)
+		if code != 0 {
+			return code
+		}
+		b, code := loadResults(fs.Arg(1), stderr)
+		if code != 0 {
+			return code
+		}
+		printComparison(stdout, a, b)
+		return 0
+	default:
 		fmt.Fprint(stderr, reportUsage)
 		return 2
 	}
-	path := fs.Arg(0)
+}
 
+// loadResults reads and parses a results.json file, or stdin if path is "-".
+// On error it writes a message to stderr and returns the exit code to use (2
+// for an I/O failure, 1 for a parse error); the returned code is 0 on success.
+func loadResults(path string, stderr io.Writer) (*results.Results, int) {
 	var data []byte
 	var err error
 	if path == "-" {
@@ -44,17 +73,15 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux report: %v\n", err)
-		return 2
+		return nil, 2
 	}
 
 	var res results.Results
 	if err := json.Unmarshal(data, &res); err != nil {
 		fmt.Fprintf(stderr, "ioflux report: parse results.json: %v\n", err)
-		return 1
+		return nil, 1
 	}
-
-	printRunReport(stdout, &res)
-	return 0
+	return &res, 0
 }
 
 func printRunReport(w io.Writer, res *results.Results) {
@@ -62,9 +89,13 @@ func printRunReport(w io.Writer, res *results.Results) {
 	env := res.RunEnv
 
 	// --- Header ---
+	kind := plan.TraceKind
+	if plan.Profile != "" {
+		kind = kind + "/" + plan.Profile
+	}
 	fmt.Fprintf(w, "Trace:     %s\n", plan.TracePath)
 	fmt.Fprintf(w, "           [%s · %d stream(s) · %d op(s) · %s]\n",
-		plan.TraceKind,
+		kind,
 		plan.NumStreams,
 		plan.NumOps,
 		fmtBytes(plan.TotalBytes),
@@ -82,12 +113,7 @@ func printRunReport(w io.Writer, res *results.Results) {
 
 	// --- Throughput ---
 	fmt.Fprintln(w)
-	var opsPerSec, gibPerSec float64
-	if res.DurationNS > 0 {
-		secs := float64(res.DurationNS) / 1e9
-		opsPerSec = float64(res.OpsCompleted) / secs
-		gibPerSec = float64(res.BytesMoved) / float64(1<<30) / secs
-	}
+	opsPerSec, gibPerSec := throughput(res)
 	fmt.Fprintf(w, "Throughput:  %.1f ops/s   %.3f GiB/s\n", opsPerSec, gibPerSec)
 	fmt.Fprintf(w, "             %d ops completed   %s moved\n",
 		res.OpsCompleted, fmtBytes(res.BytesMoved))
@@ -220,6 +246,103 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 }
 
+// throughput returns ops/s and GiB/s for a completed run, or (0, 0) if the
+// run has no recorded duration.
+func throughput(res *results.Results) (opsPerSec, gibPerSec float64) {
+	if res.DurationNS <= 0 {
+		return 0, 0
+	}
+	secs := float64(res.DurationNS) / 1e9
+	return float64(res.OpsCompleted) / secs, float64(res.BytesMoved) / float64(1<<30) / secs
+}
+
+// dominantOp returns the PerOpStats entry for the first data-moving op type
+// present, in priority order WRITE, READ, PUT, GET — the op whose latency
+// best characterizes the run's workload. It returns nil if none are present
+// (e.g. a metadata-only trace).
+func dominantOp(res *results.Results) *results.PerOpStats {
+	for _, kind := range []string{"WRITE", "READ", "PUT", "GET"} {
+		for i := range res.PerOpStats {
+			if res.PerOpStats[i].OpType == kind {
+				return &res.PerOpStats[i]
+			}
+		}
+	}
+	return nil
+}
+
+// printComparison prints a side-by-side delta of two run reports' headline
+// scalars, followed by each side's dominant data-op latency table. It is
+// used to compare e.g. a checkpoint-write report against a training-read
+// report.
+func printComparison(w io.Writer, a, b *results.Results) {
+	fmt.Fprintf(w, "Comparing two reports:\n")
+	fmt.Fprintf(w, "  A: %s\n", a.Plan.TracePath)
+	fmt.Fprintf(w, "  B: %s\n", b.Plan.TracePath)
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%-14s %16s %16s %16s\n", "", "A", "B", "Δ (B-A)")
+	row := func(label, av, bv, dv string) {
+		fmt.Fprintf(w, "%-14s %16s %16s %16s\n", label, av, bv, dv)
+	}
+	row2 := func(label, av, bv string) {
+		fmt.Fprintf(w, "%-14s %16s %16s\n", label, av, bv)
+	}
+
+	row2("kind", a.Plan.TraceKind, b.Plan.TraceKind)
+	row2("profile", profileOrDash(a.Plan.Profile), profileOrDash(b.Plan.Profile))
+	row2("mode", a.Plan.Mode, b.Plan.Mode)
+
+	row("duration", fmtDuration(a.DurationNS), fmtDuration(b.DurationNS), fmtSignedDuration(b.DurationNS-a.DurationNS))
+
+	aOps, aGiB := throughput(a)
+	bOps, bGiB := throughput(b)
+	row("ops/s", fmt.Sprintf("%.1f", aOps), fmt.Sprintf("%.1f", bOps), fmt.Sprintf("%+.1f", bOps-aOps))
+	row("GiB/s", fmt.Sprintf("%.3f", aGiB), fmt.Sprintf("%.3f", bGiB), fmt.Sprintf("%+.3f", bGiB-aGiB))
+
+	row("CPU user", fmtDuration(a.CPU.UserNS), fmtDuration(b.CPU.UserNS), fmtSignedDuration(b.CPU.UserNS-a.CPU.UserNS))
+	row("CPU sys", fmtDuration(a.CPU.SysNS), fmtDuration(b.CPU.SysNS), fmtSignedDuration(b.CPU.SysNS-a.CPU.SysNS))
+	row("CPU wall", fmtDuration(a.CPU.WallNS), fmtDuration(b.CPU.WallNS), fmtSignedDuration(b.CPU.WallNS-a.CPU.WallNS))
+
+	row2("low-fidelity", lowFidelityLabel(a), lowFidelityLabel(b))
+
+	fmt.Fprintln(w)
+	printDominantOpLatency(w, "A", a)
+	printDominantOpLatency(w, "B", b)
+}
+
+// profileOrDash returns the trace profile, or "-" if it was not recorded
+// (e.g. an older results.json predating the profile field).
+func profileOrDash(profile string) string {
+	if profile == "" {
+		return "-"
+	}
+	return profile
+}
+
+// lowFidelityLabel summarizes a run's low-fidelity flag and category for the
+// comparison table.
+func lowFidelityLabel(res *results.Results) string {
+	if !res.Fidelity.LowFidelity {
+		return "no"
+	}
+	if res.Fidelity.LowFidelityCategory != "" {
+		return fmt.Sprintf("YES [%s]", res.Fidelity.LowFidelityCategory)
+	}
+	return "YES"
+}
+
+// printDominantOpLatency prints the dominant data-op's latency table for one
+// side of a comparison, labeled "A" or "B".
+func printDominantOpLatency(w io.Writer, label string, res *results.Results) {
+	op := dominantOp(res)
+	if op == nil {
+		fmt.Fprintf(w, "%s: no data ops\n", label)
+		return
+	}
+	printOpStatsTable(w, fmt.Sprintf("%s (%s) latency (µs):", label, op.OpType), []results.PerOpStats{*op})
+}
+
 // printOpStatsTable renders one per-op percentile table under the given title.
 func printOpStatsTable(w io.Writer, title string, stats []results.PerOpStats) {
 	fmt.Fprintf(w, "%s\n", title)
@@ -266,6 +389,19 @@ func fmtDuration(ns int64) string {
 		return fmt.Sprintf("%.1fµs", float64(ns)/1e3)
 	default:
 		return fmt.Sprintf("%dns", ns)
+	}
+}
+
+// fmtSignedDuration formats a nanosecond delta with an explicit +/- sign, for
+// the Δ column of a comparison table.
+func fmtSignedDuration(ns int64) string {
+	switch {
+	case ns > 0:
+		return "+" + fmtDuration(ns)
+	case ns < 0:
+		return "-" + fmtDuration(-ns)
+	default:
+		return fmtDuration(0)
 	}
 }
 

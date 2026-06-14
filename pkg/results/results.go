@@ -20,6 +20,7 @@ type PlanInfo struct {
 	MaxInflight               int     `json:"max_inflight"`
 	SpeedupFactor             float64 `json:"speedup_factor,omitempty"`
 	TraceKind                 string  `json:"trace_kind"`
+	Profile                   string  `json:"profile,omitempty"`
 	NumStreams                int     `json:"num_streams"`
 	NumOps                    int64   `json:"num_ops"`
 	TotalBytes                int64   `json:"total_bytes"`
