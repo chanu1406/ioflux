@@ -431,6 +431,106 @@ func TestReportCmd_Comparison(t *testing.T) {
 	}
 }
 
+// TestReportCmd_ComparisonNoWarningsWhenComparable verifies that two reports
+// with matching fidelity and replay equivalence produce a "Comparability:
+// none" section rather than a spurious mismatch flag.
+func TestReportCmd_ComparisonNoWarningsWhenComparable(t *testing.T) {
+	a := makeTestResults()
+	a.Plan.ReplayEquivalence = "syscall-level"
+	b := makeTestResults()
+	b.Plan.TracePath = "/data/b.json"
+	b.Plan.ReplayEquivalence = "syscall-level"
+
+	dir := t.TempDir()
+	pA := filepath.Join(dir, "a.json")
+	pB := filepath.Join(dir, "b.json")
+	for p, res := range map[string]*results.Results{pA: a, pB: b} {
+		data, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, out, stderr := runReportCLI([]string{pA, pB})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "Comparability:\n  none") {
+		t.Errorf("comparable reports should print 'Comparability: none'; got:\n%s", out)
+	}
+	if strings.Contains(out, "replay equivalence differs") || strings.Contains(out, "fidelity mismatch") {
+		t.Errorf("comparable reports must not print a mismatch warning; got:\n%s", out)
+	}
+}
+
+// TestReportCmd_ComparisonFlagsEquivalenceMismatch verifies that comparing an
+// object-level (coalesced write) run against a syscall-level run is flagged,
+// since the delta may reflect that semantic difference rather than backend
+// performance (PRD §6 honesty rule).
+func TestReportCmd_ComparisonFlagsEquivalenceMismatch(t *testing.T) {
+	a := makeTestResults()
+	a.Plan.ReplayEquivalence = "object-level"
+	b := makeTestResults()
+	b.Plan.TracePath = "/data/b.json"
+	b.Plan.ReplayEquivalence = "syscall-level"
+
+	dir := t.TempDir()
+	pA := filepath.Join(dir, "a.json")
+	pB := filepath.Join(dir, "b.json")
+	for p, res := range map[string]*results.Results{pA: a, pB: b} {
+		data, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, out, stderr := runReportCLI([]string{pA, pB})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "replay equivalence differs: A is object-level, B is syscall-level") {
+		t.Errorf("output should flag the equivalence mismatch; got:\n%s", out)
+	}
+}
+
+// TestReportCmd_ComparisonFlagsFidelityMismatch verifies that comparing a
+// low-fidelity run against a full-fidelity run is flagged rather than
+// presented as a clean apples-to-apples delta.
+func TestReportCmd_ComparisonFlagsFidelityMismatch(t *testing.T) {
+	a := makeTestResults()
+	b := makeTestResults()
+	b.Plan.TracePath = "/data/b.json"
+	b.Fidelity.LowFidelity = true
+	b.Fidelity.LowFidelityReason = "schedule drift too high"
+
+	dir := t.TempDir()
+	pA := filepath.Join(dir, "a.json")
+	pB := filepath.Join(dir, "b.json")
+	for p, res := range map[string]*results.Results{pA: a, pB: b} {
+		data, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, out, stderr := runReportCLI([]string{pA, pB})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "fidelity mismatch: B is low-fidelity and A is not") {
+		t.Errorf("output should flag the fidelity mismatch; got:\n%s", out)
+	}
+}
+
 func TestDominantOpUsesCountWithPriorityTieBreak(t *testing.T) {
 	res := &results.Results{PerOpStats: []results.PerOpStats{
 		{OpType: "WRITE", Count: 1},

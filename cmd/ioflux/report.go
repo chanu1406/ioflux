@@ -275,8 +275,9 @@ func printComparison(w io.Writer, a, b *results.Results) {
 	}
 
 	row2("kind", a.Plan.TraceKind, b.Plan.TraceKind)
-	row2("profile", profileOrDash(a.Plan.Profile), profileOrDash(b.Plan.Profile))
+	row2("profile", orDash(a.Plan.Profile), orDash(b.Plan.Profile))
 	row2("mode", a.Plan.Mode, b.Plan.Mode)
+	row2("equivalence", orDash(a.Plan.ReplayEquivalence), orDash(b.Plan.ReplayEquivalence))
 
 	row("duration", fmtDuration(a.DurationNS), fmtDuration(b.DurationNS), fmtSignedDuration(b.DurationNS-a.DurationNS))
 
@@ -292,17 +293,59 @@ func printComparison(w io.Writer, a, b *results.Results) {
 	row2("low-fidelity", lowFidelityLabel(a), lowFidelityLabel(b))
 
 	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Comparability:\n")
+	if warnings := comparabilityWarnings(a, b); len(warnings) == 0 {
+		fmt.Fprintf(w, "  none\n")
+	} else {
+		for _, msg := range warnings {
+			fmt.Fprintf(w, "  ! %s\n", msg)
+		}
+	}
+
+	fmt.Fprintln(w)
 	printDominantOpLatency(w, "A", a)
 	printDominantOpLatency(w, "B", b)
 }
 
-// profileOrDash returns the trace profile, or "-" if it was not recorded
-// (e.g. an older results.json predating the profile field).
-func profileOrDash(profile string) string {
-	if profile == "" {
+// orDash returns s, or "-" if it is empty (e.g. a field not recorded by an
+// older results.json).
+func orDash(s string) string {
+	if s == "" {
 		return "-"
 	}
-	return profile
+	return s
+}
+
+// comparabilityWarnings flags conditions that can make a side-by-side
+// comparison misleading even though both reports parse and print cleanly:
+// differing replay equivalence (one side's writes were coalesced into
+// object-level PUTs while the other replayed at the syscall level) or a
+// low-fidelity/full-fidelity mismatch. Per the honesty rule (PRD §6), the
+// tool flags these rather than silently presenting the delta as an
+// apples-to-apples backend comparison. Empty when both sides are comparable
+// on these axes, or when a field is missing from an older results.json.
+func comparabilityWarnings(a, b *results.Results) []string {
+	var warnings []string
+
+	ea, eb := a.Plan.ReplayEquivalence, b.Plan.ReplayEquivalence
+	if ea != "" && eb != "" && ea != eb {
+		warnings = append(warnings, fmt.Sprintf(
+			"replay equivalence differs: A is %s, B is %s — one side's writes were coalesced into "+
+				"object-level PUTs while the other replayed at the syscall level; the delta may reflect "+
+				"that difference, not backend performance", ea, eb))
+	}
+
+	if a.Fidelity.LowFidelity != b.Fidelity.LowFidelity {
+		low, full := "A", "B"
+		if b.Fidelity.LowFidelity {
+			low, full = "B", "A"
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"fidelity mismatch: %s is low-fidelity and %s is not — cross-fidelity deltas may reflect "+
+				"measurement noise, not backend performance", low, full))
+	}
+
+	return warnings
 }
 
 // lowFidelityLabel summarizes a run's low-fidelity flag and category for the
