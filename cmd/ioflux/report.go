@@ -256,21 +256,6 @@ func throughput(res *results.Results) (opsPerSec, gibPerSec float64) {
 	return float64(res.OpsCompleted) / secs, float64(res.BytesMoved) / float64(1<<30) / secs
 }
 
-// dominantOp returns the PerOpStats entry for the first data-moving op type
-// present, in priority order WRITE, READ, PUT, GET — the op whose latency
-// best characterizes the run's workload. It returns nil if none are present
-// (e.g. a metadata-only trace).
-func dominantOp(res *results.Results) *results.PerOpStats {
-	for _, kind := range []string{"WRITE", "READ", "PUT", "GET"} {
-		for i := range res.PerOpStats {
-			if res.PerOpStats[i].OpType == kind {
-				return &res.PerOpStats[i]
-			}
-		}
-	}
-	return nil
-}
-
 // printComparison prints a side-by-side delta of two run reports' headline
 // scalars, followed by each side's dominant data-op latency table. It is
 // used to compare e.g. a checkpoint-write report against a training-read
@@ -335,7 +320,7 @@ func lowFidelityLabel(res *results.Results) string {
 // printDominantOpLatency prints the dominant data-op's latency table for one
 // side of a comparison, labeled "A" or "B".
 func printDominantOpLatency(w io.Writer, label string, res *results.Results) {
-	op := dominantOp(res)
+	op := res.DominantDataOp()
 	if op == nil {
 		fmt.Fprintf(w, "%s: no data ops\n", label)
 		return

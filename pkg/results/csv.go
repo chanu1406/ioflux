@@ -7,10 +7,12 @@ import (
 )
 
 var csvColumns = []string{
-	"timestamp", "trace_path", "trace_kind", "engine", "mode",
+	"timestamp", "trace_path", "trace_kind", "trace_profile", "engine", "mode",
 	"num_streams", "num_ops", "max_inflight", "cache_mode", "prepare_mode",
+	"replay_equivalence",
 	"duration_ns", "ops_completed", "bytes_moved", "errors",
 	"read_p50_ns", "read_p99_ns", "read_p999_ns",
+	"data_op", "data_op_p50_ns", "data_op_p99_ns", "data_op_p999_ns",
 	"ops_per_sec", "gib_per_sec",
 	"cpu_user_ns", "cpu_sys_ns",
 	"backlog_events", "schedule_drift_p99_ns", "low_fidelity",
@@ -43,6 +45,10 @@ func AppendCSV(path string, r *Results) error {
 
 func csvRowFor(r *Results) []string {
 	read := r.PerOpMap()["READ"]
+	var dataOp PerOpStats
+	if d := r.DominantDataOp(); d != nil {
+		dataOp = *d
+	}
 
 	var opsPerSec, gibPerSec float64
 	if r.DurationNS > 0 {
@@ -55,6 +61,7 @@ func csvRowFor(r *Results) []string {
 		r.GeneratedAt,
 		r.Plan.TracePath,
 		r.Plan.TraceKind,
+		r.Plan.Profile,
 		r.Plan.Engine,
 		r.Plan.Mode,
 		strconv.Itoa(r.Plan.NumStreams),
@@ -62,6 +69,7 @@ func csvRowFor(r *Results) []string {
 		strconv.Itoa(r.Plan.MaxInflight),
 		r.RunEnv.CacheMode,
 		r.Plan.PrepareMode,
+		r.Plan.ReplayEquivalence,
 		strconv.FormatInt(r.DurationNS, 10),
 		strconv.FormatInt(r.OpsCompleted, 10),
 		strconv.FormatInt(r.BytesMoved, 10),
@@ -69,6 +77,10 @@ func csvRowFor(r *Results) []string {
 		strconv.FormatInt(read.P50NS, 10),
 		strconv.FormatInt(read.P99NS, 10),
 		strconv.FormatInt(read.P999NS, 10),
+		dataOp.OpType,
+		strconv.FormatInt(dataOp.P50NS, 10),
+		strconv.FormatInt(dataOp.P99NS, 10),
+		strconv.FormatInt(dataOp.P999NS, 10),
 		strconv.FormatFloat(opsPerSec, 'f', 3, 64),
 		strconv.FormatFloat(gibPerSec, 'f', 3, 64),
 		strconv.FormatInt(r.CPU.UserNS, 10),

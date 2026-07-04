@@ -35,7 +35,7 @@ type Params struct {
 
 	// CreatedUTC, if non-empty, is written to the trace header as created_utc.
 	// Leave empty for deterministic (byte-identical) output across runs.
-	// The CLI sets this to time.Now().UTC().Format(time.RFC3339).
+	// The CLI leaves this empty so generated artifacts are reproducible.
 	CreatedUTC string
 }
 

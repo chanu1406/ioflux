@@ -49,6 +49,11 @@ type SchedulerOpts struct {
 
 	// Fill controls deterministic write/PUT payload generation.
 	Fill payload.Config
+
+	// ObjectWriteSizes maps target id -> final byte size for write handles that
+	// qualify for object-level coalesced-PUT replay (see objectWriteEligibility
+	// in objectwrite.go). Nil/empty means no target uses coalesced replay.
+	ObjectWriteSizes map[int]int64
 }
 
 // WorkerOutput is the raw result of replaying one worker's assigned streams.
@@ -207,7 +212,7 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 					rec.RecordDrift(driftNS)
 				}
 
-				bytesN, shortRead, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf, fill)
+				bytesN, shortRead, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf, fill, opts.ObjectWriteSizes)
 				serviceNS := time.Since(serviceStart).Nanoseconds()
 				if serviceNS < 0 {
 					serviceNS = 0
@@ -551,6 +556,7 @@ func dispatchOp(
 	handleMap map[int64]replayHandle,
 	bufp *[]byte,
 	fill payload.Config,
+	objSizes map[int]int64,
 ) (bytesN int64, shortRead bool, opErr error) {
 	buf := *bufp
 	defer func() { *bufp = buf }()
@@ -560,11 +566,18 @@ func dispatchOp(
 		name := hdr.Targets[*op.Tgt].Name
 		mode := engine.Mode(op.Mode)
 		flags := parseOpenFlags(op.Flags)
-		h, err := eng.Open(ctx, name, mode, flags)
-		if err == nil {
-			handleMap[*op.H] = replayHandle{handle: h, target: name}
+		if size, ok := objSizes[*op.Tgt]; ok && mode == engine.ModeWrite {
+			// Object-level coalesced write: stream WRITEs into a single Put
+			// issued now, instead of opening a per-op handle the engine can't
+			// support (see objectWriteEligibility in objectwrite.go).
+			handleMap[*op.H] = replayHandle{target: name, objWrite: startObjectPut(ctx, eng, name, size)}
+		} else {
+			h, err := eng.Open(ctx, name, mode, flags)
+			if err == nil {
+				handleMap[*op.H] = replayHandle{handle: h, target: name}
+			}
+			opErr = err
 		}
-		opErr = err
 
 	case trace.OpRead:
 		rh := handleMap[*op.H]
@@ -587,16 +600,31 @@ func dispatchOp(
 			opID = *op.OpID
 		}
 		payload.Fill(buf[:length], fill, opID, rh.target, off)
-		n, err := eng.Write(ctx, rh.handle, off, buf[:length])
-		bytesN = int64(n)
-		opErr = err
+		if rh.objWrite != nil {
+			n, err := rh.objWrite.write(buf[:length])
+			bytesN = int64(n)
+			opErr = err
+		} else {
+			n, err := eng.Write(ctx, rh.handle, off, buf[:length])
+			bytesN = int64(n)
+			opErr = err
+		}
 
 	case trace.OpFsync:
-		opErr = eng.Fsync(ctx, handleMap[*op.H].handle)
+		rh := handleMap[*op.H]
+		if rh.objWrite == nil {
+			opErr = eng.Fsync(ctx, rh.handle)
+		}
+		// Coalesced object-level writes have no fsync semantics: the Put either
+		// lands durably or fails outright at CLOSE, so FSYNC is a no-op here.
 
 	case trace.OpClose:
 		rh := handleMap[*op.H]
-		opErr = eng.Close(ctx, rh.handle)
+		if rh.objWrite != nil {
+			opErr = rh.objWrite.finish()
+		} else {
+			opErr = eng.Close(ctx, rh.handle)
+		}
 		if opErr == nil {
 			delete(handleMap, *op.H)
 		}
@@ -640,6 +668,9 @@ func dispatchOp(
 type replayHandle struct {
 	handle engine.Handle
 	target string
+	// objWrite is non-nil when this handle is an object-level coalesced write
+	// (see objectwrite.go): WRITEs feed its pipe instead of calling eng.Write.
+	objWrite *objectPipe
 }
 
 // parseOpenFlags translates trace OPEN flags into engine flags.

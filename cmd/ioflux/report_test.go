@@ -431,6 +431,30 @@ func TestReportCmd_Comparison(t *testing.T) {
 	}
 }
 
+func TestDominantOpUsesCountWithPriorityTieBreak(t *testing.T) {
+	res := &results.Results{PerOpStats: []results.PerOpStats{
+		{OpType: "WRITE", Count: 1},
+		{OpType: "READ", Count: 10},
+		{OpType: "OPEN", Count: 100},
+	}}
+	if got := res.DominantDataOp(); got == nil || got.OpType != "READ" {
+		t.Fatalf("DominantDataOp=%v, want READ by highest data-op count", got)
+	}
+
+	res.PerOpStats = []results.PerOpStats{
+		{OpType: "READ", Count: 10},
+		{OpType: "WRITE", Count: 10},
+	}
+	if got := res.DominantDataOp(); got == nil || got.OpType != "WRITE" {
+		t.Fatalf("DominantDataOp=%v, want WRITE tie-break over READ", got)
+	}
+
+	res.PerOpStats = []results.PerOpStats{{OpType: "OPEN", Count: 10}}
+	if got := res.DominantDataOp(); got != nil {
+		t.Fatalf("DominantDataOp=%v, want nil for metadata-only stats", got)
+	}
+}
+
 // TestReportCmd_TooManyArgsExitsTwo ensures more than two report paths is a
 // usage error.
 func TestReportCmd_TooManyArgsExitsTwo(t *testing.T) {

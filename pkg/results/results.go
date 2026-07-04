@@ -34,6 +34,11 @@ type PlanInfo struct {
 	PrepareCopied             int     `json:"prepare_copied,omitempty"`
 	PrepareSkippedSizeUnknown int     `json:"prepare_skipped_size_unknown,omitempty"`
 	PrepareDerivedSizeFromOps int     `json:"prepare_derived_size_from_ops,omitempty"`
+	// ReplayEquivalence is "syscall-level" for a faithful op-for-op replay, or
+	// "object-level" when write ops were coalesced into a single PUT because
+	// the backend cannot replay offset writes directly (see pkg/replay
+	// objectWriteEligibility). Empty when not determined by this code path.
+	ReplayEquivalence string `json:"replay_equivalence,omitempty"`
 }
 
 // PerOpStats holds latency percentiles and counters for one op type.
@@ -215,6 +220,27 @@ func (r *Results) PerOpMap() map[string]PerOpStats {
 		m[s.OpType] = s
 	}
 	return m
+}
+
+// DominantDataOp returns the data-moving op (WRITE, READ, PUT, GET) whose
+// latency best characterizes the run: the highest-count data op wins, ties
+// broken by WRITE, READ, PUT, GET priority. Returns nil when the run has no
+// data-moving op (e.g. a metadata-only trace).
+func (r *Results) DominantDataOp() *PerOpStats {
+	priority := map[string]int{"WRITE": 0, "READ": 1, "PUT": 2, "GET": 3}
+	bestRank := len(priority)
+	var best *PerOpStats
+	for i := range r.PerOpStats {
+		rank, ok := priority[r.PerOpStats[i].OpType]
+		if !ok {
+			continue
+		}
+		if best == nil || r.PerOpStats[i].Count > best.Count || (r.PerOpStats[i].Count == best.Count && rank < bestRank) {
+			best = &r.PerOpStats[i]
+			bestRank = rank
+		}
+	}
+	return best
 }
 
 // AllOpKinds enumerates all op kinds present in a trace's op list. Used by

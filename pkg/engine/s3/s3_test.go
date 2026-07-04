@@ -297,3 +297,39 @@ func hasQueryKey(r *http.Request, key string) bool {
 	_, ok := r.URL.Query()[key]
 	return ok
 }
+
+// TestPutAcceptsNonSeekableReaderBelowThreshold verifies that Put succeeds for
+// a non-seekable source (e.g. an io.PipeReader, as replay's coalesced-write
+// dispatch uses) when the object is below the multipart threshold. The SDK's
+// PutObject needs to seek the body to compute the payload hash before
+// signing; Put must buffer such sources rather than fail or hang.
+func TestPutAcceptsNonSeekableReaderBelowThreshold(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	eng, err := s3engine.New(testConfig(srv.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	want := bytes.Repeat([]byte{9}, 4096)
+	go func() {
+		_, _ = pw.Write(want)
+		pw.Close()
+	}()
+	if err := eng.Put(context.Background(), "shard.pt", pr, int64(len(want))); err != nil {
+		t.Fatalf("Put with non-seekable reader: %v", err)
+	}
+	if !bytes.Equal(gotBody, want) {
+		t.Fatalf("body length=%d, want %d matching bytes", len(gotBody), len(want))
+	}
+}

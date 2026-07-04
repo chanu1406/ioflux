@@ -63,6 +63,10 @@ type Executor struct {
 	originalTargets []trace.TargetInfo
 	prepStats       prepare.Stats
 	materialized    bool
+	// objectWriteSizes maps target id -> final byte size for write handles that
+	// qualify for object-level coalesced-PUT replay (see objectWriteEligibility).
+	// Empty when the engine supports PartialWrite or no target qualified.
+	objectWriteSizes map[int]int64
 }
 
 // Prepare loads all ops from r, validates that every op is compatible with
@@ -113,12 +117,27 @@ func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStrea
 		}.Normalize(),
 	}
 	handleToTarget := make(map[int64]int)
+
+	// Engines that report ObjectAPI but not PartialWrite (S3-shaped) cannot
+	// replay offset WRITEs at the syscall level. Rather than reject every such
+	// trace outright, track whether each write handle's lifecycle qualifies for
+	// object-level coalesced-PUT replay (§8.4 honesty rule).
+	var eligibility *objectWriteEligibility
+	if caps.ObjectAPI && !caps.PartialWrite {
+		eligibility = newObjectWriteEligibility()
+	}
+
 	rep, err := trace.ValidateWithOps(r, func(op trace.Op) error {
 		if op.Group != nil && *op.Group != 0 {
 			return fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
 		}
 		if err := checkOpCaps(op, caps); err != nil {
 			return fmt.Errorf("replay: prepare: %w", err)
+		}
+		if eligibility != nil {
+			if err := eligibility.observe(op, hdr.Targets); err != nil {
+				return fmt.Errorf("replay: prepare: %w", err)
+			}
 		}
 		updatePrepMetadata(prepMeta, handleToTarget, op)
 		if loadAllStreams {
@@ -137,9 +156,21 @@ func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStrea
 		return nil, fmt.Errorf("replay: prepare: invalid trace: %s", formatValidationErrors(rep))
 	}
 
+	var objectWriteSizes map[int]int64
+	if eligibility != nil {
+		objectWriteSizes = eligibility.sizes
+	}
+
 	// Dataset preparation is deferred to Materialize so it honors a caller's
 	// context (a cancelled PREPARE phase must not keep materializing data).
-	return &Executor{plan: plan, hdr: hdr, byStream: byStream, prepMeta: prepMeta, originalTargets: originalTargets}, nil
+	return &Executor{
+		plan:             plan,
+		hdr:              hdr,
+		byStream:         byStream,
+		prepMeta:         prepMeta,
+		originalTargets:  originalTargets,
+		objectWriteSizes: objectWriteSizes,
+	}, nil
 }
 
 func updatePrepMetadata(meta prepare.Metadata, handleToTarget map[int64]int, op trace.Op) {
@@ -231,14 +262,20 @@ func checkOpCaps(op trace.Op, caps engine.Capabilities) error {
 			return fmt.Errorf("trace contains READ op but engine reports Seekable=false")
 		}
 	case trace.OpFsync:
-		if !caps.Durable {
+		// Object-store engines have no fsync semantics: a Put either lands
+		// durably or fails outright, so FSYNC is a recorded no-op rather than a
+		// capability violation (checked for real by objectWriteEligibility).
+		if !caps.Durable && !caps.ObjectAPI {
 			return fmt.Errorf("trace contains FSYNC op but engine reports Durable=false")
 		}
 	case trace.OpWrite:
 		if op.Off != nil && !caps.Seekable {
 			return fmt.Errorf("trace contains offset WRITE op but engine reports Seekable=false")
 		}
-		if op.Off != nil && !caps.PartialWrite {
+		// An ObjectAPI engine without PartialWrite may still replay an offset
+		// WRITE as part of a coalesced object-level PUT; objectWriteEligibility
+		// enforces the strict eligibility rules that make that safe.
+		if op.Off != nil && !caps.PartialWrite && !caps.ObjectAPI {
 			return fmt.Errorf("trace contains offset WRITE op but engine reports PartialWrite=false")
 		}
 	case trace.OpStat:
@@ -292,6 +329,10 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		PrepareCopied:             e.prepStats.Copied,
 		PrepareSkippedSizeUnknown: e.prepStats.SkippedSizeUnknown,
 		PrepareDerivedSizeFromOps: e.prepStats.DerivedSizeFromOps,
+		ReplayEquivalence:         "syscall-level",
+	}
+	if len(e.objectWriteSizes) > 0 {
+		planInfo.ReplayEquivalence = "object-level"
 	}
 	runEnv := results.RunEnv{
 		CacheMode:        e.plan.CacheMode,
@@ -299,13 +340,14 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		CacheLimitations: cacheRes.Limitations,
 	}
 	opts := SchedulerOpts{
-		Mode:          e.plan.Mode,
-		MaxInflight:   e.plan.MaxInflight,
-		SpeedupFactor: e.plan.SpeedupFactor,
-		RunStart:      time.Now(),
-		PlanInfo:      planInfo,
-		RunEnv:        runEnv,
-		Fill:          e.prepMeta.Fill,
+		Mode:             e.plan.Mode,
+		MaxInflight:      e.plan.MaxInflight,
+		SpeedupFactor:    e.plan.SpeedupFactor,
+		RunStart:         time.Now(),
+		PlanInfo:         planInfo,
+		RunEnv:           runEnv,
+		Fill:             e.prepMeta.Fill,
+		ObjectWriteSizes: e.objectWriteSizes,
 	}
 	return schedule(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }
@@ -366,12 +408,13 @@ func (e *Executor) RunWorker(ctx context.Context, runStart time.Time, progress f
 		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
 	}
 	opts := SchedulerOpts{
-		Mode:          e.plan.Mode,
-		MaxInflight:   e.plan.MaxInflight,
-		SpeedupFactor: e.plan.SpeedupFactor,
-		RunStart:      runStart,
-		Progress:      progress,
-		Fill:          e.prepMeta.Fill,
+		Mode:             e.plan.Mode,
+		MaxInflight:      e.plan.MaxInflight,
+		SpeedupFactor:    e.plan.SpeedupFactor,
+		RunStart:         runStart,
+		Progress:         progress,
+		Fill:             e.prepMeta.Fill,
+		ObjectWriteSizes: e.objectWriteSizes,
 	}
 	return runStreams(ctx, e.byStream, e.plan.Engine, e.hdr, opts)
 }

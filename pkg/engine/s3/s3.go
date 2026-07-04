@@ -5,6 +5,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -207,13 +208,34 @@ func (e *S3Engine) Put(ctx context.Context, key string, r io.Reader, size int64)
 	if size > e.cfg.MultipartThreshold {
 		return e.putMultipart(ctx, key, r, size)
 	}
-	_, err := e.client.PutObject(ctx, &awss3.PutObjectInput{
+	body, err := seekableBody(r, size)
+	if err != nil {
+		return fmt.Errorf("s3: put %q: %w", key, err)
+	}
+	_, err = e.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket:        aws.String(e.cfg.Bucket),
 		Key:           aws.String(key),
-		Body:          r,
+		Body:          body,
 		ContentLength: aws.Int64(size),
 	})
 	return mapErr("put "+key, err)
+}
+
+// seekableBody returns r unchanged when it already supports seeking (the SDK
+// seeks back to the start to compute the request's payload hash before
+// signing); otherwise it reads r fully into memory and wraps it in a
+// bytes.Reader. Only reached for objects at or below MultipartThreshold, so
+// the copy is bounded by that threshold rather than by object size —
+// putMultipart's per-part bytes.Reader wrapping needs no such fallback.
+func seekableBody(r io.Reader, size int64) (io.ReadSeeker, error) {
+	if rs, ok := r.(io.ReadSeeker); ok {
+		return rs, nil
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	return bytes.NewReader(buf), nil
 }
 
 // Get reads length bytes from key at off using an S3 Range GET.

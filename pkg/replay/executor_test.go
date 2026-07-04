@@ -661,57 +661,133 @@ func TestPrepareIONotRecorded(t *testing.T) {
 	}
 }
 
-// TestPrepareRejectsOffsetWriteAgainstObjectEngine verifies that a trace with
-// offset WRITE ops is rejected at PREPARE when the target map rewrites targets
-// to an object engine reporting PartialWrite=false. File-shaped reads against
-// object backends are supported (per plan: Open(key) + Range Read), so the
-// check here is strictly about partial-write semantics.
-func TestPrepareRejectsOffsetWriteAgainstObjectEngine(t *testing.T) {
-	var buf bytes.Buffer
-	tw := trace.NewWriter(&buf)
-	tgt0 := 0
-	h0 := int64(1)
-	hdr := trace.Header{
+// objectWriteHeader returns a single-target header used by the object-level
+// coalesced-write eligibility tests below.
+func objectWriteHeader(size int64, numOps int64) trace.Header {
+	return trace.Header{
 		Version:       trace.TraceFormatVersion,
 		Kind:          trace.TraceSynthetic,
 		TimeUnit:      trace.TimeUnitNanoseconds,
 		CaptureMethod: trace.CaptureSynthetic,
-		Targets:       []trace.TargetInfo{{ID: 0, Name: "shard_0.tar", Kind: trace.TargetFile, Size: 4096}},
-		Summary:       trace.Summary{NumOps: 2, NumStreams: 1},
+		Targets:       []trace.TargetInfo{{ID: 0, Name: "shard_0.tar", Kind: trace.TargetFile, Size: size}},
+		Summary:       trace.Summary{NumOps: numOps, NumStreams: 1},
 	}
+}
+
+// writeObjectTrace writes hdr and ops to a buffer and returns a *trace.Reader
+// over it, for the object-level eligibility tests below.
+func writeObjectTrace(t *testing.T, hdr trace.Header, ops []trace.Op) *trace.Reader {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
 	if err := tw.WriteHeader(hdr); err != nil {
 		t.Fatal(err)
 	}
-	for _, op := range []trace.Op{
-		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeReadWrite},
-		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(512)), Len: trace.Ptr(int64(512))},
-	} {
+	for _, op := range ops {
 		if err := tw.WriteOp(op); err != nil {
 			t.Fatal(err)
 		}
 	}
-
 	r, err := trace.NewReader(&buf)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
+	return r
+}
 
-	// Object-only engine: Seekable for range GETs, PartialWrite=false.
+// TestPrepareRejectsReadWriteModeAgainstObjectEngine verifies that a handle
+// opened in read-write mode is rejected: object-store engines only support
+// object-level replay for write-only (mode=w) lifecycles, since a coalesced
+// PUT cannot interleave with reads.
+func TestPrepareRejectsReadWriteModeAgainstObjectEngine(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	r := writeObjectTrace(t, objectWriteHeader(4096, 2), []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeReadWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(512)), Len: trace.Ptr(int64(512))},
+	})
+
 	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
 	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
-	plan := replay.Plan{
-		Engine:     objectEng,
-		EngineName: "s3",
-		Bucket:     "bench",
-		Mode:       "asap",
-		TargetMap:  tm,
-	}
-	_, err = replay.Prepare(plan, r)
+	plan := replay.Plan{Engine: objectEng, EngineName: "s3", Bucket: "bench", Mode: "asap", TargetMap: tm}
+	_, err := replay.Prepare(plan, r)
 	if err == nil {
-		t.Fatal("Prepare should reject offset WRITE against object engine (PartialWrite=false)")
+		t.Fatal("Prepare should reject a read-write handle against an object engine")
 	}
-	if !strings.Contains(err.Error(), "PartialWrite=false") {
-		t.Errorf("Prepare error=%v, want PartialWrite=false rejection", err)
+	if !strings.Contains(err.Error(), "mode=w") {
+		t.Errorf("Prepare error=%v, want mode=w rejection", err)
+	}
+}
+
+// TestPrepareRejectsOutOfOrderCoalescedWrite verifies that a WRITE which does
+// not start at the next expected offset (here: skipping the first half of the
+// object) is rejected with a specific eligibility reason rather than being
+// silently approximated.
+func TestPrepareRejectsOutOfOrderCoalescedWrite(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	r := writeObjectTrace(t, objectWriteHeader(4096, 2), []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(512)), Len: trace.Ptr(int64(512))},
+	})
+
+	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
+	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
+	plan := replay.Plan{Engine: objectEng, EngineName: "s3", Bucket: "bench", Mode: "asap", TargetMap: tm}
+	_, err := replay.Prepare(plan, r)
+	if err == nil {
+		t.Fatal("Prepare should reject an out-of-order WRITE against an object engine")
+	}
+	if !strings.Contains(err.Error(), "not the next sequential byte") {
+		t.Errorf("Prepare error=%v, want sequential-offset rejection", err)
+	}
+}
+
+// TestPrepareRejectsPartialCoverageCoalescedWrite verifies that closing a
+// write handle before its WRITEs cover the target's full declared size is
+// rejected: object-level replay requires full coverage, not a partial write.
+func TestPrepareRejectsPartialCoverageCoalescedWrite(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	r := writeObjectTrace(t, objectWriteHeader(4096, 3), []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(0)), Len: trace.Ptr(int64(2048))},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpClose, H: &h0},
+	})
+
+	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
+	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
+	plan := replay.Plan{Engine: objectEng, EngineName: "s3", Bucket: "bench", Mode: "asap", TargetMap: tm}
+	_, err := replay.Prepare(plan, r)
+	if err == nil {
+		t.Fatal("Prepare should reject a partial-coverage coalesced write against an object engine")
+	}
+	if !strings.Contains(err.Error(), "partial coverage") {
+		t.Errorf("Prepare error=%v, want partial-coverage rejection", err)
+	}
+}
+
+// TestPrepareAcceptsCoalescedWriteAgainstObjectEngine verifies that a
+// checkpoint-shaped OPEN(w) → WRITE* → FSYNC → CLOSE lifecycle whose WRITEs
+// are sequential and fully cover the declared target size passes PREPARE
+// against an object engine reporting PartialWrite=false — the object-level
+// equivalence the plan requires for checkpoint-to-S3 replay.
+func TestPrepareAcceptsCoalescedWriteAgainstObjectEngine(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	r := writeObjectTrace(t, objectWriteHeader(4096, 5), []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(0)), Len: trace.Ptr(int64(2048))},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpWrite, H: &h0, Off: trace.Ptr(int64(2048)), Len: trace.Ptr(int64(2048))},
+		{T: 3, OpID: trace.Ptr(int64(3)), S: 0, Op: trace.OpFsync, H: &h0},
+		{T: 3, OpID: trace.Ptr(int64(4)), S: 0, Op: trace.OpClose, H: &h0},
+	})
+
+	objectEng := newCapsEngine(engine.Capabilities{Seekable: true, PartialWrite: false, ObjectAPI: true})
+	tm := &targetmap.Map{Rules: []targetmap.Rule{{From: "", To: "s3://bench/imagenet/"}}}
+	plan := replay.Plan{Engine: objectEng, EngineName: "s3", Bucket: "bench", Mode: "asap", TargetMap: tm}
+	if _, err := replay.Prepare(plan, r); err != nil {
+		t.Fatalf("Prepare should accept a fully-covered sequential coalesced write: %v", err)
 	}
 }
 

@@ -46,8 +46,8 @@ type Params struct {
 	Fsync                 string  // per-file | final | none
 
 	// CreatedUTC, if non-empty, is written to the header as created_utc. Leave
-	// empty for deterministic (byte-identical) output across runs. The CLI sets
-	// this to time.Now().UTC().Format(time.RFC3339).
+	// empty for deterministic (byte-identical) output across runs. The CLI
+	// leaves this empty so generated artifacts are reproducible.
 	CreatedUTC string
 }
 
