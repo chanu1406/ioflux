@@ -23,7 +23,10 @@ const (
 	captureMethod      = "import:strace"
 	captureLimitations = "strace syscall trace; mmap page-fault I/O not captured; " +
 		"ops on file descriptors opened before tracing or shared across threads are skipped; " +
-		"STDIO/socket/non-file syscalls ignored; strace -T durations are preserved as optional op metadata"
+		"STDIO/socket/non-file syscalls ignored; strace -T durations are preserved as optional op metadata; " +
+		"ptrace-based tracing itself is slow (commonly 10-100x wall-clock overhead) and distorts the " +
+		"captured timeline, so timeline/scaled replay of this trace should not be trusted for absolute " +
+		"pacing — prefer asap-mode replay or compare against the preserved per-op durations"
 	generatedBy = "ioflux-import 0.1.0 / strace"
 )
 

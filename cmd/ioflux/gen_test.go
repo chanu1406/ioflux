@@ -131,6 +131,63 @@ func TestGenCmd_BasicSmoke(t *testing.T) {
 	}
 }
 
+// TestGenCmd_PrefetchDepthWarnsWhenExplicit verifies that passing
+// --prefetch-depth > 1 prints a warning that the value is not modeled, since
+// the generator always emits strictly sequential per-shard reads regardless
+// of the flag.
+func TestGenCmd_PrefetchDepthWarnsWhenExplicit(t *testing.T) {
+	tmp, err := os.CreateTemp("", "ioflux-gen-prefetch-*.ioflux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "65536",
+		"--record-size", "16384",
+		"--dataloader-workers", "1",
+		"--prefetch-depth", "4",
+		"-o", tmp.Name(),
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d want 0; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "--prefetch-depth=4 is not modeled") {
+		t.Errorf("stderr should warn about unmodeled prefetch-depth, got: %s", stderr)
+	}
+}
+
+// TestGenCmd_PrefetchDepthSilentByDefault verifies that not passing
+// --prefetch-depth at all produces no warning, even though the field's own
+// default value is > 1 — the warning is about the user's explicit choice,
+// not about the placeholder default.
+func TestGenCmd_PrefetchDepthSilentByDefault(t *testing.T) {
+	tmp, err := os.CreateTemp("", "ioflux-gen-prefetch-default-*.ioflux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "65536",
+		"--record-size", "16384",
+		"--dataloader-workers", "1",
+		"-o", tmp.Name(),
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d want 0; stderr=%s", code, stderr)
+	}
+	if strings.Contains(stderr, "prefetch-depth") {
+		t.Errorf("stderr should not mention prefetch-depth when the flag was not passed, got: %s", stderr)
+	}
+}
+
 // TestGenCmd_SizeSuffixes verifies that human-readable size suffixes produce
 // the same output as the equivalent raw byte counts.
 func TestGenCmd_SizeSuffixes(t *testing.T) {

@@ -88,6 +88,21 @@ func TestImport_PreservesDurations(t *testing.T) {
 	}
 }
 
+// TestImport_CaptureLimitationsDeclareTracingOverhead verifies that the
+// declared capture_limitations warn that ptrace-based tracing distorts the
+// captured timeline, so a timeline/scaled replay of a strace-imported trace
+// isn't mistaken for an undistorted pacing measurement.
+func TestImport_CaptureLimitationsDeclareTracingOverhead(t *testing.T) {
+	_, hdr, _ := importString(t, `3201  10:00:00.000000 openat(AT_FDCWD, "/data/a.bin", O_RDONLY) = 3
+3201  10:00:00.000100 close(3) = 0
+`)
+	for _, want := range []string{"overhead", "distort", "timeline"} {
+		if !strings.Contains(hdr.CaptureLimitations, want) {
+			t.Errorf("capture_limitations=%q, want it to mention %q", hdr.CaptureLimitations, want)
+		}
+	}
+}
+
 func TestImport_Basic(t *testing.T) {
 	in, err := os.ReadFile("testdata/basic.strace")
 	if err != nil {

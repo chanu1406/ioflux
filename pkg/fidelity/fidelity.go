@@ -57,8 +57,14 @@ type CoverageSummary struct {
 	OpsSkipped int64 `json:"ops_skipped"`
 }
 
-// ConcurrencyCheck confirms that no stream ran more than one op in-flight at
-// a time (the strict-sequentiality invariant for no-group traces).
+// ConcurrencyCheck records the observed peak per-stream in-flight depth. For
+// no-group traces this is a structural guarantee, not an independent
+// measurement: the scheduler dispatches each stream's ops one at a time from
+// a single goroutine (see runStreams in pkg/replay), so MaxPerStreamInflight
+// cannot exceed 1 by construction — group replay is rejected at PREPARE (the
+// only mechanism that would let a stream run ops concurrently doesn't exist
+// yet). Violations, if ever non-empty, would indicate a scheduler bug rather
+// than a backend-observed fidelity loss.
 type ConcurrencyCheck struct {
 	MaxPerStreamInflight int64   `json:"max_per_stream_inflight"`
 	Violations           []int64 `json:"violations,omitempty"`
@@ -142,6 +148,8 @@ func summaryOf(h *metrics.Histogram) PercentileSummary {
 }
 
 // buildConcurrencyCheck scans peakByStream and flags violations (peak > 1).
+// This asserts the scheduler's own no-group strict-sequentiality guarantee
+// rather than measuring something that could vary with backend behavior.
 func buildConcurrencyCheck(peakByStream map[int64]int64) ConcurrencyCheck {
 	var cc ConcurrencyCheck
 	sids := make([]int64, 0, len(peakByStream))

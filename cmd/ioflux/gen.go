@@ -138,6 +138,17 @@ func runGenTrainingRead(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
 		return 1
 	}
+	// Warn rather than silently ignore --prefetch-depth: only when the user
+	// actually passed it, since the field's own default is a non-modeled
+	// placeholder and warning on every unflagged run would be noise.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "prefetch-depth" && p.PrefetchDepth > 1 {
+			fmt.Fprintf(stderr,
+				"ioflux gen: warning: --prefetch-depth=%d is not modeled — every worker stream still "+
+					"emits a strictly sequential OPEN, READ*, CLOSE per shard with no outstanding overlap; "+
+					"the generated trace does not reflect prefetch-depth > 1\n", p.PrefetchDepth)
+		}
+	})
 
 	var w io.Writer
 	if out == "-" {

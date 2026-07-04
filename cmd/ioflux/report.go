@@ -181,9 +181,12 @@ func printRunReport(w io.Writer, res *results.Results) {
 	fmt.Fprintf(w, "  coverage:       %d/%d ops (%.1f%%)\n",
 		fid.Coverage.OpsIssued, fid.Coverage.OpsInTrace, issuePct)
 
-	ccStatus := "ok"
+	// Structural guarantee, not an independent measurement: the scheduler
+	// dispatches each (non-grouped) stream one op at a time, so this can only
+	// exceed 1 if the scheduler itself has a bug.
+	ccStatus := "guaranteed by scheduler"
 	if fid.ConcurrencyCheck.MaxPerStreamInflight > 1 {
-		ccStatus = fmt.Sprintf("VIOLATION: max per-stream in-flight = %d (streams: %v)",
+		ccStatus = fmt.Sprintf("SCHEDULER BUG: max per-stream in-flight = %d (streams: %v)",
 			fid.ConcurrencyCheck.MaxPerStreamInflight, fid.ConcurrencyCheck.Violations)
 	}
 	fmt.Fprintf(w, "  concurrency:    max-per-stream %d [%s]\n",
