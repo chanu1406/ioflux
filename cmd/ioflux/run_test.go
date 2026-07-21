@@ -100,6 +100,47 @@ func TestRunCmd_LocalEngine(t *testing.T) {
 	}
 }
 
+func TestRunCmd_ShortReadWritesInvalidResultAndExitsOne(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "short.dat")
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if err := os.WriteFile(targetPath, make([]byte, 512), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content := fmt.Sprintf(`{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","capture_method":"synthetic","scrubbed":false,"targets":[{"id":0,"name":%q,"kind":"file","size":1024}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":1024,"duration_ns":0}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":1,"mode":"r"}
+{"t":1,"op_id":1,"s":0,"op":"READ","h":1,"off":0,"len":1024}
+{"t":2,"op_id":2,"s":0,"op":"CLOSE","h":1}
+`, targetPath)
+	if err := os.WriteFile(tracePath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--mode", "asap",
+		"-o", resultsPath,
+	})
+	if code != 1 {
+		t.Fatalf("runRun exit=%d want 1; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "1 op(s) failed") {
+		t.Fatalf("stderr should identify the invalid execution, got %q", stderr)
+	}
+	got, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"errors": 1`, `"short_reads": 1`, `"bytes_moved": 512`} {
+		if !bytes.Contains(got, []byte(want)) {
+			t.Fatalf("results should contain %s, got:\n%s", want, got)
+		}
+	}
+}
+
 func TestRunCmd_S3RequiresBucket(t *testing.T) {
 	dir := t.TempDir()
 	tracePath := filepath.Join(dir, "trace.ioflux")

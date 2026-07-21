@@ -283,6 +283,8 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 		SpeedupFactor:             plan.SpeedupFactor,
 		TraceKind:                 string(hdr.Kind),
 		Profile:                   hdr.Profile,
+		CaptureMethod:             string(hdr.CaptureMethod),
+		CaptureLimitations:        hdr.CaptureLimitations,
 		NumStreams:                hdr.Summary.NumStreams,
 		NumOps:                    hdr.Summary.NumOps,
 		TotalBytes:                hdr.Summary.TotalBytes,

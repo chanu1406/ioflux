@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -584,12 +585,7 @@ func dispatchOp(
 		off, length := *op.Off, *op.Len
 		buf = growBuf(buf, length)
 		n, err := eng.Read(ctx, rh.handle, off, length, buf[:length])
-		bytesN = int64(n)
-		if errors.Is(err, engine.ErrShortRead) {
-			shortRead = true
-			err = nil
-		}
-		opErr = err
+		bytesN, shortRead, opErr = checkedReadTransfer(n, length, err)
 
 	case trace.OpWrite:
 		rh := handleMap[*op.H]
@@ -602,12 +598,10 @@ func dispatchOp(
 		payload.Fill(buf[:length], fill, opID, rh.target, off)
 		if rh.objWrite != nil {
 			n, err := rh.objWrite.write(buf[:length])
-			bytesN = int64(n)
-			opErr = err
+			bytesN, opErr = checkedWriteTransfer(n, length, err)
 		} else {
 			n, err := eng.Write(ctx, rh.handle, off, buf[:length])
-			bytesN = int64(n)
-			opErr = err
+			bytesN, opErr = checkedWriteTransfer(n, length, err)
 		}
 
 	case trace.OpFsync:
@@ -642,18 +636,19 @@ func dispatchOp(
 		}
 		payload.Fill(buf[:length], fill, opID, key, 0)
 		opErr = eng.Put(ctx, key, bytes.NewReader(buf[:length]), length)
+		if opErr == nil {
+			// Engine.Put's success contract means one complete object of exactly
+			// length bytes was accepted. Unlike Read and Write the interface has
+			// no partial byte return, so failed PUTs conservatively account zero.
+			bytesN = length
+		}
 
 	case trace.OpGet:
 		key := hdr.Targets[*op.Tgt].Name
 		off, length := *op.Off, *op.Len
 		buf = growBuf(buf, length)
 		n, err := eng.Get(ctx, key, off, length, buf[:length])
-		bytesN = int64(n)
-		if errors.Is(err, engine.ErrShortRead) {
-			shortRead = true
-			err = nil
-		}
-		opErr = err
+		bytesN, shortRead, opErr = checkedReadTransfer(n, length, err)
 
 	case trace.OpHead:
 		_, opErr = eng.Head(ctx, hdr.Targets[*op.Tgt].Name)
@@ -663,6 +658,44 @@ func dispatchOp(
 	}
 
 	return bytesN, shortRead, opErr
+}
+
+// checkedReadTransfer validates both parts of an Engine Read/Get outcome. A
+// short result is an operation failure even when an engine returns nil, because
+// completing less work than the trace requested cannot support a valid run.
+func checkedReadTransfer(n int, requested int64, err error) (bytesN int64, short bool, opErr error) {
+	bytesN = validTransferredBytes(n, requested)
+	short = int64(n) != requested || errors.Is(err, engine.ErrShortRead)
+	if int64(n) < 0 || int64(n) > requested {
+		return bytesN, short, fmt.Errorf("engine returned invalid read count %d for %d requested bytes", n, requested)
+	}
+	if short && err == nil {
+		err = fmt.Errorf("%w: completed %d of %d requested bytes", engine.ErrShortRead, n, requested)
+	}
+	return bytesN, short, err
+}
+
+// checkedWriteTransfer rejects a short or otherwise impossible Engine Write
+// outcome while preserving the number of bytes the backend actually accepted.
+func checkedWriteTransfer(n int, requested int64, err error) (bytesN int64, opErr error) {
+	bytesN = validTransferredBytes(n, requested)
+	if int64(n) < 0 || int64(n) > requested {
+		return bytesN, fmt.Errorf("engine returned invalid write count %d for %d requested bytes", n, requested)
+	}
+	if int64(n) != requested && err == nil {
+		err = fmt.Errorf("%w: completed %d of %d requested bytes", engine.ErrShortWrite, n, requested)
+	}
+	return bytesN, err
+}
+
+func validTransferredBytes(n int, requested int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	if int64(n) > requested {
+		return requested
+	}
+	return int64(n)
 }
 
 type replayHandle struct {

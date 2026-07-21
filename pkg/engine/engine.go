@@ -24,6 +24,10 @@ var (
 	// requested (e.g., read starting at or near EOF). The return value n
 	// holds the number of bytes actually read.
 	ErrShortRead = errors.New("engine: short read")
+
+	// ErrShortWrite marks a Write that accepted fewer bytes than requested.
+	// The return value n holds the number of bytes actually written.
+	ErrShortWrite = errors.New("engine: short write")
 )
 
 // Handle is an opaque reference to an open file, returned by Open and passed

@@ -16,15 +16,17 @@ func makeTestResults() *results.Results {
 	return &results.Results{
 		GeneratedAt: "2026-06-04T10:00:00Z",
 		Plan: results.PlanInfo{
-			TracePath:   "/data/trace.ioflux",
-			TraceKind:   "imported",
-			Engine:      "local",
-			Mode:        "asap",
-			MaxInflight: 512,
-			NumStreams:  4,
-			NumOps:      1024,
-			TotalBytes:  67108864,
-			PrepareMode: "assume-existing",
+			TracePath:          "/data/trace.ioflux",
+			TraceKind:          "imported",
+			CaptureMethod:      "import:strace",
+			CaptureLimitations: "mmap page-fault I/O not captured",
+			Engine:             "local",
+			Mode:               "asap",
+			MaxInflight:        512,
+			NumStreams:         4,
+			NumOps:             1024,
+			TotalBytes:         67108864,
+			PrepareMode:        "assume-existing",
 		},
 		RunEnv: results.RunEnv{
 			CacheMode: "cold",
@@ -60,6 +62,28 @@ func makeTestResults() *results.Results {
 			},
 			LowFidelity: false,
 		},
+	}
+}
+
+func TestReportCmd_PrintsCaptureProvenance(t *testing.T) {
+	res := makeTestResults()
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr)
+	}
+	for _, want := range []string{"Source:    import:strace", "Capture limitations: mmap page-fault I/O not captured"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q; got:\n%s", want, out)
+		}
 	}
 }
 
@@ -327,6 +351,7 @@ func TestReportCmd_LowFidelityWarning(t *testing.T) {
 func TestReportCmd_ErrorsReportedAsWarning(t *testing.T) {
 	res := makeTestResults()
 	res.Errors = 3
+	res.ShortReads = 1
 
 	data, err := json.Marshal(res)
 	if err != nil {
@@ -343,6 +368,9 @@ func TestReportCmd_ErrorsReportedAsWarning(t *testing.T) {
 	}
 	if !strings.Contains(out, "3 op error(s)") {
 		t.Errorf("output should mention op errors; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Execution: INVALID — 3 operation failure(s), including 1 short read(s)") {
+		t.Errorf("output should give failed operations an explicit invalid execution verdict; got:\n%s", out)
 	}
 }
 

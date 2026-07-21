@@ -1,6 +1,6 @@
 # IOFlux
 
-IOFlux is a trace driven storage workload replay tool for AI workloads. It
+IOFlux is a trace-driven storage workload replay prototype for AI workloads. It
 generates synthetic training-read and checkpoint-write traces, imports real
 traces (strace, DFTracer), validates them, and replays any of them against a
 storage backend, then reports how the backend handled them.
@@ -16,6 +16,20 @@ can be generated synthetically or imported from strace and DFTracer output. A ru
 can be distributed across multiple hosts, which replay disjoint subsets of the
 trace's streams and report per-host throughput alongside merged percentiles. Live
 process capture is not implemented yet.
+
+## Current qualification boundary
+
+IOFlux is useful today for controlled experiments and simple, synchronous,
+same-domain replays. It is not yet a production-qualified benchmark for storage
+purchasing, capacity planning, or whole-application reproduction. In particular,
+imported traces retain capture-method limitations, short transfers make a run
+fail, and saved reports identify detected operation failures as invalid
+execution. Importer loss manifests, environment comparability, result-schema
+versioning, and full workload qualification are still in progress.
+
+Distributed execution and POSIX-to-object replay are experimental. They are
+valuable implementation and research paths, but their output must not be treated
+as qualified cluster-wide or exact cross-protocol evidence yet.
 
 ## Commands
 
@@ -93,14 +107,15 @@ each side's dominant data-op latency (`WRITE` vs `READ`):
 bin/ioflux report ckpt.json results.json
 ```
 
-Checkpoint-write replays as `OPEN(create|trunc)` → `WRITE*` → `[FSYNC]` →
-`CLOSE`, so it runs against the `local` (POSIX/NFS/Lustre) engine today, and
-against `mem` with `--fsync none` (the mem engine has no durable storage to
-fsync). The `s3` engine does not support it yet — S3 rejects write-mode `Open`
-and offset `Write` at PREPARE; checkpoint replay to S3 needs the multipart
-write path, which is a planned follow-up.
+Checkpoint-write replays op-for-op as `OPEN(create|trunc)` → `WRITE*` →
+`[FSYNC]` → `CLOSE` against the `local` engine, and against `mem` with
+`--fsync none` (the mem engine has no durable storage to fsync). Against S3,
+eligible sequential full-coverage writes are coalesced into one whole-object
+PUT, using multipart upload above the configured threshold. Results label that
+path `replay_equivalence: object-level`; it is an experimental cross-domain
+transformation, not an exact POSIX replay or durability comparison.
 
-## Distributed runs
+## Distributed runs (experimental)
 
 Start a worker on each host, then point a run at them with `--hosts`:
 
@@ -120,7 +135,10 @@ synchronizes them through `PREPARE`/`RUN`/`DONE` barriers, and merges the
 per-host HDR histograms losslessly, so the reported percentiles come from one
 global distribution rather than averaged per-host numbers. The report adds a
 per-host table and a first-done/last-done straggler window. A worker failure
-aborts the whole run (v1 has no failover). Omitting `--hosts` runs single-node
+aborts the whole run (v1 has no failover). This mode is a functional prototype,
+not a qualified production distributed benchmark: placement semantics, clock
+and start-skew calibration, authentication, partial evidence, and real
+multi-host qualification remain incomplete. Omitting `--hosts` runs single-node
 through the same code path via one in-process worker.
 
 > **Security:** the coordinator/worker gRPC transport is plaintext and

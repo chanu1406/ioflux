@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
@@ -210,6 +211,21 @@ func TestMaterializeSynthetic_PosixCreatesAllTargets(t *testing.T) {
 	}
 }
 
+func TestMaterializeSynthetic_RejectsShortWrite(t *testing.T) {
+	tgts := []trace.TargetInfo{{ID: 0, Name: "short.dat", Kind: trace.TargetFile, Size: 4096}}
+	prep, err := prepare.For(prepare.ModeMaterializeSynthetic, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = prep.Prepare(context.Background(), tgts, nil, nil, &shortPrepareWriteEngine{})
+	if err == nil {
+		t.Fatal("Prepare should fail when the backend accepts fewer bytes than requested")
+	}
+	if !strings.Contains(err.Error(), "short write") {
+		t.Fatalf("Prepare error=%v, want short-write classification", err)
+	}
+}
+
 func allZero(b []byte) bool {
 	for _, v := range b {
 		if v != 0 {
@@ -408,6 +424,12 @@ func TestFor_MaterializeFromSourceRequiresRoot(t *testing.T) {
 // discardEngine accepts writes but does not store data. Used to test that
 // materialize-synthetic doesn't allocate the full object size in memory.
 type discardEngine struct{}
+
+type shortPrepareWriteEngine struct{ discardEngine }
+
+func (e *shortPrepareWriteEngine) Write(_ context.Context, _ engine.Handle, _ int64, data []byte) (int, error) {
+	return len(data) / 2, nil
+}
 
 func (e *discardEngine) Caps() engine.Capabilities {
 	return engine.Capabilities{Seekable: true, PartialWrite: true}

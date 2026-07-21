@@ -226,11 +226,11 @@ func writePOSIX(ctx context.Context, eng engine.Engine, name string, size int64,
 		}
 		payload.Fill(buf[:n], fill, 0, name, off)
 		written, writeErr := eng.Write(ctx, h, off, buf[:n])
-		off += int64(written)
-		if writeErr != nil {
+		if err := validateWriteCount(written, n, writeErr); err != nil {
 			_ = eng.Close(ctx, h)
-			return fmt.Errorf("writeTarget %q: write at %d: %w", name, off-int64(written), writeErr)
+			return fmt.Errorf("writeTarget %q: write at %d: %w", name, off, err)
 		}
+		off += int64(written)
 	}
 	if eng.Caps().Durable {
 		if err := eng.Fsync(ctx, h); err != nil {
@@ -334,11 +334,11 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			written, writeErr := eng.Write(ctx, h, off, buf[:n])
-			off += int64(written)
-			if writeErr != nil {
+			if err := validateWriteCount(written, int64(n), writeErr); err != nil {
 				_ = eng.Close(ctx, h)
-				return fmt.Errorf("write dest %q at %d: %w", name, off-int64(written), writeErr)
+				return fmt.Errorf("write dest %q at %d: %w", name, off, err)
 			}
+			off += int64(written)
 		}
 		if readErr == io.EOF {
 			break
@@ -355,4 +355,14 @@ func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, bu
 		}
 	}
 	return eng.Close(ctx, h)
+}
+
+func validateWriteCount(written int, requested int64, writeErr error) error {
+	if written < 0 || int64(written) > requested {
+		return fmt.Errorf("engine returned invalid write count %d for %d requested bytes", written, requested)
+	}
+	if int64(written) != requested && writeErr == nil {
+		return fmt.Errorf("%w: completed %d of %d requested bytes", engine.ErrShortWrite, written, requested)
+	}
+	return writeErr
 }

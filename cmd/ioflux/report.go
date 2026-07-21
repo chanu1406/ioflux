@@ -100,6 +100,12 @@ func printRunReport(w io.Writer, res *results.Results) {
 		plan.NumOps,
 		fmtBytes(plan.TotalBytes),
 	)
+	if plan.CaptureMethod != "" {
+		fmt.Fprintf(w, "Source:    %s\n", plan.CaptureMethod)
+	}
+	if plan.CaptureLimitations != "" {
+		fmt.Fprintf(w, "Capture limitations: %s\n", plan.CaptureLimitations)
+	}
 	fmt.Fprintf(w, "Engine:    %s   mode: %s   max-inflight: %d\n",
 		plan.Engine, plan.Mode, plan.MaxInflight)
 	if env.CacheMode != "" {
@@ -110,6 +116,15 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 	fmt.Fprintf(w, "Run:       %s   duration: %s\n",
 		res.GeneratedAt, fmtDuration(res.DurationNS))
+	if res.Errors > 0 {
+		fmt.Fprintf(w, "Execution: INVALID — %d operation failure(s)", res.Errors)
+		if res.ShortReads > 0 {
+			fmt.Fprintf(w, ", including %d short read(s)", res.ShortReads)
+		}
+		fmt.Fprintln(w)
+	} else {
+		fmt.Fprintln(w, "Execution: no detected operation failures")
+	}
 
 	// --- Throughput ---
 	fmt.Fprintln(w)

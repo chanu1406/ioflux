@@ -59,6 +59,9 @@ func TestCoordinator_DistributedEquivalence(t *testing.T) {
 	if dist.Errors != 0 || single.Errors != 0 {
 		t.Errorf("errors: dist=%d single=%d, want 0", dist.Errors, single.Errors)
 	}
+	if dist.Plan.CaptureMethod != string(hdr.CaptureMethod) || single.Plan.CaptureMethod != string(hdr.CaptureMethod) {
+		t.Errorf("capture method not preserved: dist=%q single=%q want=%q", dist.Plan.CaptureMethod, single.Plan.CaptureMethod, hdr.CaptureMethod)
+	}
 	if dist.Fidelity.Coverage.OpsSkipped != 0 {
 		t.Errorf("dist coverage.ops_skipped=%d, want 0", dist.Fidelity.Coverage.OpsSkipped)
 	}

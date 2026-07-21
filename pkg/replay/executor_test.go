@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -486,7 +487,7 @@ func TestRunRecordsEngineErrorsWithoutReturningFatalError(t *testing.T) {
 	}
 }
 
-func TestRunRecordsShortReadsAndServiceTime(t *testing.T) {
+func TestRunInvalidatesShortReadsAndRecordsServiceTime(t *testing.T) {
 	tgt0 := 0
 	h0 := int64(1)
 	off0 := int64(0)
@@ -527,8 +528,8 @@ func TestRunRecordsShortReadsAndServiceTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Errors != 0 {
-		t.Fatalf("Errors=%d, want 0 for ErrShortRead", res.Errors)
+	if res.Errors != 1 {
+		t.Fatalf("Errors=%d, want 1: a short read must invalidate execution", res.Errors)
 	}
 	if res.ShortReads != 1 {
 		t.Fatalf("ShortReads=%d, want 1", res.ShortReads)
@@ -544,6 +545,89 @@ func TestRunRecordsShortReadsAndServiceTime(t *testing.T) {
 	}
 	if _, ok := res.HistogramSnapshot.ServiceHistograms[trace.OpRead]; !ok {
 		t.Fatal("snapshot missing READ service histogram")
+	}
+}
+
+func TestRunInvalidatesShortWriteAndCountsActualBytes(t *testing.T) {
+	tgt0 := 0
+	h0 := int64(1)
+	off0 := int64(0)
+	writeLen := int64(1024)
+	ops := []trace.Op{
+		{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpOpen, Tgt: &tgt0, H: &h0, Mode: trace.ModeWrite},
+		{T: 1, OpID: trace.Ptr(int64(1)), S: 0, Op: trace.OpWrite, H: &h0, Off: &off0, Len: &writeLen},
+		{T: 2, OpID: trace.Ptr(int64(2)), S: 0, Op: trace.OpClose, H: &h0},
+	}
+	hdr := basicHeader(int64(len(ops)))
+	hdr.Summary.TotalBytes = writeLen
+
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if err := tw.WriteOp(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec, err := replay.Prepare(replay.Plan{Engine: &shortWriteEngine{}, EngineName: "short-write", Mode: "asap"}, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Errors != 1 {
+		t.Fatalf("Errors=%d, want 1: a short write must invalidate execution", res.Errors)
+	}
+	if res.BytesMoved != writeLen/2 {
+		t.Fatalf("BytesMoved=%d, want actual written bytes %d", res.BytesMoved, writeLen/2)
+	}
+}
+
+func TestRunCountsSuccessfulPutBytes(t *testing.T) {
+	tgt0 := 0
+	putLen := int64(4096)
+	ops := []trace.Op{{T: 0, OpID: trace.Ptr(int64(0)), S: 0, Op: trace.OpPut, Tgt: &tgt0, Len: &putLen}}
+	hdr := basicHeader(int64(len(ops)))
+	hdr.Targets[0].Kind = trace.TargetObject
+	hdr.Summary.TotalBytes = putLen
+
+	var buf bytes.Buffer
+	tw := trace.NewWriter(&buf)
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteOp(ops[0]); err != nil {
+		t.Fatal(err)
+	}
+	r, err := trace.NewReader(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &putCountingEngine{}
+	exec, err := replay.Prepare(replay.Plan{Engine: eng, EngineName: "put-counting", Mode: "asap"}, r)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	res, err := exec.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("Errors=%d, want 0", res.Errors)
+	}
+	if res.BytesMoved != putLen {
+		t.Fatalf("BytesMoved=%d, want successful PUT bytes %d", res.BytesMoved, putLen)
+	}
+	if eng.received != putLen {
+		t.Fatalf("engine received %d bytes, want %d", eng.received, putLen)
 	}
 }
 
@@ -1100,6 +1184,33 @@ func (e *readFailEngine) Head(_ context.Context, _ string) (engine.ObjectInfo, e
 	return engine.ObjectInfo{}, engine.ErrUnsupported
 }
 func (e *readFailEngine) Delete(_ context.Context, _ string) error { return engine.ErrUnsupported }
+
+type shortWriteEngine struct{ readFailEngine }
+
+func (e *shortWriteEngine) Write(_ context.Context, _ engine.Handle, _ int64, data []byte) (int, error) {
+	return len(data) / 2, nil
+}
+
+type putCountingEngine struct {
+	capsEngine
+	received int64
+}
+
+func (e *putCountingEngine) Caps() engine.Capabilities {
+	return engine.Capabilities{ObjectAPI: true}
+}
+
+func (e *putCountingEngine) Put(_ context.Context, _ string, r io.Reader, size int64) error {
+	n, err := io.Copy(io.Discard, r)
+	e.received = n
+	if err != nil {
+		return err
+	}
+	if n != size {
+		return fmt.Errorf("received %d bytes, want %d", n, size)
+	}
+	return nil
+}
 
 // TestResultsIncludeCPU verifies that a replay populates the CPU block. The
 // non-zero rusage assertion lives in pkg/cpustat (busy loop) — here we only

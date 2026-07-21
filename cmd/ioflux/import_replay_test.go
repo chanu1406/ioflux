@@ -114,6 +114,12 @@ func assertImportedReplayHonest(t *testing.T, res *results.Results, hdr trace.He
 	if res.Plan.TraceKind != string(trace.TraceImported) {
 		t.Errorf("results trace_kind=%q, want imported", res.Plan.TraceKind)
 	}
+	if res.Plan.CaptureMethod != string(wantMethod) {
+		t.Errorf("results capture_method=%q, want %q", res.Plan.CaptureMethod, wantMethod)
+	}
+	if res.Plan.CaptureLimitations != hdr.CaptureLimitations || res.Plan.CaptureLimitations == "" {
+		t.Errorf("results capture_limitations=%q, want trace header limitations %q", res.Plan.CaptureLimitations, hdr.CaptureLimitations)
+	}
 	if res.Errors != 0 {
 		t.Errorf("errors=%d, want 0", res.Errors)
 	}

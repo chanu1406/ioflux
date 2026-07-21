@@ -21,6 +21,8 @@ type PlanInfo struct {
 	SpeedupFactor             float64 `json:"speedup_factor,omitempty"`
 	TraceKind                 string  `json:"trace_kind"`
 	Profile                   string  `json:"profile,omitempty"`
+	CaptureMethod             string  `json:"capture_method,omitempty"`
+	CaptureLimitations        string  `json:"capture_limitations,omitempty"`
 	NumStreams                int     `json:"num_streams"`
 	NumOps                    int64   `json:"num_ops"`
 	TotalBytes                int64   `json:"total_bytes"`
