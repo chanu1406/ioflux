@@ -16,6 +16,12 @@ type Recorder struct {
 	Bytes        int64
 	Errors       int64
 	ShortReads   int64
+	// HistogramOverflows counts latency samples that fell outside every
+	// histogram's trackable range (see maxLatencyNS) and were therefore not
+	// recorded in any percentile. The op that produced the sample still
+	// completed and is counted elsewhere; this only tracks samples the
+	// latency distribution itself lost.
+	HistogramOverflows int64
 
 	// BacklogEvents is the number of times an op had to wait for a semaphore
 	// slot because the worker-level MaxInflight cap was reached.
@@ -57,7 +63,9 @@ func (r *Recorder) RecordDrift(driftNS int64) {
 	if r.DriftHist == nil {
 		r.DriftHist = New()
 	}
-	r.DriftHist.RecordValue(driftNS)
+	if !r.DriftHist.RecordValue(driftNS) {
+		r.HistogramOverflows++
+	}
 }
 
 // RecordCompletionLag records one completion-lag sample: completionTime −
@@ -70,7 +78,9 @@ func (r *Recorder) RecordCompletionLag(lagNS int64) {
 	if r.CompletionLagHist == nil {
 		r.CompletionLagHist = New()
 	}
-	r.CompletionLagHist.RecordValue(lagNS)
+	if !r.CompletionLagHist.RecordValue(lagNS) {
+		r.HistogramOverflows++
+	}
 }
 
 // DriftP99 returns the p99 schedule drift in nanoseconds, or 0 if no drift
@@ -91,7 +101,9 @@ func (r *Recorder) Record(kind trace.OpKind, latencyNS, bytesN int64, errored bo
 		h = New()
 		r.hists[kind] = h
 	}
-	h.RecordValue(latencyNS)
+	if !h.RecordValue(latencyNS) {
+		r.HistogramOverflows++
+	}
 	r.counts[kind]++
 	r.Bytes += bytesN
 	if errored {
@@ -110,7 +122,9 @@ func (r *Recorder) RecordService(kind trace.OpKind, serviceNS int64) {
 		h = New()
 		r.serviceHists[kind] = h
 	}
-	h.RecordValue(serviceNS)
+	if !h.RecordValue(serviceNS) {
+		r.HistogramOverflows++
+	}
 }
 
 // RecordShortRead counts a replay op that returned engine.ErrShortRead.
@@ -131,6 +145,7 @@ func (r *Recorder) Merge(other *Recorder) {
 	r.Bytes += other.Bytes
 	r.Errors += other.Errors
 	r.ShortReads += other.ShortReads
+	r.HistogramOverflows += other.HistogramOverflows
 	for kind, oh := range other.serviceHists {
 		h, ok := r.serviceHists[kind]
 		if !ok {

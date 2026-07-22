@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/chanuollala/ioflux/pkg/results"
 )
 
 func runRunCLI(args []string) (int, string, string) {
@@ -138,6 +141,62 @@ func TestRunCmd_ShortReadWritesInvalidResultAndExitsOne(t *testing.T) {
 		if !bytes.Contains(got, []byte(want)) {
 			t.Fatalf("results should contain %s, got:\n%s", want, got)
 		}
+	}
+}
+
+// TestRunCmd_HistogramOverflowInvalidatesResultAndExitsOne verifies that a
+// latency sample outside the histogram's 100s trackable range invalidates the
+// run (exit 1) even though every op completed successfully, mirroring the
+// short-transfer honesty guardrail. It exploits timeline mode's
+// intended-arrival accounting to synthesize a ~200s sample without any real
+// wait: an op whose trace timestamp is far in the past has its intended
+// arrival long before the run starts, so the scheduler dispatches it
+// immediately, but the recorded drift/completion-lag/latency against that
+// stale intended arrival is still ~200s.
+func TestRunCmd_HistogramOverflowInvalidatesResultAndExitsOne(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	const farPastNS = -200_000_000_000 // 200s before the run starts
+	content := fmt.Sprintf(`{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","capture_method":"synthetic","scrubbed":false,"targets":[{"id":0,"name":"target-a","kind":"file","size":8192}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":8192,"duration_ns":0}}
+{"t":%d,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":1,"mode":"r"}
+{"t":%d,"op_id":1,"s":0,"op":"READ","h":1,"off":0,"len":8192}
+{"t":%d,"op_id":2,"s":0,"op":"CLOSE","h":1}
+`, farPastNS, farPastNS, farPastNS)
+	if err := os.WriteFile(tracePath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--mode", "timeline",
+		"-o", resultsPath,
+	})
+	if code != 1 {
+		t.Fatalf("runRun exit=%d want 1; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "latency sample(s) exceeded the histogram's trackable range") {
+		t.Fatalf("stderr should identify the histogram overflow, got %q", stderr)
+	}
+
+	got, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res results.Results
+	if err := json.Unmarshal(got, &res); err != nil {
+		t.Fatalf("unmarshal results.json: %v", err)
+	}
+	if res.HistogramOverflows <= 0 {
+		t.Errorf("HistogramOverflows=%d, want > 0", res.HistogramOverflows)
+	}
+	if res.Errors != 0 {
+		t.Errorf("Errors=%d, want 0 (every op completed; only the latency sample overflowed)", res.Errors)
+	}
+	if res.OpsCompleted != 3 {
+		t.Errorf("OpsCompleted=%d, want 3", res.OpsCompleted)
 	}
 }
 

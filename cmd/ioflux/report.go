@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/chanuollala/ioflux/pkg/results"
 )
@@ -116,12 +117,20 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 	fmt.Fprintf(w, "Run:       %s   duration: %s\n",
 		res.GeneratedAt, fmtDuration(res.DurationNS))
+	var invalidReasons []string
 	if res.Errors > 0 {
-		fmt.Fprintf(w, "Execution: INVALID — %d operation failure(s)", res.Errors)
+		reason := fmt.Sprintf("%d operation failure(s)", res.Errors)
 		if res.ShortReads > 0 {
-			fmt.Fprintf(w, ", including %d short read(s)", res.ShortReads)
+			reason += fmt.Sprintf(", including %d short read(s)", res.ShortReads)
 		}
-		fmt.Fprintln(w)
+		invalidReasons = append(invalidReasons, reason)
+	}
+	if res.HistogramOverflows > 0 {
+		invalidReasons = append(invalidReasons, fmt.Sprintf(
+			"%d latency sample(s) exceeded the histogram's trackable range", res.HistogramOverflows))
+	}
+	if len(invalidReasons) > 0 {
+		fmt.Fprintf(w, "Execution: INVALID — %s\n", strings.Join(invalidReasons, "; "))
 	} else {
 		fmt.Fprintln(w, "Execution: no detected operation failures")
 	}
@@ -249,6 +258,11 @@ func printRunReport(w io.Writer, res *results.Results) {
 	if res.ShortReads > 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"%d short read(s): backend returned fewer bytes than the trace requested (undersized targets?)", res.ShortReads))
+	}
+	if res.HistogramOverflows > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d histogram overflow(s): latency sample(s) exceeded the 100s trackable range and were excluded "+
+				"from every percentile (op still completed; possible hang or stall)", res.HistogramOverflows))
 	}
 	warnings = append(warnings, env.EngineLimitations...)
 	warnings = append(warnings, env.CacheLimitations...)

@@ -254,6 +254,16 @@ func progressPointsFromProto(points []*clusterpb.ProgressPoint) []results.Progre
 }
 
 // --- RecorderSnapshot / HistSnapshot ---
+//
+// Known gap: clusterpb.RecorderSnapshot does not carry
+// metrics.RecorderSnapshot.HistogramOverflows, so a remote gRPC worker's
+// histogram-overflow count is lost when its output crosses the wire to the
+// coordinator (in-process single-node runs are unaffected — they never
+// serialize through this path). Fixing this requires regenerating
+// ioflux.pb.go from ioflux.proto (buf + protoc-gen-go/-grpc), which this
+// environment does not have available. Distributed mode is already
+// documented as experimental and unqualified; this is an additional known
+// limitation of that path, not a silent one.
 
 func recorderSnapshotToProto(s metrics.RecorderSnapshot) *clusterpb.RecorderSnapshot {
 	pb := &clusterpb.RecorderSnapshot{

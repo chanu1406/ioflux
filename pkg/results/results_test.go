@@ -79,6 +79,30 @@ func TestBuildAndWriteJSON(t *testing.T) {
 	}
 }
 
+// TestBuildPropagatesHistogramOverflows verifies that a Recorder's
+// HistogramOverflows counter (samples that fell outside the histogram's
+// trackable range) reaches Results, so a run with a lost latency sample
+// cannot be mistaken for a clean one downstream.
+func TestBuildPropagatesHistogramOverflows(t *testing.T) {
+	rec := metrics.NewRecorder()
+	rec.Record(trace.OpRead, 1_000_000, 4096, false)
+	rec.Record(trace.OpRead, 200_000_000_000, 4096, false) // exceeds the 100s trackable range
+
+	r := results.Build(results.PlanInfo{}, results.RunEnv{}, rec, 10_000_000)
+
+	if r.HistogramOverflows != 1 {
+		t.Errorf("HistogramOverflows=%d, want 1", r.HistogramOverflows)
+	}
+	// The overflowing op still completed and counts toward OpsCompleted; only
+	// its latency sample was excluded from the percentile histogram.
+	if r.OpsCompleted != 2 {
+		t.Errorf("OpsCompleted=%d, want 2", r.OpsCompleted)
+	}
+	if r.Errors != 0 {
+		t.Errorf("Errors=%d, want 0 (a histogram overflow is not an op error)", r.Errors)
+	}
+}
+
 // TestPerOpStatsMonotonic verifies monotonicity for a larger sample.
 func TestPerOpStatsMonotonic(t *testing.T) {
 	rec := metrics.NewRecorder()

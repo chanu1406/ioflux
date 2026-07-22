@@ -131,6 +131,85 @@ func TestRecorderErrors(t *testing.T) {
 	}
 }
 
+// TestRecordValueOverflowReturnsFalse verifies that a value beyond the
+// histogram's trackable range (1µs–100s) is reported as unrecorded rather
+// than silently dropped: RecordValue must return false, and the sample must
+// not appear in TotalCount.
+func TestRecordValueOverflowReturnsFalse(t *testing.T) {
+	h := metrics.New()
+	if ok := h.RecordValue(200_000_000_000); ok {
+		t.Fatal("RecordValue(200s) = true, want false (value exceeds the 100s trackable range)")
+	}
+	if h.TotalCount() != 0 {
+		t.Errorf("TotalCount=%d after an overflowing record, want 0", h.TotalCount())
+	}
+	if ok := h.RecordValue(1_000_000); !ok {
+		t.Fatal("RecordValue(1ms) = false, want true (value is within range)")
+	}
+	if h.TotalCount() != 1 {
+		t.Errorf("TotalCount=%d after one in-range record, want 1", h.TotalCount())
+	}
+}
+
+// TestRecorderRecordCountsOverflow verifies that an out-of-range latency
+// sample given to Recorder.Record still counts the op (it completed) but
+// also increments HistogramOverflows so the lost latency sample is visible
+// rather than silently absent from every percentile.
+func TestRecorderRecordCountsOverflow(t *testing.T) {
+	r := metrics.NewRecorder()
+	r.Record(trace.OpRead, 200_000_000_000, 4096, false)
+	r.Record(trace.OpRead, 1_000_000, 4096, false)
+
+	if r.HistogramOverflows != 1 {
+		t.Errorf("HistogramOverflows=%d, want 1", r.HistogramOverflows)
+	}
+	if r.Count(trace.OpRead) != 2 {
+		t.Errorf("READ count=%d, want 2 (op still completed despite overflow)", r.Count(trace.OpRead))
+	}
+	if r.TotalOps() != 2 {
+		t.Errorf("TotalOps=%d, want 2", r.TotalOps())
+	}
+	if r.Errors != 0 {
+		t.Errorf("Errors=%d, want 0 (a histogram overflow is not an op error)", r.Errors)
+	}
+	if h := r.Histogram(trace.OpRead); h.TotalCount() != 1 {
+		t.Errorf("READ histogram TotalCount=%d, want 1 (only the in-range sample)", h.TotalCount())
+	}
+}
+
+// TestRecorderRecordServiceDriftCompletionLagCountOverflow verifies the
+// remaining three histogram-backed Recorder methods also surface an overflow
+// instead of dropping the sample silently.
+func TestRecorderRecordServiceDriftCompletionLagCountOverflow(t *testing.T) {
+	r := metrics.NewRecorder()
+	r.RecordService(trace.OpWrite, 200_000_000_000)
+	r.RecordDrift(200_000_000_000)
+	r.RecordCompletionLag(200_000_000_000)
+
+	if r.HistogramOverflows != 3 {
+		t.Errorf("HistogramOverflows=%d, want 3 (service + drift + completion lag)", r.HistogramOverflows)
+	}
+}
+
+// TestRecorderMergeSumsOverflows verifies Merge aggregates HistogramOverflows
+// across recorders like every other counter.
+func TestRecorderMergeSumsOverflows(t *testing.T) {
+	ra := metrics.NewRecorder()
+	ra.Record(trace.OpRead, 200_000_000_000, 0, false)
+
+	rb := metrics.NewRecorder()
+	rb.Record(trace.OpWrite, 200_000_000_000, 0, false)
+	rb.Record(trace.OpWrite, 200_000_000_000, 0, false)
+
+	merged := metrics.NewRecorder()
+	merged.Merge(ra)
+	merged.Merge(rb)
+
+	if merged.HistogramOverflows != 3 {
+		t.Errorf("HistogramOverflows=%d, want 3", merged.HistogramOverflows)
+	}
+}
+
 // TestOpKindsSorted verifies that OpKinds returns a sorted slice.
 func TestOpKindsSorted(t *testing.T) {
 	r := metrics.NewRecorder()

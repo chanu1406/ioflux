@@ -68,6 +68,7 @@ Engine notes:
 Exit codes:
   0   replay completed; results.json written
   1   replay rejected before dispatch (bad trace, caps mismatch) or completed with op errors
+      (including a latency sample outside the histogram's trackable range)
   2   usage error or I/O failure
 `
 
@@ -286,8 +287,16 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	if res.Fidelity.LowFidelity {
 		fmt.Fprintf(stderr, "ioflux run: warning: low-fidelity replay: %s\n", res.Fidelity.LowFidelityReason)
 	}
+	invalid := false
 	if res.Errors > 0 {
 		fmt.Fprintf(stderr, "ioflux run: %d op(s) failed; see results.errors\n", res.Errors)
+		invalid = true
+	}
+	if res.HistogramOverflows > 0 {
+		fmt.Fprintf(stderr, "ioflux run: %d latency sample(s) exceeded the histogram's trackable range and were excluded from every percentile; see results.histogram_overflows\n", res.HistogramOverflows)
+		invalid = true
+	}
+	if invalid {
 		return 1
 	}
 	return 0

@@ -374,6 +374,54 @@ func TestReportCmd_ErrorsReportedAsWarning(t *testing.T) {
 	}
 }
 
+func TestReportCmd_HistogramOverflowInvalidatesExecution(t *testing.T) {
+	res := makeTestResults()
+	res.HistogramOverflows = 2
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, _ := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0 (report just prints, does not re-evaluate)", code)
+	}
+	if !strings.Contains(out, "Execution: INVALID — 2 latency sample(s) exceeded the histogram's trackable range") {
+		t.Errorf("output should give a histogram overflow an explicit invalid execution verdict; got:\n%s", out)
+	}
+	if !strings.Contains(out, "2 histogram overflow(s)") {
+		t.Errorf("output should warn about the histogram overflow; got:\n%s", out)
+	}
+}
+
+func TestReportCmd_ErrorsAndHistogramOverflowBothInvalidate(t *testing.T) {
+	res := makeTestResults()
+	res.Errors = 1
+	res.HistogramOverflows = 1
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, _ := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	if !strings.Contains(out, "Execution: INVALID — 1 operation failure(s); 1 latency sample(s) exceeded the histogram's trackable range") {
+		t.Errorf("output should combine both invalidating reasons; got:\n%s", out)
+	}
+}
+
 func TestReportCmd_Stdin(t *testing.T) {
 	res := makeTestResults()
 	data, err := json.Marshal(res)

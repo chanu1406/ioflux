@@ -22,13 +22,14 @@ type RecorderSnapshot struct {
 	CompletionLagHist *HistSnapshot                 `json:"completion_lag_hist,omitempty"`
 	Counts            map[trace.OpKind]int64        `json:"counts,omitempty"`
 
-	Bytes            int64 `json:"bytes"`
-	Errors           int64 `json:"errors"`
-	ShortReads       int64 `json:"short_reads"`
-	BacklogEvents    int64 `json:"backlog_events"`
-	BacklogBlockedNS int64 `json:"backlog_blocked_ns"`
-	MaxInflightDepth int64 `json:"max_inflight_depth"`
-	PeakInflight     int64 `json:"peak_inflight"`
+	Bytes              int64 `json:"bytes"`
+	Errors             int64 `json:"errors"`
+	ShortReads         int64 `json:"short_reads"`
+	HistogramOverflows int64 `json:"histogram_overflows"`
+	BacklogEvents      int64 `json:"backlog_events"`
+	BacklogBlockedNS   int64 `json:"backlog_blocked_ns"`
+	MaxInflightDepth   int64 `json:"max_inflight_depth"`
+	PeakInflight       int64 `json:"peak_inflight"`
 }
 
 // Export returns a lossless snapshot of h. Trailing zero buckets are trimmed:
@@ -91,16 +92,17 @@ func (r *Recorder) Export() RecorderSnapshot {
 		return RecorderSnapshot{}
 	}
 	s := RecorderSnapshot{
-		Histograms:        make(map[trace.OpKind]HistSnapshot, len(r.hists)),
-		ServiceHistograms: make(map[trace.OpKind]HistSnapshot, len(r.serviceHists)),
-		Counts:            make(map[trace.OpKind]int64, len(r.counts)),
-		Bytes:             r.Bytes,
-		Errors:            r.Errors,
-		ShortReads:        r.ShortReads,
-		BacklogEvents:     r.BacklogEvents,
-		BacklogBlockedNS:  r.BacklogBlockedNS,
-		MaxInflightDepth:  r.MaxInflightDepth,
-		PeakInflight:      r.PeakInflight,
+		Histograms:         make(map[trace.OpKind]HistSnapshot, len(r.hists)),
+		ServiceHistograms:  make(map[trace.OpKind]HistSnapshot, len(r.serviceHists)),
+		Counts:             make(map[trace.OpKind]int64, len(r.counts)),
+		Bytes:              r.Bytes,
+		Errors:             r.Errors,
+		ShortReads:         r.ShortReads,
+		HistogramOverflows: r.HistogramOverflows,
+		BacklogEvents:      r.BacklogEvents,
+		BacklogBlockedNS:   r.BacklogBlockedNS,
+		MaxInflightDepth:   r.MaxInflightDepth,
+		PeakInflight:       r.PeakInflight,
 	}
 	for kind, h := range r.hists {
 		s.Histograms[kind] = h.Export()
@@ -128,6 +130,7 @@ func ImportRecorder(s RecorderSnapshot) *Recorder {
 	r.Bytes = s.Bytes
 	r.Errors = s.Errors
 	r.ShortReads = s.ShortReads
+	r.HistogramOverflows = s.HistogramOverflows
 	r.BacklogEvents = s.BacklogEvents
 	r.BacklogBlockedNS = s.BacklogBlockedNS
 	r.MaxInflightDepth = s.MaxInflightDepth

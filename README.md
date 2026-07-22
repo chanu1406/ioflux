@@ -23,7 +23,9 @@ IOFlux is useful today for controlled experiments and simple, synchronous,
 same-domain replays. It is not yet a production-qualified benchmark for storage
 purchasing, capacity planning, or whole-application reproduction. In particular,
 imported traces retain capture-method limitations, short transfers make a run
-fail, and saved reports identify detected operation failures as invalid
+fail, a latency sample outside the histogram's 100s trackable range (e.g. a
+hang or stall) also fails the run instead of silently vanishing from every
+percentile, and saved reports identify detected operation failures as invalid
 execution. Importer loss manifests, environment comparability, result-schema
 versioning, and full workload qualification are still in progress.
 

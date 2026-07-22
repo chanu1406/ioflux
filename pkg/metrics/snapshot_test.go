@@ -75,6 +75,7 @@ func snapshotRecorder(seed int64) *metrics.Recorder {
 	r.BacklogBlockedNS = 123_456 + seed
 	r.MaxInflightDepth = 5
 	r.PeakInflight = 1
+	r.Record(trace.OpRead, 200_000_000_000, 0, false) // one overflowing sample
 	return r
 }
 
@@ -85,6 +86,9 @@ func assertRecorderCounters(t *testing.T, got, want *metrics.Recorder) {
 	}
 	if got.Errors != want.Errors {
 		t.Fatalf("Errors=%d, want %d", got.Errors, want.Errors)
+	}
+	if got.HistogramOverflows != want.HistogramOverflows {
+		t.Fatalf("HistogramOverflows=%d, want %d", got.HistogramOverflows, want.HistogramOverflows)
 	}
 	if got.BacklogEvents != want.BacklogEvents {
 		t.Fatalf("BacklogEvents=%d, want %d", got.BacklogEvents, want.BacklogEvents)

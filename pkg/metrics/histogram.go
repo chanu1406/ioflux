@@ -21,14 +21,17 @@ func New() *Histogram {
 	return &Histogram{h: hdrhistogram.New(minLatencyNS, maxLatencyNS, sigFigs)}
 }
 
-// RecordValue records one latency sample in nanoseconds. Values below
-// minLatencyNS are clamped to minLatencyNS so they stay within the histogram's
-// trackable range.
-func (h *Histogram) RecordValue(ns int64) {
+// RecordValue records one latency sample in nanoseconds and reports whether it
+// was recorded. Values below minLatencyNS are clamped to minLatencyNS so they
+// stay within the histogram's trackable range. Values above maxLatencyNS
+// cannot be clamped without corrupting the percentile distribution, so
+// RecordValue returns false instead of silently dropping the sample; callers
+// must count and surface that as a histogram overflow rather than ignore it.
+func (h *Histogram) RecordValue(ns int64) bool {
 	if ns < minLatencyNS {
 		ns = minLatencyNS
 	}
-	_ = h.h.RecordValue(ns)
+	return h.h.RecordValue(ns) == nil
 }
 
 // Merge adds all samples from other into h without losing histogram precision.

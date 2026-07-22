@@ -117,18 +117,24 @@ type StragglerWindow struct {
 
 // Results is the full output of a replay run written to results.json.
 type Results struct {
-	GeneratedAt      string       `json:"generated_at"`
-	Plan             PlanInfo     `json:"plan"`
-	RunEnv           RunEnv       `json:"run_env"`
-	DurationNS       int64        `json:"duration_ns"`
-	OpsCompleted     int64        `json:"ops_completed"`
-	BytesMoved       int64        `json:"bytes_moved"`
-	Errors           int64        `json:"errors"`
-	ShortReads       int64        `json:"short_reads,omitempty"`
-	PerOpStats       []PerOpStats `json:"per_op_stats"`
-	ServiceTimeStats []PerOpStats `json:"service_time_stats,omitempty"`
-	BacklogEvents    int64        `json:"backlog_events"`
-	BacklogBlockedNS int64        `json:"backlog_blocked_ns"`
+	GeneratedAt  string   `json:"generated_at"`
+	Plan         PlanInfo `json:"plan"`
+	RunEnv       RunEnv   `json:"run_env"`
+	DurationNS   int64    `json:"duration_ns"`
+	OpsCompleted int64    `json:"ops_completed"`
+	BytesMoved   int64    `json:"bytes_moved"`
+	Errors       int64    `json:"errors"`
+	ShortReads   int64    `json:"short_reads,omitempty"`
+	// HistogramOverflows counts latency samples that exceeded the histogram's
+	// 100s trackable range and were excluded from every percentile in
+	// PerOpStats/ServiceTimeStats. The underlying op still completed and is
+	// included in OpsCompleted; only its latency sample was lost. A nonzero
+	// value means the reported percentiles cannot be trusted as complete.
+	HistogramOverflows int64        `json:"histogram_overflows,omitempty"`
+	PerOpStats         []PerOpStats `json:"per_op_stats"`
+	ServiceTimeStats   []PerOpStats `json:"service_time_stats,omitempty"`
+	BacklogEvents      int64        `json:"backlog_events"`
+	BacklogBlockedNS   int64        `json:"backlog_blocked_ns"`
 	// MaxInflightDepth is the peak concurrent in-flight op count.
 	MaxInflightDepth int64                   `json:"max_backlog_depth"`
 	ScheduleDrift    DriftStats              `json:"schedule_drift"`
@@ -182,20 +188,21 @@ func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64
 		}
 	}
 	r := &Results{
-		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
-		Plan:              plan,
-		RunEnv:            runEnv,
-		DurationNS:        durationNS,
-		OpsCompleted:      rec.TotalOps(),
-		BytesMoved:        rec.Bytes,
-		Errors:            rec.Errors,
-		ShortReads:        rec.ShortReads,
-		PerOpStats:        stats,
-		ServiceTimeStats:  serviceStats,
-		BacklogEvents:     rec.BacklogEvents,
-		BacklogBlockedNS:  rec.BacklogBlockedNS,
-		MaxInflightDepth:  rec.MaxInflightDepth,
-		HistogramSnapshot: rec.Export(),
+		GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
+		Plan:               plan,
+		RunEnv:             runEnv,
+		DurationNS:         durationNS,
+		OpsCompleted:       rec.TotalOps(),
+		BytesMoved:         rec.Bytes,
+		Errors:             rec.Errors,
+		ShortReads:         rec.ShortReads,
+		HistogramOverflows: rec.HistogramOverflows,
+		PerOpStats:         stats,
+		ServiceTimeStats:   serviceStats,
+		BacklogEvents:      rec.BacklogEvents,
+		BacklogBlockedNS:   rec.BacklogBlockedNS,
+		MaxInflightDepth:   rec.MaxInflightDepth,
+		HistogramSnapshot:  rec.Export(),
 	}
 	if dh := rec.DriftHist; dh != nil {
 		r.ScheduleDrift = DriftStats{
