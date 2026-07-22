@@ -294,7 +294,10 @@ func (m *materializeFromSource) Prepare(ctx context.Context, targets, originalTa
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		srcPath := filepath.Join(m.root, originalTargets[i].Name)
+		srcPath, err := resolveSourcePath(m.root, originalTargets[i].Name)
+		if err != nil {
+			return stats, fmt.Errorf("prepare: materialize-from-source: %w", err)
+		}
 		if err := copyTarget(ctx, eng, tgt.Name, srcPath, buf); err != nil {
 			return stats, fmt.Errorf("prepare: materialize-from-source: %w", err)
 		}
@@ -302,6 +305,19 @@ func (m *materializeFromSource) Prepare(ctx context.Context, targets, originalTa
 	}
 	stats.TouchedSameData = true
 	return stats, nil
+}
+
+// resolveSourcePath joins root with a trace-supplied target name and rejects
+// the result unless name is a safe relative path under root. name comes from
+// the trace's target table, which may be an imported or hand-edited file, so
+// an absolute path or a "../" sequence must not let materialize-from-source
+// read (and then replay-serve) a file outside --source-root.
+func resolveSourcePath(root, name string) (string, error) {
+	if !filepath.IsLocal(name) {
+		return "", fmt.Errorf("target %q is not a safe relative path under --source-root %q "+
+			"(absolute paths and \"..\" traversal are rejected)", name, root)
+	}
+	return filepath.Join(root, name), nil
 }
 
 func copyTarget(ctx context.Context, eng engine.Engine, name, srcPath string, buf []byte) error {

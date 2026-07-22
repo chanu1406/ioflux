@@ -395,6 +395,68 @@ func TestMaterializeFromSource_CopiesContent(t *testing.T) {
 	_ = tgts // suppress unused warning
 }
 
+// TestMaterializeFromSource_RejectsPathTraversal verifies that a trace target
+// name using ".." to walk out of --source-root is rejected rather than
+// silently read from outside the configured root. secret sits next to srcDir
+// but is not under it; a name like "../secret.txt" must not reach it.
+func TestMaterializeFromSource_RejectsPathTraversal(t *testing.T) {
+	parent := t.TempDir()
+	srcDir := filepath.Join(parent, "source-root")
+	if err := os.Mkdir(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretPath := filepath.Join(parent, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("outside the root"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tgts := []trace.TargetInfo{{ID: 0, Name: "../secret.txt", Kind: trace.TargetFile}}
+	prep, err := prepare.For(prepare.ModeMaterializeFromSource, srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dstDir := t.TempDir()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dstDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	_, err = prep.Prepare(context.Background(), tgts, nil, nil, localfile.New())
+	if err == nil {
+		t.Fatal("Prepare should reject a target name that traverses outside --source-root")
+	}
+	if !strings.Contains(err.Error(), "not a safe relative path") {
+		t.Errorf("error should explain the rejection, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dstDir, "..", "secret.txt")); statErr == nil {
+		t.Error("traversal target should not have been copied anywhere reachable from dstDir")
+	}
+}
+
+// TestMaterializeFromSource_RejectsAbsoluteTargetName verifies that an
+// absolute-looking target name is rejected rather than silently reinterpreted
+// relative to --source-root.
+func TestMaterializeFromSource_RejectsAbsoluteTargetName(t *testing.T) {
+	srcDir := t.TempDir()
+	tgts := []trace.TargetInfo{{ID: 0, Name: "/etc/passwd", Kind: trace.TargetFile}}
+	prep, err := prepare.For(prepare.ModeMaterializeFromSource, srcDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = prep.Prepare(context.Background(), tgts, nil, nil, localfile.New())
+	if err == nil {
+		t.Fatal("Prepare should reject an absolute target name")
+	}
+	if !strings.Contains(err.Error(), "not a safe relative path") {
+		t.Errorf("error should explain the rejection, got: %v", err)
+	}
+}
+
 func TestMaterializeFromSource_RejectsMissingSource(t *testing.T) {
 	tgts := []trace.TargetInfo{{ID: 0, Name: "nonexistent.tar", Kind: trace.TargetFile}}
 	prep, err := prepare.For(prepare.ModeMaterializeFromSource, "/nonexistent-source-root")
