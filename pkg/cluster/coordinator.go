@@ -298,6 +298,7 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 		PrepareCopied:             prep.PrepStats.Copied,
 		PrepareSkippedSizeUnknown: prep.PrepStats.SkippedSizeUnknown,
 		PrepareDerivedSizeFromOps: prep.PrepStats.DerivedSizeFromOps,
+		ReplayEquivalence:         prep.ReplayEquivalence,
 	}
 	runEnv := results.RunEnv{
 		CacheMode:        plan.CacheMode,

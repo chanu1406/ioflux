@@ -13,7 +13,13 @@ import (
 // 0.2.0: PrepareStream chunked trace transfer; the plan gained prepare_scope
 // and fill_mode/fill_seed, which an 0.1.0 worker would silently ignore while
 // the coordinator records them as applied.
-const Version = "0.2.0"
+//
+// 0.3.0: PrepareAck gained replay_equivalence and RecorderSnapshot gained
+// histogram_overflows. Both are evidence a 0.2.0 worker cannot send, and their
+// absence reads as "exact replay" and "no lost latency samples" — the two
+// answers most likely to make an invalid run look green. Rejecting the older
+// worker is the only way absence stays distinguishable from a real negative.
+const Version = "0.3.0"
 
 const (
 	PrepareScopeShared    = "shared"
@@ -91,4 +97,10 @@ type WorkerInfo struct {
 type PrepareResult struct {
 	PrepStats   prepare.Stats
 	CacheResult cache.Result
+	// ReplayEquivalence is how faithfully this worker will replay the trace
+	// (results.EquivalenceSyscallLevel or results.EquivalenceObjectLevel),
+	// decided at PREPARE. Every worker parses the same trace against the same
+	// engine spec, so workers agree; the coordinator records the representative
+	// copy alongside the other prepare metadata.
+	ReplayEquivalence string
 }

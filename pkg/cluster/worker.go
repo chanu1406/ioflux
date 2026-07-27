@@ -150,7 +150,11 @@ func (s *Session) PrepareReader(ctx context.Context, p Plan, traceData io.Reader
 	// containment root directory handle) rather than accumulating them.
 	shutdownEngine(prev)
 
-	return PrepareResult{PrepStats: prepStats, CacheResult: cacheRes}, nil
+	return PrepareResult{
+		PrepStats:         prepStats,
+		CacheResult:       cacheRes,
+		ReplayEquivalence: exec.ReplayEquivalence(),
+	}, nil
 }
 
 // shutdownEngine releases engine-held OS resources when the engine supports it.

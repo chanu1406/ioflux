@@ -855,3 +855,126 @@ func TestRunCmd_TargetRootCheckedBeforeCacheControls(t *testing.T) {
 		t.Fatalf("stderr should explain the containment rejection, got %q", stderr)
 	}
 }
+
+// TestRunCmd_RecordsSyscallLevelEquivalence verifies a faithful op-for-op
+// replay is labeled as such in results.json. The classification is decided on
+// the worker and must reach the coordinator's PlanInfo; when that plumbing was
+// missing the field was simply absent, which reads the same as a run whose
+// semantics were never examined.
+func TestRunCmd_RecordsSyscallLevelEquivalence(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "scratch")
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(dir, "results.json")
+	oneTargetReadTrace(t, tracePath, filepath.Join(root, "shard.dat"), 4096)
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--target-root", root,
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	res := decodeResults(t, resultsPath)
+	if res.Plan.ReplayEquivalence != results.EquivalenceSyscallLevel {
+		t.Fatalf("replay_equivalence=%q, want %q",
+			res.Plan.ReplayEquivalence, results.EquivalenceSyscallLevel)
+	}
+}
+
+// TestRunCmd_RecordsObjectLevelEquivalence is the regression test for the
+// mislabeling that mattered: replaying a checkpoint-write trace against an
+// object store coalesces each file's WRITE ops into one whole-object PUT. That
+// is a transformation, not a replay, and the result must say so — otherwise the
+// comparator cannot warn when it is diffed against a syscall-level run.
+func TestRunCmd_RecordsObjectLevelEquivalence(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "ckpt.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"checkpoint-write",
+		"--model-size", "64KiB",
+		"--writer-ranks", "2",
+		"--write-block", "16KiB",
+		"--fsync", "per-file",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen checkpoint-write exit=%d, stderr=%s", code, stderr)
+	}
+	if err := os.WriteFile(mapPath,
+		[]byte("target_rewrite:\n  - from: \"\"\n    to: \"s3://bench/ckpt/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	objects := make(map[string][]byte)
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/bench/") {
+			http.NotFound(w, r)
+			return
+		}
+		key := strings.TrimPrefix(r.URL.Path, "/bench/")
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			objects[key] = body
+			mu.Unlock()
+			w.Header().Set("ETag", `"put"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			mu.Lock()
+			body, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"--endpoint", srv.URL,
+		"--bucket", "bench",
+		"--path-style",
+		"--access-key", "test-access",
+		"--secret-key", "test-secret",
+		"--target-map", mapPath,
+		"--mode", "asap",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun s3 checkpoint exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+
+	res := decodeResults(t, resultsPath)
+	if res.Plan.ReplayEquivalence != results.EquivalenceObjectLevel {
+		t.Fatalf("replay_equivalence=%q, want %q — a coalesced-PUT replay must not be "+
+			"reported as an exact one", res.Plan.ReplayEquivalence, results.EquivalenceObjectLevel)
+	}
+
+	// Sanity-check that the writes really were coalesced: one PUT per rank shard,
+	// not one per WRITE op.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(objects) != 2 {
+		t.Fatalf("expected one coalesced PUT per writer rank, got %d objects (%v)",
+			len(objects), objects)
+	}
+}

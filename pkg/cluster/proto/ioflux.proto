@@ -114,6 +114,12 @@ message CacheResult {
 message PrepareAck {
   PrepStats prep_stats = 1;
   CacheResult cache_result = 2;
+  // replay_equivalence classifies how faithfully this worker will replay the
+  // trace, decided at PREPARE: "syscall-level" for an op-for-op replay, or
+  // "object-level" when write ops are coalesced into whole-object PUTs because
+  // the backend cannot replay offset writes. The coordinator records it in the
+  // result so a transformed replay is never reported as an exact one.
+  string replay_equivalence = 3;
 }
 
 // GoSignal starts the RUN phase. go_epoch_ns is the coordinator's logical T0 in
@@ -160,6 +166,11 @@ message RecorderSnapshot {
   int64 peak_inflight = 10;
   map<string, HistSnapshot> service_histograms = 11;
   int64 short_reads = 12;
+  // histogram_overflows counts latency samples past the histogram's trackable
+  // range, which were excluded from every percentile. A nonzero value
+  // invalidates the run, so it must survive the trip to the coordinator or a
+  // remote worker's hung op would vanish from an otherwise green report.
+  int64 histogram_overflows = 13;
 }
 
 // CPU mirrors results.CPU.

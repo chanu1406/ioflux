@@ -318,6 +318,22 @@ func checkOpCaps(op trace.Op, caps engine.Capabilities) error {
 // Header returns the trace header parsed during Prepare.
 func (e *Executor) Header() trace.Header { return e.hdr }
 
+// ReplayEquivalence classifies how faithfully this executor reproduces the
+// trace, decided during Prepare: results.EquivalenceObjectLevel when write ops
+// were coalesced into whole-object PUTs because the backend cannot replay
+// offset writes, otherwise results.EquivalenceSyscallLevel.
+//
+// It is exported because the classification must reach the result whichever way
+// the run was driven — Run for an in-process replay, or a worker reporting it
+// to a coordinator at PREPARE. Deriving both from here keeps the two paths from
+// disagreeing about what a run actually did.
+func (e *Executor) ReplayEquivalence() string {
+	if len(e.objectWriteSizes) > 0 {
+		return results.EquivalenceObjectLevel
+	}
+	return results.EquivalenceSyscallLevel
+}
+
 // Run executes the replay and returns Results. Supported modes: "asap",
 // "timeline", "scaled".
 func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
@@ -356,10 +372,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		PrepareCopied:             e.prepStats.Copied,
 		PrepareSkippedSizeUnknown: e.prepStats.SkippedSizeUnknown,
 		PrepareDerivedSizeFromOps: e.prepStats.DerivedSizeFromOps,
-		ReplayEquivalence:         "syscall-level",
-	}
-	if len(e.objectWriteSizes) > 0 {
-		planInfo.ReplayEquivalence = "object-level"
+		ReplayEquivalence:         e.ReplayEquivalence(),
 	}
 	runEnv := results.RunEnv{
 		CacheMode:        e.plan.CacheMode,

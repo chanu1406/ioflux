@@ -161,6 +161,7 @@ func prepareAckToProto(r PrepareResult) *clusterpb.PrepareAck {
 			Limitations: r.CacheResult.Limitations,
 			Primed:      int32(r.CacheResult.Primed),
 		},
+		ReplayEquivalence: r.ReplayEquivalence,
 	}
 }
 
@@ -169,6 +170,7 @@ func prepareAckFromProto(pb *clusterpb.PrepareAck) PrepareResult {
 		return PrepareResult{}
 	}
 	var r PrepareResult
+	r.ReplayEquivalence = pb.GetReplayEquivalence()
 	if ps := pb.GetPrepStats(); ps != nil {
 		r.PrepStats = prepare.Stats{
 			Verified:           int(ps.GetVerified()),
@@ -254,29 +256,20 @@ func progressPointsFromProto(points []*clusterpb.ProgressPoint) []results.Progre
 }
 
 // --- RecorderSnapshot / HistSnapshot ---
-//
-// Known gap: clusterpb.RecorderSnapshot does not carry
-// metrics.RecorderSnapshot.HistogramOverflows, so a remote gRPC worker's
-// histogram-overflow count is lost when its output crosses the wire to the
-// coordinator (in-process single-node runs are unaffected — they never
-// serialize through this path). Fixing this requires regenerating
-// ioflux.pb.go from ioflux.proto (buf + protoc-gen-go/-grpc), which this
-// environment does not have available. Distributed mode is already
-// documented as experimental and unqualified; this is an additional known
-// limitation of that path, not a silent one.
 
 func recorderSnapshotToProto(s metrics.RecorderSnapshot) *clusterpb.RecorderSnapshot {
 	pb := &clusterpb.RecorderSnapshot{
-		Histograms:        make(map[string]*clusterpb.HistSnapshot, len(s.Histograms)),
-		Counts:            make(map[string]int64, len(s.Counts)),
-		Bytes:             s.Bytes,
-		Errors:            s.Errors,
-		BacklogEvents:     s.BacklogEvents,
-		BacklogBlockedNs:  s.BacklogBlockedNS,
-		MaxInflightDepth:  s.MaxInflightDepth,
-		PeakInflight:      s.PeakInflight,
-		ShortReads:        s.ShortReads,
-		ServiceHistograms: make(map[string]*clusterpb.HistSnapshot, len(s.ServiceHistograms)),
+		Histograms:         make(map[string]*clusterpb.HistSnapshot, len(s.Histograms)),
+		Counts:             make(map[string]int64, len(s.Counts)),
+		Bytes:              s.Bytes,
+		Errors:             s.Errors,
+		BacklogEvents:      s.BacklogEvents,
+		BacklogBlockedNs:   s.BacklogBlockedNS,
+		MaxInflightDepth:   s.MaxInflightDepth,
+		PeakInflight:       s.PeakInflight,
+		ShortReads:         s.ShortReads,
+		HistogramOverflows: s.HistogramOverflows,
+		ServiceHistograms:  make(map[string]*clusterpb.HistSnapshot, len(s.ServiceHistograms)),
 	}
 	for kind, h := range s.Histograms {
 		pb.Histograms[string(kind)] = histSnapshotToProto(h)
@@ -308,6 +301,7 @@ func recorderSnapshotFromProto(pb *clusterpb.RecorderSnapshot) metrics.RecorderS
 	s.Bytes = pb.GetBytes()
 	s.Errors = pb.GetErrors()
 	s.ShortReads = pb.GetShortReads()
+	s.HistogramOverflows = pb.GetHistogramOverflows()
 	s.BacklogEvents = pb.GetBacklogEvents()
 	s.BacklogBlockedNS = pb.GetBacklogBlockedNs()
 	s.MaxInflightDepth = pb.GetMaxInflightDepth()

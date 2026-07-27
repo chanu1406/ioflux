@@ -757,11 +757,17 @@ func (x *CacheResult) GetPrimed() int32 {
 }
 
 type PrepareAck struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PrepStats     *PrepStats             `protobuf:"bytes,1,opt,name=prep_stats,json=prepStats,proto3" json:"prep_stats,omitempty"`
-	CacheResult   *CacheResult           `protobuf:"bytes,2,opt,name=cache_result,json=cacheResult,proto3" json:"cache_result,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	PrepStats   *PrepStats             `protobuf:"bytes,1,opt,name=prep_stats,json=prepStats,proto3" json:"prep_stats,omitempty"`
+	CacheResult *CacheResult           `protobuf:"bytes,2,opt,name=cache_result,json=cacheResult,proto3" json:"cache_result,omitempty"`
+	// replay_equivalence classifies how faithfully this worker will replay the
+	// trace, decided at PREPARE: "syscall-level" for an op-for-op replay, or
+	// "object-level" when write ops are coalesced into whole-object PUTs because
+	// the backend cannot replay offset writes. The coordinator records it in the
+	// result so a transformed replay is never reported as an exact one.
+	ReplayEquivalence string `protobuf:"bytes,3,opt,name=replay_equivalence,json=replayEquivalence,proto3" json:"replay_equivalence,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *PrepareAck) Reset() {
@@ -806,6 +812,13 @@ func (x *PrepareAck) GetCacheResult() *CacheResult {
 		return x.CacheResult
 	}
 	return nil
+}
+
+func (x *PrepareAck) GetReplayEquivalence() string {
+	if x != nil {
+		return x.ReplayEquivalence
+	}
+	return ""
 }
 
 // GoSignal starts the RUN phase. go_epoch_ns is the coordinator's logical T0 in
@@ -1103,8 +1116,13 @@ type RecorderSnapshot struct {
 	PeakInflight      int64                    `protobuf:"varint,10,opt,name=peak_inflight,json=peakInflight,proto3" json:"peak_inflight,omitempty"`
 	ServiceHistograms map[string]*HistSnapshot `protobuf:"bytes,11,rep,name=service_histograms,json=serviceHistograms,proto3" json:"service_histograms,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	ShortReads        int64                    `protobuf:"varint,12,opt,name=short_reads,json=shortReads,proto3" json:"short_reads,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// histogram_overflows counts latency samples past the histogram's trackable
+	// range, which were excluded from every percentile. A nonzero value
+	// invalidates the run, so it must survive the trip to the coordinator or a
+	// remote worker's hung op would vanish from an otherwise green report.
+	HistogramOverflows int64 `protobuf:"varint,13,opt,name=histogram_overflows,json=histogramOverflows,proto3" json:"histogram_overflows,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RecorderSnapshot) Reset() {
@@ -1217,6 +1235,13 @@ func (x *RecorderSnapshot) GetServiceHistograms() map[string]*HistSnapshot {
 func (x *RecorderSnapshot) GetShortReads() int64 {
 	if x != nil {
 		return x.ShortReads
+	}
+	return 0
+}
+
+func (x *RecorderSnapshot) GetHistogramOverflows() int64 {
+	if x != nil {
+		return x.HistogramOverflows
 	}
 	return 0
 }
@@ -1474,12 +1499,13 @@ const file_ioflux_proto_rawDesc = "" +
 	"\vCacheResult\x12\x18\n" +
 	"\aactions\x18\x01 \x03(\tR\aactions\x12 \n" +
 	"\vlimitations\x18\x02 \x03(\tR\vlimitations\x12\x16\n" +
-	"\x06primed\x18\x03 \x01(\x05R\x06primed\"|\n" +
+	"\x06primed\x18\x03 \x01(\x05R\x06primed\"\xab\x01\n" +
 	"\n" +
 	"PrepareAck\x123\n" +
 	"\n" +
 	"prep_stats\x18\x01 \x01(\v2\x14.clusterpb.PrepStatsR\tprepStats\x129\n" +
-	"\fcache_result\x18\x02 \x01(\v2\x16.clusterpb.CacheResultR\vcacheResult\"*\n" +
+	"\fcache_result\x18\x02 \x01(\v2\x16.clusterpb.CacheResultR\vcacheResult\x12-\n" +
+	"\x12replay_equivalence\x18\x03 \x01(\tR\x11replayEquivalence\"*\n" +
 	"\bGoSignal\x12\x1e\n" +
 	"\vgo_epoch_ns\x18\x01 \x01(\x03R\tgoEpochNs\"2\n" +
 	"\bProgress\x12\x10\n" +
@@ -1498,7 +1524,7 @@ const file_ioflux_proto_rawDesc = "" +
 	"\x03low\x18\x01 \x01(\x03R\x03low\x12\x12\n" +
 	"\x04high\x18\x02 \x01(\x03R\x04high\x12\x19\n" +
 	"\bsig_figs\x18\x03 \x01(\x05R\asigFigs\x12\x16\n" +
-	"\x06counts\x18\x04 \x03(\x03R\x06counts\"\xed\x06\n" +
+	"\x06counts\x18\x04 \x03(\x03R\x06counts\"\x9e\a\n" +
 	"\x10RecorderSnapshot\x12K\n" +
 	"\n" +
 	"histograms\x18\x01 \x03(\v2+.clusterpb.RecorderSnapshot.HistogramsEntryR\n" +
@@ -1516,7 +1542,8 @@ const file_ioflux_proto_rawDesc = "" +
 	" \x01(\x03R\fpeakInflight\x12a\n" +
 	"\x12service_histograms\x18\v \x03(\v22.clusterpb.RecorderSnapshot.ServiceHistogramsEntryR\x11serviceHistograms\x12\x1f\n" +
 	"\vshort_reads\x18\f \x01(\x03R\n" +
-	"shortReads\x1aV\n" +
+	"shortReads\x12/\n" +
+	"\x13histogram_overflows\x18\r \x01(\x03R\x12histogramOverflows\x1aV\n" +
 	"\x0fHistogramsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12-\n" +
 	"\x05value\x18\x02 \x01(\v2\x17.clusterpb.HistSnapshotR\x05value:\x028\x01\x1a9\n" +

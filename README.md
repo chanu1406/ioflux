@@ -25,9 +25,12 @@ purchasing, capacity planning, or whole-application reproduction. In particular,
 imported traces retain capture-method limitations, short transfers make a run
 fail, a latency sample outside the histogram's 100s trackable range (e.g. a
 hang or stall) also fails the run instead of silently vanishing from every
-percentile, and saved reports identify detected operation failures as invalid
-execution. Importer loss manifests, environment comparability, result-schema
-versioning, and full workload qualification are still in progress.
+percentile, saved reports identify detected operation failures as invalid
+execution, and every run records whether it was an exact op-for-op replay or a
+transformation of the trace (`replay_equivalence`), so a comparison between the
+two is flagged rather than presented as a backend difference. Importer loss
+manifests, environment comparability, result-schema versioning, and full
+workload qualification are still in progress.
 
 Target names come from the trace, which is imported or hand-edited input, so
 `--target-root` confines the local engine to one directory: replay and dataset
@@ -203,6 +206,12 @@ not a qualified production distributed benchmark: placement semantics, clock
 and start-skew calibration, authentication, partial evidence, and real
 multi-host qualification remain incomplete. Omitting `--hosts` runs single-node
 through the same code path via one in-process worker.
+
+Coordinator and workers must be the same build: a worker whose protocol version
+differs is rejected at registration rather than run. The check exists because a
+worker predating a protocol field cannot send it, and a missing field reads as a
+benign default — "exact replay", "no lost latency samples" — which is exactly
+how an invalid run would look green.
 
 > **Security:** the coordinator/worker gRPC transport is plaintext and
 > unauthenticated, and the plan it sends carries the trace bytes and any S3

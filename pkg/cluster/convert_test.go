@@ -4,9 +4,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/chanuollala/ioflux/pkg/cache"
 	clusterpb "github.com/chanuollala/ioflux/pkg/cluster/proto"
 	s3engine "github.com/chanuollala/ioflux/pkg/engine/s3"
 	"github.com/chanuollala/ioflux/pkg/metrics"
+	"github.com/chanuollala/ioflux/pkg/prepare"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/results"
 	"github.com/chanuollala/ioflux/pkg/targetmap"
@@ -88,6 +90,7 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	rec.MaxInflightDepth = 9
 	rec.PeakInflight = 1
 	rec.ShortReads = 2
+	rec.HistogramOverflows = 4
 
 	wire, err := proto.Marshal(recorderSnapshotToProto(rec.Export()))
 	if err != nil {
@@ -110,6 +113,11 @@ func TestRecorderSnapshotProtoRoundTrip(t *testing.T) {
 	}
 	if got.ShortReads != rec.ShortReads {
 		t.Errorf("ShortReads=%d, want %d", got.ShortReads, rec.ShortReads)
+	}
+	// A lost latency sample invalidates the run, so losing the count on the wire
+	// would let a remote worker's hung op vanish from an otherwise green report.
+	if got.HistogramOverflows != rec.HistogramOverflows {
+		t.Errorf("HistogramOverflows=%d, want %d", got.HistogramOverflows, rec.HistogramOverflows)
 	}
 	if got.BacklogEvents != rec.BacklogEvents || got.BacklogBlockedNS != rec.BacklogBlockedNS {
 		t.Errorf("backlog counters mismatch: got (%d,%d) want (%d,%d)",
@@ -176,5 +184,44 @@ func TestWorkerOutputProtoRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.TimeSeries, out.TimeSeries) {
 		t.Errorf("TimeSeries=%v, want %v", got.TimeSeries, out.TimeSeries)
+	}
+}
+
+// TestPrepareAckProtoRoundTrip checks that a worker's PREPARE evidence survives
+// the wire, including the replay-equivalence classification. Losing it would
+// read as "field not recorded", which the report renders identically to a run
+// whose semantics were never transformed.
+func TestPrepareAckProtoRoundTrip(t *testing.T) {
+	want := PrepareResult{
+		PrepStats: prepare.Stats{
+			Verified: 1, Created: 2, Copied: 3,
+			SkippedSizeUnknown: 4, DerivedSizeFromOps: 5, TouchedSameData: true,
+		},
+		CacheResult: cache.Result{
+			Actions:     []string{"cold: fadvised DONTNEED"},
+			Limitations: []string{"cold: metadata caches out of reach"},
+			Primed:      7,
+		},
+		ReplayEquivalence: results.EquivalenceObjectLevel,
+	}
+
+	wire, err := proto.Marshal(prepareAckToProto(want))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	pb := &clusterpb.PrepareAck{}
+	if err := proto.Unmarshal(wire, pb); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got := prepareAckFromProto(pb)
+
+	if got.ReplayEquivalence != want.ReplayEquivalence {
+		t.Errorf("ReplayEquivalence=%q, want %q", got.ReplayEquivalence, want.ReplayEquivalence)
+	}
+	if got.PrepStats != want.PrepStats {
+		t.Errorf("PrepStats=%+v, want %+v", got.PrepStats, want.PrepStats)
+	}
+	if got.CacheResult.Primed != want.CacheResult.Primed {
+		t.Errorf("CacheResult.Primed=%d, want %d", got.CacheResult.Primed, want.CacheResult.Primed)
 	}
 }

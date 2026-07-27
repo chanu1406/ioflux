@@ -12,6 +12,18 @@ import (
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
+// Replay-equivalence classifications recorded in PlanInfo.ReplayEquivalence.
+// They answer whether a result may be read as an exact replay of the trace or
+// only as a transformation of it, so the two are never compared as if they were
+// the same experiment.
+const (
+	// EquivalenceSyscallLevel marks a faithful op-for-op replay.
+	EquivalenceSyscallLevel = "syscall-level"
+	// EquivalenceObjectLevel marks a replay whose write ops were coalesced into
+	// one whole-object PUT because the backend cannot replay offset writes.
+	EquivalenceObjectLevel = "object-level"
+)
+
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
 	TracePath                 string  `json:"trace_path"`
