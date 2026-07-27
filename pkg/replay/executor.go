@@ -108,6 +108,15 @@ func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStrea
 		hdr.Targets = rewritten
 	}
 
+	// Gate the whole rewritten target table against the engine's containment
+	// root before any phase touches the filesystem. Preparation and cache
+	// controls reach targets by paths the engine never sees (a source-tree copy,
+	// an fadvise open), so checking here — not only on the first engine call —
+	// is what makes containment cover the entire run.
+	if err := checkTargetContainment(plan.Engine, hdr.Targets); err != nil {
+		return nil, fmt.Errorf("replay: prepare: %w", err)
+	}
+
 	caps := plan.Engine.Caps()
 	prepMeta := prepare.Metadata{
 		Extents: make(map[int]int64),
@@ -239,6 +248,22 @@ func (e *Executor) Materialize(ctx context.Context) (prepare.Stats, error) {
 	}
 	e.materialized = true
 	return e.prepStats, nil
+}
+
+// checkTargetContainment rejects the run when any target escapes the engine's
+// configured containment root. Engines that apply no containment do not
+// implement engine.TargetChecker, so this is a no-op for them.
+func checkTargetContainment(eng engine.Engine, targets []trace.TargetInfo) error {
+	checker, ok := eng.(engine.TargetChecker)
+	if !ok {
+		return nil
+	}
+	for _, tgt := range targets {
+		if err := checker.CheckTarget(tgt.Name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func formatValidationErrors(rep trace.Report) string {

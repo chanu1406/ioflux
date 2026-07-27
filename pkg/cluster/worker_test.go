@@ -3,6 +3,10 @@ package cluster_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,4 +160,59 @@ func TestSession_RunBeforePrepare(t *testing.T) {
 	if _, err := s.Collect(); err == nil {
 		t.Fatal("Collect before Run succeeded, want error")
 	}
+}
+
+// TestSessionWorkerRootOverridesPlan verifies that a worker's own containment
+// root wins over the coordinator's plan. The root is worker-local policy on
+// purpose: a coordinator must not be able to widen what a worker's host exposes.
+func TestSessionWorkerRootOverridesPlan(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "allowed")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "precious.dat")
+	original := []byte("data the coordinator must not reach")
+	if err := os.WriteFile(outside, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	traceBytes := readTraceForTarget(t, outside, int64(len(original)))
+	plan := cluster.Plan{
+		TracePath:       "test.ioflux",
+		TraceBytes:      traceBytes,
+		AssignedStreams: []int64{0},
+		// The plan asks for an unconfined local engine; the worker refuses.
+		Engine:      cluster.EngineSpec{Name: "local"},
+		Mode:        "asap",
+		MaxInflight: 512,
+		PrepareMode: "materialize-synthetic",
+	}
+
+	s := cluster.NewSessionWithRoot(root)
+	_, err := s.Prepare(context.Background(), plan)
+	if err == nil {
+		t.Fatal("Prepare succeeded against a target outside the worker's root; want rejection")
+	}
+	if !strings.Contains(err.Error(), "outside the configured root") {
+		t.Fatalf("Prepare err=%v, want an outside-root rejection", err)
+	}
+	got, readErr := os.ReadFile(outside)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("worker preparation overwrote a file outside its root: got %q, want %q", got, original)
+	}
+}
+
+// readTraceForTarget builds a minimal one-target write trace naming target.
+func readTraceForTarget(t *testing.T, target string, size int64) []byte {
+	t.Helper()
+	return []byte(fmt.Sprintf(
+		`{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","capture_method":"synthetic","scrubbed":false,"targets":[{"id":0,"name":%q,"kind":"file","size":%d}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":%d,"duration_ns":0}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":1,"mode":"r"}
+{"t":1,"op_id":1,"s":0,"op":"READ","h":1,"off":0,"len":%d}
+{"t":2,"op_id":2,"s":0,"op":"CLOSE","h":1}
+`, target, size, size, size))
 }

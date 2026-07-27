@@ -29,7 +29,11 @@ coordinator sends carries the trace and any S3 credentials. Run workers only on 
 trusted network (private subnet, SSH tunnel, or VPN); v1 has no TLS.
 
 Flags:
-  --listen <addr>   Address to listen on (default :7800)
+  --listen <addr>        Address to listen on (default :7800)
+  --target-root <dir>    Confine every local-engine target this worker replays to
+                         this directory, whatever the coordinator's plan asks for.
+                         The root is worker-local policy: the host that owns the data
+                         decides what a plan may touch. Unset means no containment.
 
 Exit codes:
   0   served and shut down cleanly
@@ -42,8 +46,9 @@ func runWorker(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, workerUsage) }
 
-	var listen string
+	var listen, targetRoot string
 	fs.StringVar(&listen, "listen", ":7800", "address to listen on")
+	fs.StringVar(&targetRoot, "target-root", "", "confine every local-engine target to this directory")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -57,7 +62,7 @@ func runWorker(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := serveWorker(ctx, lis, stdout); err != nil {
+	if err := serveWorker(ctx, lis, stdout, targetRoot); err != nil {
 		fmt.Fprintf(stderr, "ioflux worker: %v\n", err)
 		return 2
 	}
@@ -67,12 +72,19 @@ func runWorker(args []string, stdout, stderr io.Writer) int {
 
 // serveWorker runs a gRPC Worker server on lis until ctx is cancelled, then
 // drains in-flight RPCs via GracefulStop. Split out so tests can drive shutdown
-// without sending a real signal.
-func serveWorker(ctx context.Context, lis net.Listener, log io.Writer) error {
+// without sending a real signal. targetRoot, when non-empty, confines every
+// local-engine target this worker replays.
+func serveWorker(ctx context.Context, lis net.Listener, log io.Writer, targetRoot string) error {
 	gs := grpc.NewServer(cluster.ServerOptions()...)
-	cluster.NewServer().RegisterTo(gs)
+	cluster.NewServerWithRoot(targetRoot).RegisterTo(gs)
 
 	fmt.Fprintf(log, "ioflux worker listening on %s (protocol %s)\n", lis.Addr(), cluster.Version)
+	if targetRoot == "" {
+		fmt.Fprintln(log, "ioflux worker: warning: no --target-root; a coordinator's trace can read or "+
+			"overwrite any path its rewritten targets resolve to on this host")
+	} else {
+		fmt.Fprintf(log, "ioflux worker: local-engine targets confined to %s\n", targetRoot)
+	}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()

@@ -43,8 +43,16 @@ type Server struct {
 	leaseDeadline time.Time
 }
 
-// NewServer returns a Server backed by a fresh Session.
-func NewServer() *Server { return &Server{session: NewSession(), runLease: defaultRunLease} }
+// NewServer returns a Server backed by a fresh Session with no target
+// containment.
+func NewServer() *Server { return NewServerWithRoot("") }
+
+// NewServerWithRoot returns a Server whose Session confines every local-engine
+// target to root, whatever the coordinator's plan requests. An empty root
+// applies no containment.
+func NewServerWithRoot(root string) *Server {
+	return &Server{session: NewSessionWithRoot(root), runLease: defaultRunLease}
+}
 
 // acquire reserves the worker for a new run, taking over an abandoned run whose
 // lease has expired. It returns false if a run is actively in progress.

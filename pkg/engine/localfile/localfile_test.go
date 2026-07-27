@@ -1,10 +1,12 @@
 package localfile_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
@@ -306,4 +308,170 @@ func TestLocalFileConcurrentReads(t *testing.T) {
 			t.Errorf("concurrent read error: %v", err)
 		}
 	}
+}
+
+// --- Target-root containment ---
+//
+// A trace's target names are untrusted input (imported from a capture, or
+// hand-edited), and dataset preparation opens write targets with CREATE|TRUNC.
+// An engine confined by WithRoot must therefore refuse an escaping target
+// before it can read or destroy anything outside the root.
+
+// TestOpenRejectsTargetOutsideRoot verifies that a confined engine refuses both
+// a "../" traversal and a bare absolute path, and — the part that actually
+// matters — leaves the file it would have escaped to untouched.
+func TestOpenRejectsTargetOutsideRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "precious.dat")
+	original := []byte("real data that must survive")
+	if err := os.WriteFile(outside, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+
+	for _, target := range []string{
+		filepath.Join(root, "..", "precious.dat"), // traversal out of the root
+		outside, // absolute path outside the root
+	} {
+		h, err := eng.Open(ctx, target, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)
+		if !errors.Is(err, engine.ErrOutsideRoot) {
+			eng.Close(ctx, h)
+			t.Fatalf("Open(%q) err=%v, want engine.ErrOutsideRoot", target, err)
+		}
+	}
+
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("file outside the root was modified: got %q, want %q", got, original)
+	}
+}
+
+// TestStatRejectsTargetOutsideRoot verifies containment covers the read-only
+// metadata path too, so assume-existing preparation cannot probe the host
+// filesystem outside the root.
+func TestStatRejectsTargetOutsideRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "other.dat")
+	if err := os.WriteFile(outside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := localfile.New(localfile.WithRoot(root))
+	if _, err := eng.Stat(context.Background(), outside); !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Fatalf("Stat(%q) err=%v, want engine.ErrOutsideRoot", outside, err)
+	}
+}
+
+// TestRootDoesNotMatchSiblingPrefix guards against the string-prefix version of
+// the containment check: "<root>X" shares a textual prefix with "<root>" but is
+// a different directory.
+func TestRootDoesNotMatchSiblingPrefix(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	sibling := filepath.Join(base, "rootX")
+	for _, dir := range []string{root, sibling} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	eng := localfile.New(localfile.WithRoot(root))
+	target := filepath.Join(sibling, "f.dat")
+	h, err := eng.Open(context.Background(), target, engine.ModeWrite, engine.OpenFlagCreate)
+	if !errors.Is(err, engine.ErrOutsideRoot) {
+		eng.Close(context.Background(), h)
+		t.Fatalf("Open(%q) err=%v, want engine.ErrOutsideRoot", target, err)
+	}
+}
+
+// TestOpenAllowsTargetInsideRoot verifies containment does not break the normal
+// replay path, including creating a nested directory under the root.
+func TestOpenAllowsTargetInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+
+	target := filepath.Join(root, "nested", "dir", "shard.dat")
+	h, err := eng.Open(ctx, target, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)
+	if err != nil {
+		t.Fatalf("Open inside root: %v", err)
+	}
+	payload := []byte("payload")
+	if _, err := eng.Write(ctx, h, 0, payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := eng.Close(ctx, h); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	info, err := eng.Stat(ctx, target)
+	if err != nil {
+		t.Fatalf("Stat inside root: %v", err)
+	}
+	if info.Size != int64(len(payload)) {
+		t.Fatalf("Stat size=%d, want %d", info.Size, len(payload))
+	}
+}
+
+// TestRelativeTargetResolvedAgainstWorkingDir verifies that a relative target
+// keeps its working-directory meaning under containment: it is made absolute
+// against the process CWD (not reinterpreted as root-relative) and then checked,
+// so an existing target map is not silently redirected.
+func TestRelativeTargetResolvedAgainstWorkingDir(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A root that cannot contain anything reachable from the CWD: every
+	// relative name must be rejected rather than joined onto the root.
+	eng := localfile.New(localfile.WithRoot(t.TempDir()))
+	h, openErr := eng.Open(context.Background(), "relative-target.dat",
+		engine.ModeWrite, engine.OpenFlagCreate)
+	if !errors.Is(openErr, engine.ErrOutsideRoot) {
+		eng.Close(context.Background(), h)
+		t.Fatalf("Open relative target err=%v, want engine.ErrOutsideRoot", openErr)
+	}
+	if _, err := os.Stat(filepath.Join(wd, "relative-target.dat")); !os.IsNotExist(err) {
+		t.Fatalf("relative target was created in the working directory: %v", err)
+	}
+}
+
+// TestLimitationsRecordContainmentState verifies that both the confined and the
+// unconfined engine state their containment status, so a saved report never
+// leaves target safety unanswered.
+func TestLimitationsRecordContainmentState(t *testing.T) {
+	unconfined := localfile.New().Limitations()
+	if !anyContains(unconfined, "no target root configured") {
+		t.Fatalf("unconfined limitations = %v, want a note that no root was configured", unconfined)
+	}
+
+	confined := localfile.New(localfile.WithRoot(t.TempDir())).Limitations()
+	if !anyContains(confined, "enforced lexically") {
+		t.Fatalf("confined limitations = %v, want the lexical-enforcement caveat", confined)
+	}
+	if anyContains(confined, "no target root configured") {
+		t.Fatalf("confined engine must not report itself unconfined: %v", confined)
+	}
+}
+
+func anyContains(list []string, sub string) bool {
+	for _, s := range list {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

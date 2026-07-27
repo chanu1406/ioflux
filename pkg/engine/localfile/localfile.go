@@ -42,6 +42,12 @@ type LocalFileEngine struct {
 	directAlignOverride int64 // 0 = auto-detect from filesystem
 	opener              openerFunc
 
+	// root, when non-empty, is the cleaned absolute directory every target must
+	// resolve within. rootErr poisons the engine when a configured root could
+	// not be resolved, so containment fails closed instead of silently lapsing.
+	root    string
+	rootErr error
+
 	limitMu     sync.Mutex
 	limitations []string
 }
@@ -68,6 +74,19 @@ func WithDirectAlign(n int64) Option {
 	return func(e *LocalFileEngine) { e.directAlignOverride = n }
 }
 
+// WithRoot confines the engine to root: every target passed to Open or Stat
+// must resolve inside it, so a trace target name can neither read nor overwrite
+// data elsewhere on the host. An empty root (the default) applies no
+// containment and is recorded as a limitation.
+//
+// Containment is lexical: the target is made absolute (relative names against
+// the process working directory), cleaned, and required to stay under root. A
+// symlink *inside* root that points outside it is not detected; that limitation
+// is recorded in Limitations rather than implied away.
+func WithRoot(root string) Option {
+	return func(e *LocalFileEngine) { e.root = root }
+}
+
 // New returns a new LocalFileEngine.
 func New(opts ...Option) *LocalFileEngine {
 	e := &LocalFileEngine{
@@ -77,7 +96,64 @@ func New(opts ...Option) *LocalFileEngine {
 	for _, opt := range opts {
 		opt(e)
 	}
+	e.initRoot()
 	return e
+}
+
+// initRoot normalizes a configured containment root to a cleaned absolute path
+// and records what the run may and may not conclude about target safety. Both
+// the confined and the unconfined case produce a limitation note, so a saved
+// report never leaves the question unanswered.
+func (e *LocalFileEngine) initRoot() {
+	if e.root == "" {
+		e.addLimitation("no target root configured: replay and dataset preparation were not " +
+			"confined, so any path a rewritten trace target resolves to could be read or " +
+			"overwritten (set --target-root to confine them)")
+		return
+	}
+	abs, err := filepath.Abs(e.root)
+	if err != nil {
+		// Fail closed: every subsequent target resolution returns this error.
+		e.rootErr = fmt.Errorf("localfile: cannot resolve target root %q: %w", e.root, err)
+		return
+	}
+	e.root = filepath.Clean(abs)
+	e.addLimitation(fmt.Sprintf("target root %s is enforced lexically: a symlink inside the "+
+		"root that points outside it is not detected", e.root))
+}
+
+// resolveTarget maps a trace target name to the path the engine operates on,
+// rejecting it when a containment root is configured and the name escapes.
+// Without a root it returns target unchanged, preserving working-directory
+// relative semantics for callers that opted out of containment.
+func (e *LocalFileEngine) resolveTarget(target string) (string, error) {
+	if e.rootErr != nil {
+		return "", e.rootErr
+	}
+	if e.root == "" {
+		return target, nil
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return "", fmt.Errorf("localfile: resolve target %q: %w", target, err)
+	}
+	// Rel + IsLocal rather than a string prefix: "/rootX" must not count as
+	// being inside "/root", and ".." segments must not walk out of it.
+	rel, err := filepath.Rel(e.root, abs)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("localfile: target %q resolves to %s, outside root %s: %w",
+			target, abs, e.root, engine.ErrOutsideRoot)
+	}
+	return abs, nil
+}
+
+// CheckTarget reports whether target is inside the configured containment root,
+// implementing engine.TargetChecker. It lets a caller reject a whole target
+// table before any I/O, including I/O this engine never sees (cache-control
+// fadvise opens the file itself).
+func (e *LocalFileEngine) CheckTarget(target string) error {
+	_, err := e.resolveTarget(target)
+	return err
 }
 
 // NewWithOpener returns a LocalFileEngine that uses openFn to open files.
@@ -123,12 +199,20 @@ func (e *LocalFileEngine) Caps() engine.Capabilities {
 }
 
 // Open opens target for the given mode and flags. target must be the full path
-// to the file (absolute or relative to the process working directory).
+// to the file (absolute or relative to the process working directory). When the
+// engine is confined by WithRoot, a target that resolves outside the root is
+// rejected with engine.ErrOutsideRoot before any directory is created or any
+// file is opened, created, or truncated.
 //
 // The "append" flag is intentionally not applied: replay uses offset-addressed
 // WriteAt, and Go's WriteAt returns an error on a file opened with O_APPEND.
 // The flag is preserved in the trace IR but treated as unmodeled by the engine.
 func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mode, flags engine.OpenFlags) (engine.Handle, error) {
+	path, err := e.resolveTarget(target)
+	if err != nil {
+		return 0, err
+	}
+
 	oflags := modeToOsFlag(mode)
 	if flags&engine.OpenFlagCreate != 0 {
 		oflags |= os.O_CREATE
@@ -157,29 +241,29 @@ func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mod
 	}
 
 	if flags&engine.OpenFlagCreate != 0 {
-		if dir := filepath.Dir(target); dir != "" && dir != "." {
+		if dir := filepath.Dir(path); dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return 0, fmt.Errorf("localfile: mkdir %s: %w", dir, err)
 			}
 		}
 	}
 
-	f, err := e.opener(target, oflags, 0o644)
+	f, err := e.opener(path, oflags, 0o644)
 	if err != nil {
 		if wantDirect && isDirectNotSupported(err) {
 			if !e.directFallback {
-				return 0, fmt.Errorf("localfile: open %s with O_DIRECT: filesystem does not support direct I/O: %w", target, err)
+				return 0, fmt.Errorf("localfile: open %s with O_DIRECT: filesystem does not support direct I/O: %w", path, err)
 			}
 			// Fall back to buffered I/O and record the limitation.
 			oflags &^= openDirectFlag
-			f, err = e.opener(target, oflags, 0o644)
+			f, err = e.opener(path, oflags, 0o644)
 			if err != nil {
-				return 0, fmt.Errorf("localfile: open %s: %w", target, err)
+				return 0, fmt.Errorf("localfile: open %s: %w", path, err)
 			}
 			actualDirect = false
-			e.addLimitation(fmt.Sprintf("O_DIRECT not supported by filesystem for %s; fell back to buffered I/O", target))
+			e.addLimitation(fmt.Sprintf("O_DIRECT not supported by filesystem for %s; fell back to buffered I/O", path))
 		} else {
-			return 0, fmt.Errorf("localfile: open %s: %w", target, err)
+			return 0, fmt.Errorf("localfile: open %s: %w", path, err)
 		}
 	}
 
@@ -249,14 +333,20 @@ func (e *LocalFileEngine) Close(_ context.Context, h engine.Handle) error {
 	return of.f.Close()
 }
 
-// Stat returns size metadata for target.
+// Stat returns size metadata for target. When the engine is confined by
+// WithRoot, a target that resolves outside the root is rejected with
+// engine.ErrOutsideRoot rather than probing the host filesystem.
 func (e *LocalFileEngine) Stat(_ context.Context, target string) (engine.ObjectInfo, error) {
-	info, err := os.Stat(target)
+	path, err := e.resolveTarget(target)
+	if err != nil {
+		return engine.ObjectInfo{}, err
+	}
+	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", target, engine.ErrNotFound)
+			return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", path, engine.ErrNotFound)
 		}
-		return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", target, err)
+		return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", path, err)
 	}
 	return engine.ObjectInfo{Name: target, Size: info.Size()}, nil
 }

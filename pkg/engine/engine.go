@@ -28,6 +28,12 @@ var (
 	// ErrShortWrite marks a Write that accepted fewer bytes than requested.
 	// The return value n holds the number of bytes actually written.
 	ErrShortWrite = errors.New("engine: short write")
+
+	// ErrOutsideRoot is returned when a target resolves outside the engine's
+	// configured containment root. Target names come from a trace, which is
+	// imported or hand-edited input, so a confined engine refuses them rather
+	// than reading or overwriting data elsewhere on the host.
+	ErrOutsideRoot = errors.New("engine: target resolves outside the configured root")
 )
 
 // Handle is an opaque reference to an open file, returned by Open and passed
@@ -78,6 +84,19 @@ type Capabilities struct {
 type ObjectInfo struct {
 	Name string
 	Size int64
+}
+
+// TargetChecker is implemented by engines that confine targets to a configured
+// root. Callers touch targets through paths the Engine interface does not cover
+// — dataset preparation reads a source tree, cache controls open files directly
+// for fadvise — so containment is only complete if those callers consult the
+// engine too. A caller that holds a target list should check it up front rather
+// than relying on the first engine call to reject it.
+//
+// CheckTarget returns nil when target is allowed, and an error wrapping
+// ErrOutsideRoot when it is not.
+type TargetChecker interface {
+	CheckTarget(target string) error
 }
 
 // Engine is the storage-backend abstraction. Implementations must be safe for

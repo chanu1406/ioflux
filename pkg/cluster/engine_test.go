@@ -79,3 +79,42 @@ func TestBuildEngineUnknownName(t *testing.T) {
 		t.Fatalf("error=%q, want unsupported engine", err)
 	}
 }
+
+// TestBuildEngineRejectsRootForNonLocalEngine verifies that a containment root
+// the chosen engine cannot enforce stops the run instead of being silently
+// dropped: an operator who asked for confinement must never get an unconfined
+// run that looks successful.
+func TestBuildEngineRejectsRootForNonLocalEngine(t *testing.T) {
+	for _, name := range []string{"mem", "s3"} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := cluster.BuildEngine(cluster.EngineSpec{Name: name, Root: t.TempDir()})
+			if err == nil {
+				t.Fatalf("BuildEngine(%s) with a target root succeeded; want rejection", name)
+			}
+			if !strings.Contains(err.Error(), "only supported by the local engine") {
+				t.Fatalf("BuildEngine(%s) err=%v, want an explanation naming the local engine", name, err)
+			}
+		})
+	}
+}
+
+// TestBuildEngineAcceptsRootForLocalEngine verifies the local engine builds with
+// a root and reports it as enforced rather than as an unconfined run.
+func TestBuildEngineAcceptsRootForLocalEngine(t *testing.T) {
+	root := t.TempDir()
+	eng, _, err := cluster.BuildEngine(cluster.EngineSpec{Name: "local", Root: root})
+	if err != nil {
+		t.Fatalf("BuildEngine(local) with root: %v", err)
+	}
+	lfe, ok := eng.(*localfile.LocalFileEngine)
+	if !ok {
+		t.Fatalf("engine type=%T, want *localfile.LocalFileEngine", eng)
+	}
+	joined := strings.Join(lfe.Limitations(), "\n")
+	if strings.Contains(joined, "no target root configured") {
+		t.Fatalf("confined engine reported itself unconfined: %q", joined)
+	}
+	if !strings.Contains(joined, root) {
+		t.Fatalf("limitations %q should name the enforced root %q", joined, root)
+	}
+}

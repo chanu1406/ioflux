@@ -29,6 +29,12 @@ percentile, and saved reports identify detected operation failures as invalid
 execution. Importer loss manifests, environment comparability, result-schema
 versioning, and full workload qualification are still in progress.
 
+Target names come from the trace, which is imported or hand-edited input, so
+`--target-root` confines the local engine to one directory: replay and dataset
+preparation reject a target that resolves outside it instead of reading or
+overwriting data elsewhere on the host. Without it a run is unconfined, and the
+report says so (see [Target containment](#target-containment)).
+
 Distributed execution and POSIX-to-object replay are experimental. They are
 valuable implementation and research paths, but their output must not be treated
 as qualified cluster-wide or exact cross-protocol evidence yet.
@@ -61,7 +67,8 @@ report:
 ```bash
 bin/ioflux import strace -o run.ioflux capture.strace
 bin/ioflux run --trace run.ioflux --engine local \
-  --prepare materialize-synthetic --target-map map.yaml -o results.json
+  --prepare materialize-synthetic --target-map map.yaml \
+  --target-root ./scratch -o results.json
 bin/ioflux report results.json
 ```
 
@@ -76,6 +83,42 @@ target_rewrite:
 
 Exit codes: `0` on success, `1` on a trace or replay error, `2` on usage or I/O
 failure.
+
+## Target containment
+
+A trace's target names are untrusted input: an imported capture records absolute
+production paths, and a hand-edited trace can contain anything. Dataset
+preparation opens every write target with `CREATE|TRUNC`, so a target that
+escapes the directory you meant to use — via `allow_passthrough`, a `..`
+sequence, or a rule that does not match what you expected — would truncate real
+data.
+
+`--target-root <dir>` confines the local engine to one directory. Every target is
+resolved (relative names against the working directory) and must land inside the
+root; anything else fails the run before a file is opened, created, or
+truncated:
+
+```bash
+bin/ioflux run --trace run.ioflux --engine local --target-root ./scratch \
+  --prepare materialize-synthetic --target-map map.yaml -o results.json
+```
+
+Notes and limits:
+
+- Containment is **lexical**. A symlink *inside* the root that points outside it
+  is not detected. The run records that caveat in `run_env.engine_limitations`
+  rather than implying a stronger guarantee.
+- Without `--target-root`, the run is unconfined and records
+  `no target root configured: …` in `run_env.engine_limitations`, which the
+  report prints under Warnings. The guarantee IOFlux makes is not that targets
+  are always confined — it is that a saved report never leaves the question
+  unstated.
+- Only the `local` engine can enforce a root. Passing `--target-root` with
+  `--engine mem` or `--engine s3` is a usage error, not a silently ignored flag.
+  Object-prefix containment for S3 is not implemented yet.
+- `--target-root` cannot be combined with `--hosts`: the root is not part of the
+  worker protocol, so a coordinator-side value would not apply on a remote
+  worker. Set it on each worker instead (see below).
 
 ## Checkpoint-write workloads
 
@@ -123,7 +166,7 @@ Start a worker on each host, then point a run at them with `--hosts`:
 
 ```bash
 # on each host
-bin/ioflux worker --listen :7800
+bin/ioflux worker --listen :7800 --target-root /srv/ioflux-scratch
 
 # from the coordinator
 bin/ioflux run --trace t.ioflux --engine local \
@@ -131,6 +174,10 @@ bin/ioflux run --trace t.ioflux --engine local \
   --hosts hostA:7800,hostB:7800 -o results.json
 bin/ioflux report results.json
 ```
+
+A worker's `--target-root` is worker-local policy: it confines every target the
+worker replays regardless of what the coordinator's plan asked for, because the
+host that owns the data — not the coordinator — decides what a plan may touch.
 
 The coordinator partitions the trace's streams round-robin across the workers,
 synchronizes them through `PREPARE`/`RUN`/`DONE` barriers, and merges the
@@ -147,7 +194,10 @@ through the same code path via one in-process worker.
 > unauthenticated, and the plan it sends carries the trace bytes and any S3
 > credentials. Run workers only on a trusted network (e.g. a private cluster
 > subnet or over an SSH tunnel/VPN); do not expose `ioflux worker` on an
-> untrusted network. TLS/mTLS is not implemented in v1.
+> untrusted network. TLS/mTLS is not implemented in v1. `--target-root` bounds
+> what a plan can reach on the worker's filesystem, but it is not a substitute
+> for authentication: an unauthenticated worker still accepts runs from anyone
+> who can reach the port.
 
 ## Development
 

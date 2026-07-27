@@ -27,6 +27,9 @@ import (
 // rejects a second Prepare before the first run is collected.
 type Session struct {
 	hostname string
+	// targetRoot, when non-empty, confines every local-engine target on this
+	// worker regardless of what the coordinator's plan asked for.
+	targetRoot string
 
 	mu   sync.Mutex
 	exec *replay.Executor
@@ -35,13 +38,20 @@ type Session struct {
 }
 
 // NewSession returns a Session that reports the local hostname in WorkerInfo and
-// COLLECT results.
-func NewSession() *Session {
+// COLLECT results, with no target containment.
+func NewSession() *Session { return NewSessionWithRoot("") }
+
+// NewSessionWithRoot returns a Session that confines every local-engine target
+// to root, overriding whatever the coordinator's plan requested. The root is
+// worker-local policy on purpose: a coordinator is not trusted to declare what
+// a worker's host may expose, so the host that owns the data sets the boundary.
+// An empty root applies no containment.
+func NewSessionWithRoot(root string) *Session {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown"
 	}
-	return &Session{hostname: host}
+	return &Session{hostname: host, targetRoot: root}
 }
 
 // Info returns this worker's identity for REGISTER.
@@ -76,6 +86,11 @@ func (s *Session) PrepareReader(ctx context.Context, p Plan, traceData io.Reader
 	spec := p.Engine
 	if spec.CacheMode == "" {
 		spec.CacheMode = p.CacheMode
+	}
+	// Worker-local containment wins over the plan: the coordinator cannot widen
+	// what this host is willing to expose.
+	if s.targetRoot != "" {
+		spec.Root = s.targetRoot
 	}
 	if spec.TargetSizes == nil {
 		spec.TargetSizes = make(map[string]int64, len(hdr.Targets))

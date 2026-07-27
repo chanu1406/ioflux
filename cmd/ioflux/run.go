@@ -55,6 +55,11 @@ S3 flags:
   --s3-multipart-part-size <size>  Multipart part size (default 16MiB; minimum 5MiB)
 
 Local engine flags:
+  --target-root <dir>   Confine every target to this directory. Replay and preparation
+                        reject a target that resolves outside it, so a trace cannot read
+                        or overwrite data elsewhere on the host. Unset means no
+                        containment, which the report records as a limitation.
+                        Cannot be combined with --hosts; set it on each worker instead.
   --allow-direct        Honor O_DIRECT opens from the trace (Linux only; default off)
   --direct-fallback     Fall back to buffered I/O when O_DIRECT is unsupported by the
                         filesystem rather than failing the open
@@ -67,8 +72,9 @@ Engine notes:
 
 Exit codes:
   0   replay completed; results.json written
-  1   replay rejected before dispatch (bad trace, caps mismatch) or completed with op errors
-      (including a latency sample outside the histogram's trackable range)
+  1   replay rejected before dispatch (bad trace, caps mismatch, a target outside
+      --target-root) or completed with op errors (including a latency sample outside
+      the histogram's trackable range)
   2   usage error or I/O failure
 `
 
@@ -94,6 +100,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		sourceRoot       string
 		fillMode         string
 		fillSeed         int64
+		targetRoot       string
 		allowDirect      bool
 		directFallback   bool
 		directAlign      int64
@@ -114,6 +121,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&sourceRoot, "source-root", "", "local source path for --prepare materialize-from-source")
 	fs.StringVar(&fillMode, "fill", string(payload.ModeSeeded), "payload fill mode: seeded | zero")
 	fs.Int64Var(&fillSeed, "fill-seed", payload.DefaultSeed, "seed for deterministic payload fill")
+	fs.StringVar(&targetRoot, "target-root", "", "confine every local-engine target to this directory")
 	fs.BoolVar(&allowDirect, "allow-direct", false, "enable O_DIRECT for trace OPEN ops carrying the direct flag (local engine, Linux only)")
 	fs.BoolVar(&directFallback, "direct-fallback", false, "fall back to buffered I/O when O_DIRECT is unsupported by the filesystem")
 	fs.Int64Var(&directAlign, "direct-align", 0, "O_DIRECT block alignment in bytes (0 = auto-detect from filesystem)")
@@ -168,6 +176,16 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	if fillSeed == 0 {
 		fillSeed = payload.DefaultSeed
 	}
+	// The containment root is not part of the worker protocol, so a
+	// coordinator-side --target-root would apply to nothing on a remote worker.
+	// Refuse the combination rather than let the operator believe the run was
+	// confined when it was not.
+	if targetRoot != "" && len(splitHosts(hosts)) > 0 {
+		fmt.Fprintln(stderr, "ioflux run: --target-root cannot be combined with --hosts: the containment "+
+			"root is not carried in the worker protocol, so it would not apply on remote workers.")
+		fmt.Fprintln(stderr, "  Set it on each worker instead: ioflux worker --listen :7800 --target-root <dir>")
+		return 2
+	}
 
 	// Read the trace into memory; the plan inlines it for every worker.
 	traceBytes, err := os.ReadFile(tracePath)
@@ -185,6 +203,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	spec := cluster.EngineSpec{
 		Name:           engineName,
 		CacheMode:      cacheMode,
+		Root:           targetRoot,
 		AllowDirect:    allowDirect,
 		DirectFallback: directFallback,
 		DirectAlign:    directAlign,

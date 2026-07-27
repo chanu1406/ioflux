@@ -19,6 +19,12 @@ import (
 // it without spawning a separate process.
 func startWorker(t *testing.T) string {
 	t.Helper()
+	return startWorkerWithRoot(t, "")
+}
+
+// startWorkerWithRoot is startWorker with a worker-local containment root.
+func startWorkerWithRoot(t *testing.T, targetRoot string) string {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -28,7 +34,7 @@ func startWorker(t *testing.T) string {
 	go func() {
 		defer close(done)
 		var log testWriter
-		_ = serveWorker(ctx, lis, &log)
+		_ = serveWorker(ctx, lis, &log, targetRoot)
 	}()
 	t.Cleanup(func() {
 		cancel()

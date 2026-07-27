@@ -644,3 +644,214 @@ func parseTestRange(header string, size int) (int, int, bool) {
 	}
 	return start, end, true
 }
+
+// oneTargetReadTrace writes a minimal single-target read trace naming target.
+func oneTargetReadTrace(t *testing.T, path, target string, size int) {
+	t.Helper()
+	content := fmt.Sprintf(`{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","capture_method":"synthetic","scrubbed":false,"targets":[{"id":0,"name":%q,"kind":"file","size":%d}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":%d,"duration_ns":0}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":1,"mode":"r"}
+{"t":1,"op_id":1,"s":0,"op":"READ","h":1,"off":0,"len":%d}
+{"t":2,"op_id":2,"s":0,"op":"CLOSE","h":1}
+`, target, size, size, size)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunCmd_TargetRootRejectsEscapingTarget is the end-to-end guard on the
+// destructive path: materialize-synthetic opens every target CREATE|TRUNC, so a
+// trace naming a path outside --target-root must fail the run rather than
+// truncate real data. Trace target names are untrusted input.
+func TestRunCmd_TargetRootRejectsEscapingTarget(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "precious.dat")
+	original := []byte("real data that must survive the run")
+	if err := os.WriteFile(outside, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tracePath := filepath.Join(base, "trace.ioflux")
+	resultsPath := filepath.Join(base, "results.json")
+	// A "../" escape out of the configured root, as an imported or hand-edited
+	// trace could easily contain.
+	oneTargetReadTrace(t, tracePath, filepath.Join(root, "..", "precious.dat"), len(original))
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--target-root", root,
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 1 {
+		t.Fatalf("runRun exit=%d want 1; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "outside the configured root") {
+		t.Fatalf("stderr should explain the containment rejection, got %q", stderr)
+	}
+
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("preparation overwrote a file outside --target-root: got %q, want %q", got, original)
+	}
+}
+
+// TestRunCmd_TargetRootAllowsContainedRun verifies containment does not break a
+// legitimate run whose targets live under the root.
+func TestRunCmd_TargetRootAllowsContainedRun(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tracePath := filepath.Join(base, "trace.ioflux")
+	resultsPath := filepath.Join(base, "results.json")
+	const size = 8192
+	oneTargetReadTrace(t, tracePath, filepath.Join(root, "shard.dat"), size)
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--target-root", root,
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	res := decodeResults(t, resultsPath)
+	if res.BytesMoved != size {
+		t.Fatalf("bytes_moved=%d, want %d", res.BytesMoved, size)
+	}
+	joined := strings.Join(res.RunEnv.EngineLimitations, "\n")
+	if strings.Contains(joined, "no target root configured") {
+		t.Fatalf("a confined run must not report itself unconfined: %q", joined)
+	}
+}
+
+// TestRunCmd_NoTargetRootRecordsLimitation verifies an unconfined local run says
+// so in results.json. The guardrail is not that IOFlux always confines targets —
+// it is that a saved report never leaves containment unstated.
+func TestRunCmd_NoTargetRootRecordsLimitation(t *testing.T) {
+	base := t.TempDir()
+	tracePath := filepath.Join(base, "trace.ioflux")
+	resultsPath := filepath.Join(base, "results.json")
+	const size = 4096
+	oneTargetReadTrace(t, tracePath, filepath.Join(base, "shard.dat"), size)
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	res := decodeResults(t, resultsPath)
+	joined := strings.Join(res.RunEnv.EngineLimitations, "\n")
+	if !strings.Contains(joined, "no target root configured") {
+		t.Fatalf("engine_limitations=%q, want a note that targets were not confined", joined)
+	}
+}
+
+// TestRunCmd_TargetRootRejectedWithHosts verifies that the combination which
+// cannot work is refused up front. The containment root is not part of the
+// worker protocol, so a coordinator-side root would apply to nothing on a remote
+// worker — silently leaving the operator believing the run was confined.
+func TestRunCmd_TargetRootRejectedWithHosts(t *testing.T) {
+	base := t.TempDir()
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", filepath.Join(base, "trace.ioflux"),
+		"--engine", "local",
+		"--target-root", base,
+		"--hosts", "127.0.0.1:7800",
+		"-o", filepath.Join(base, "results.json"),
+	})
+	if code != 2 {
+		t.Fatalf("runRun exit=%d want 2; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "not carried in the worker protocol") {
+		t.Fatalf("stderr should explain why the combination is refused, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "ioflux worker") {
+		t.Fatalf("stderr should point at the worker-side flag, got %q", stderr)
+	}
+}
+
+// TestRunCmd_TargetRootRejectedForNonLocalEngine verifies a root the engine
+// cannot enforce is a usage error, not a silently ignored flag.
+func TestRunCmd_TargetRootRejectedForNonLocalEngine(t *testing.T) {
+	base := t.TempDir()
+	tracePath := filepath.Join(base, "trace.ioflux")
+	oneTargetReadTrace(t, tracePath, filepath.Join(base, "shard.dat"), 4096)
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "mem",
+		"--target-root", base,
+		"-o", filepath.Join(base, "results.json"),
+	})
+	if code != 2 {
+		t.Fatalf("runRun exit=%d want 2; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "only supported by the local engine") {
+		t.Fatalf("stderr should explain the engine cannot enforce a root, got %q", stderr)
+	}
+}
+
+// decodeResults reads a results.json written by a CLI run. (The integration
+// build has its own readResults behind a build tag; this is the untagged twin.)
+func decodeResults(t *testing.T, path string) results.Results {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res results.Results
+	if err := json.Unmarshal(data, &res); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return res
+}
+
+// TestRunCmd_TargetRootCheckedBeforeCacheControls verifies containment is not
+// limited to engine calls. With no --prepare, dataset preparation is a no-op and
+// the next thing to touch targets is the cold-cache control, which opens files
+// directly (os.Open + fadvise) rather than through the engine. An escaping
+// target must still fail the run before anything outside the root is opened.
+func TestRunCmd_TargetRootCheckedBeforeCacheControls(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "elsewhere.dat")
+	if err := os.WriteFile(outside, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tracePath := filepath.Join(base, "trace.ioflux")
+	oneTargetReadTrace(t, tracePath, filepath.Join(root, "..", "elsewhere.dat"), 4096)
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--target-root", root,
+		"--cache-mode", "cold",
+		"-o", filepath.Join(base, "results.json"),
+	})
+	if code != 1 {
+		t.Fatalf("runRun exit=%d want 1; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "outside the configured root") {
+		t.Fatalf("stderr should explain the containment rejection, got %q", stderr)
+	}
+}
