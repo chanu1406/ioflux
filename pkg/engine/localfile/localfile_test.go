@@ -459,8 +459,11 @@ func TestLimitationsRecordContainmentState(t *testing.T) {
 	}
 
 	confined := localfile.New(localfile.WithRoot(t.TempDir())).Limitations()
-	if !anyContains(confined, "enforced lexically") {
-		t.Fatalf("confined limitations = %v, want the lexical-enforcement caveat", confined)
+	if !anyContains(confined, "enforced by the OS") {
+		t.Fatalf("confined limitations = %v, want the OS-enforcement statement", confined)
+	}
+	if !anyContains(confined, "bind mount") {
+		t.Fatalf("confined limitations = %v, want the residual bind-mount/device caveat", confined)
 	}
 	if anyContains(confined, "no target root configured") {
 		t.Fatalf("confined engine must not report itself unconfined: %v", confined)
@@ -474,4 +477,176 @@ func anyContains(list []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// --- Symlink containment ---
+//
+// The containment root is enforced by the OS through an open directory handle,
+// so resolution cannot leave the root even when the filesystem itself points
+// out of it. These are the cases a string-comparison check silently allows.
+
+// TestSymlinkInsideRootCannotEscape is the regression test for the hole that
+// motivated OS-level enforcement: a symlink placed inside the root pointing at
+// a file outside it. A lexical check sees only an in-root path and allows the
+// open, letting preparation truncate real data.
+func TestSymlinkInsideRootCannotEscape(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "scratch")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "precious.dat")
+	original := []byte("real data that must survive")
+	if err := os.WriteFile(outside, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Textually inside the root; actually a door out of it.
+	link := filepath.Join(root, "looks-innocent.dat")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+	defer eng.Shutdown()
+
+	h, err := eng.Open(ctx, link, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)
+	if !errors.Is(err, engine.ErrOutsideRoot) {
+		eng.Close(ctx, h)
+		t.Fatalf("Open through escaping symlink err=%v, want engine.ErrOutsideRoot", err)
+	}
+	if _, err := eng.Stat(ctx, link); !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Fatalf("Stat through escaping symlink err=%v, want engine.ErrOutsideRoot", err)
+	}
+	if err := eng.CheckTarget(link); !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Fatalf("CheckTarget on escaping symlink err=%v, want engine.ErrOutsideRoot", err)
+	}
+
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("symlink escape modified the file outside the root: got %q, want %q", got, original)
+	}
+}
+
+// TestRelativeSymlinkInsideRootIsAllowed verifies containment refuses escapes
+// without refusing ordinary datasets: a relative symlink that stays inside the
+// root still resolves, including one that traverses "..".
+func TestRelativeSymlinkInsideRootIsAllowed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("INSIDE")
+	if err := os.WriteFile(filepath.Join(root, "real.dat"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.dat", filepath.Join(root, "flat.dat")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../real.dat", filepath.Join(root, "sub", "updir.dat")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+	defer eng.Shutdown()
+
+	for _, name := range []string{"flat.dat", filepath.Join("sub", "updir.dat")} {
+		target := filepath.Join(root, name)
+		if err := eng.CheckTarget(target); err != nil {
+			t.Fatalf("CheckTarget(%s) on an in-root relative symlink: %v", name, err)
+		}
+		info, err := eng.Stat(ctx, target)
+		if err != nil {
+			t.Fatalf("Stat(%s) on an in-root relative symlink: %v", name, err)
+		}
+		if info.Size != int64(len(payload)) {
+			t.Fatalf("Stat(%s).Size=%d, want %d", name, info.Size, len(payload))
+		}
+	}
+}
+
+// TestAbsoluteSymlinkRejectedEvenInsideRoot pins a real behavior change: an
+// absolute symlink is refused even when it points back inside the root, because
+// an absolute link cannot be resolved relative to the root. Documented so an
+// operator who hits it knows the dataset, not IOFlux, needs to change.
+func TestAbsoluteSymlinkRejectedEvenInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "real.dat"), []byte("INSIDE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "abs.dat")
+	if err := os.Symlink(filepath.Join(root, "real.dat"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := localfile.New(localfile.WithRoot(root))
+	defer eng.Shutdown()
+
+	err := eng.CheckTarget(link)
+	if !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Fatalf("CheckTarget on an absolute in-root symlink err=%v, want engine.ErrOutsideRoot", err)
+	}
+	if !strings.Contains(err.Error(), "absolute symlinks are rejected") {
+		t.Fatalf("error should explain the absolute-symlink rule, got %q", err)
+	}
+}
+
+// TestRootCreatedWhenMissing verifies pointing --target-root at a directory that
+// does not exist yet still works, matching how materialization creates the
+// directories beneath it.
+func TestRootCreatedWhenMissing(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not", "yet", "there")
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+	defer eng.Shutdown()
+
+	target := filepath.Join(root, "shard.dat")
+	h, err := eng.Open(ctx, target, engine.ModeWrite, engine.OpenFlagCreate|engine.OpenFlagTrunc)
+	if err != nil {
+		t.Fatalf("Open inside a freshly created root: %v", err)
+	}
+	if _, err := eng.Write(ctx, h, 0, []byte("x")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := eng.Close(ctx, h); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestShutdownReleasesRootAndFailsClosed verifies the root handle is released
+// and that a shut-down engine refuses work rather than falling back to
+// unconfined access.
+func TestShutdownReleasesRootAndFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	eng := localfile.New(localfile.WithRoot(root))
+
+	if err := eng.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := eng.Shutdown(); err != nil {
+		t.Fatalf("second Shutdown must be a no-op, got %v", err)
+	}
+	if _, err := eng.Open(ctx, filepath.Join(root, "x.dat"), engine.ModeWrite, engine.OpenFlagCreate); err == nil {
+		t.Fatal("Open after Shutdown succeeded; a released root must refuse work")
+	}
+}
+
+// TestShutdownOnUnconfinedEngineIsNoop verifies an engine with no root is
+// unaffected by Shutdown.
+func TestShutdownOnUnconfinedEngineIsNoop(t *testing.T) {
+	eng := localfile.New()
+	if err := eng.Shutdown(); err != nil {
+		t.Fatalf("Shutdown on unconfined engine: %v", err)
+	}
+	dir := t.TempDir()
+	h, err := eng.Open(context.Background(), filepath.Join(dir, "x.dat"), engine.ModeWrite, engine.OpenFlagCreate)
+	if err != nil {
+		t.Fatalf("unconfined engine must keep working after Shutdown: %v", err)
+	}
+	eng.Close(context.Background(), h)
 }

@@ -1,6 +1,6 @@
 module github.com/chanuollala/ioflux
 
-go 1.22
+go 1.25
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2

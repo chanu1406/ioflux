@@ -140,12 +140,27 @@ func (s *Session) PrepareReader(ctx context.Context, p Plan, traceData io.Reader
 	cacheRes := exec.ApplyCache(ctx)
 
 	s.mu.Lock()
+	prev := s.eng
 	s.exec = exec
 	s.eng = eng
 	s.out = nil
 	s.mu.Unlock()
+	// A worker serves many runs over its lifetime and builds one engine per run.
+	// Release the previous run's engine-held OS resources (the local engine's
+	// containment root directory handle) rather than accumulating them.
+	shutdownEngine(prev)
 
 	return PrepareResult{PrepStats: prepStats, CacheResult: cacheRes}, nil
+}
+
+// shutdownEngine releases engine-held OS resources when the engine supports it.
+func shutdownEngine(eng engine.Engine) {
+	if eng == nil {
+		return
+	}
+	if s, ok := eng.(engine.Shutdowner); ok {
+		_ = s.Shutdown()
+	}
 }
 
 // Run replays the prepared streams, scheduling timeline arrivals from goTime

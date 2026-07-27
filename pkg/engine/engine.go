@@ -99,6 +99,17 @@ type TargetChecker interface {
 	CheckTarget(target string) error
 }
 
+// Shutdowner is implemented by engines holding process-level OS resources
+// beyond individual file handles — the local engine keeps its containment root
+// open as a directory handle. A caller that builds engines repeatedly (a
+// long-lived worker builds one per run) must shut the previous one down, or
+// those handles accumulate for the life of the process.
+//
+// Shutdown does not close outstanding file handles; Close those individually.
+type Shutdowner interface {
+	Shutdown() error
+}
+
 // Engine is the storage-backend abstraction. Implementations must be safe for
 // concurrent use by multiple goroutines. Operations not supported by the
 // backend return ErrUnsupported; the caller must check Caps() before calling

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -42,11 +43,18 @@ type LocalFileEngine struct {
 	directAlignOverride int64 // 0 = auto-detect from filesystem
 	opener              openerFunc
 
-	// root, when non-empty, is the cleaned absolute directory every target must
-	// resolve within. rootErr poisons the engine when a configured root could
-	// not be resolved, so containment fails closed instead of silently lapsing.
-	root    string
-	rootErr error
+	// rootSpec is the containment root as configured (WithRoot); root is the
+	// opened directory every target must resolve within, and rootPath its
+	// cleaned absolute form, used to translate target names and to phrase
+	// errors. rootErr poisons the engine when a configured root could not be
+	// opened, so containment fails closed instead of silently lapsing.
+	// root is immutable after New, so reads need no lock; closeOnce guards the
+	// single release of its directory handle.
+	rootSpec  string
+	root      *os.Root
+	rootPath  string
+	rootErr   error
+	closeOnce sync.Once
 
 	limitMu     sync.Mutex
 	limitations []string
@@ -77,14 +85,24 @@ func WithDirectAlign(n int64) Option {
 // WithRoot confines the engine to root: every target passed to Open or Stat
 // must resolve inside it, so a trace target name can neither read nor overwrite
 // data elsewhere on the host. An empty root (the default) applies no
-// containment and is recorded as a limitation.
+// containment and is recorded as a limitation. The root is created if it does
+// not exist.
 //
-// Containment is lexical: the target is made absolute (relative names against
-// the process working directory), cleaned, and required to stay under root. A
-// symlink *inside* root that points outside it is not detected; that limitation
-// is recorded in Limitations rather than implied away.
+// Enforcement is done by the operating system, not by string comparison: the
+// engine holds the root open (os.Root) and every file operation is performed
+// relative to that directory handle, so neither a ".." component nor a symlink
+// can escape it. Target names are translated to root-relative form first, which
+// is where a plainly out-of-root name is rejected with a specific message.
+//
+// Two consequences worth knowing:
+//   - An *absolute* symlink inside the root is rejected even when it points
+//     back inside the root, because an absolute link cannot be validated
+//     against a root. Relative symlinks that stay inside the root work.
+//   - A root confines path resolution, not the filesystem: bind mounts, /proc
+//     special files, and device nodes reachable inside the root remain
+//     reachable. This is recorded in Limitations.
 func WithRoot(root string) Option {
-	return func(e *LocalFileEngine) { e.root = root }
+	return func(e *LocalFileEngine) { e.rootSpec = root }
 }
 
 // New returns a new LocalFileEngine.
@@ -100,60 +118,167 @@ func New(opts ...Option) *LocalFileEngine {
 	return e
 }
 
-// initRoot normalizes a configured containment root to a cleaned absolute path
-// and records what the run may and may not conclude about target safety. Both
-// the confined and the unconfined case produce a limitation note, so a saved
-// report never leaves the question unanswered.
+// initRoot opens a configured containment root and records what the run may and
+// may not conclude about target safety. Both the confined and the unconfined
+// case produce a limitation note, so a saved report never leaves the question
+// unanswered.
 func (e *LocalFileEngine) initRoot() {
-	if e.root == "" {
+	if e.rootSpec == "" {
 		e.addLimitation("no target root configured: replay and dataset preparation were not " +
 			"confined, so any path a rewritten trace target resolves to could be read or " +
 			"overwritten (set --target-root to confine them)")
 		return
 	}
-	abs, err := filepath.Abs(e.root)
+	abs, err := filepath.Abs(e.rootSpec)
 	if err != nil {
 		// Fail closed: every subsequent target resolution returns this error.
-		e.rootErr = fmt.Errorf("localfile: cannot resolve target root %q: %w", e.root, err)
+		e.rootErr = fmt.Errorf("localfile: cannot resolve target root %q: %w", e.rootSpec, err)
 		return
 	}
-	e.root = filepath.Clean(abs)
-	e.addLimitation(fmt.Sprintf("target root %s is enforced lexically: a symlink inside the "+
-		"root that points outside it is not detected", e.root))
+	abs = filepath.Clean(abs)
+	// Create the root so pointing --target-root at a fresh scratch directory
+	// works the same way materialization creates the directories beneath it.
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		e.rootErr = fmt.Errorf("localfile: cannot create target root %s: %w", abs, err)
+		return
+	}
+	root, err := os.OpenRoot(abs)
+	if err != nil {
+		e.rootErr = fmt.Errorf("localfile: cannot open target root %s: %w", abs, err)
+		return
+	}
+	e.root, e.rootPath = root, abs
+	e.addLimitation(fmt.Sprintf("target root %s is enforced by the OS: neither \"..\" nor a "+
+		"symlink can escape it, but a bind mount, /proc file, or device node reachable "+
+		"inside the root is still reachable", abs))
 }
 
-// resolveTarget maps a trace target name to the path the engine operates on,
-// rejecting it when a containment root is configured and the name escapes.
-// Without a root it returns target unchanged, preserving working-directory
-// relative semantics for callers that opted out of containment.
-func (e *LocalFileEngine) resolveTarget(target string) (string, error) {
-	if e.rootErr != nil {
-		return "", e.rootErr
-	}
-	if e.root == "" {
-		return target, nil
-	}
+// Shutdown releases the containment root's directory handle, implementing
+// engine.Shutdowner. Open file handles are unaffected; Close them individually.
+// It is safe to call on an unconfined engine and safe to call more than once.
+// Operations attempted afterwards fail rather than escaping, since a closed
+// root refuses every request.
+func (e *LocalFileEngine) Shutdown() error {
+	var err error
+	e.closeOnce.Do(func() {
+		if e.root != nil {
+			err = e.root.Close()
+		}
+	})
+	return err
+}
+
+// rootRelative translates a trace target name into the root-relative form the
+// os.Root methods take. It is path translation, not the security boundary: a
+// plainly out-of-root name is rejected here so the error names the resolved
+// path, but the guarantee that nothing escapes comes from os.Root itself, which
+// also resolves symlinks the filesystem would follow.
+func (e *LocalFileEngine) rootRelative(target string) (string, error) {
 	abs, err := filepath.Abs(target)
 	if err != nil {
 		return "", fmt.Errorf("localfile: resolve target %q: %w", target, err)
 	}
 	// Rel + IsLocal rather than a string prefix: "/rootX" must not count as
 	// being inside "/root", and ".." segments must not walk out of it.
-	rel, err := filepath.Rel(e.root, abs)
+	rel, err := filepath.Rel(e.rootPath, abs)
 	if err != nil || !filepath.IsLocal(rel) {
 		return "", fmt.Errorf("localfile: target %q resolves to %s, outside root %s: %w",
-			target, abs, e.root, engine.ErrOutsideRoot)
+			target, abs, e.rootPath, engine.ErrOutsideRoot)
 	}
-	return abs, nil
+	return rel, nil
+}
+
+// openerFor returns the function that opens target with a given set of OS
+// flags, plus the path to name in messages. When a containment root is
+// configured every open goes through the root's directory handle, so the
+// returned opener cannot reach outside it; otherwise the engine's plain opener
+// is used and working-directory relative semantics are preserved. createDirs
+// requests the parent directories, created inside the root when confined.
+//
+// A custom opener installed by NewWithOpener applies only to the unconfined
+// path; it is a test seam for simulating filesystem behavior, and a confined
+// engine must not bypass its root to honor it.
+func (e *LocalFileEngine) openerFor(target string, createDirs bool) (func(int) (*os.File, error), string, error) {
+	if e.rootErr != nil {
+		return nil, target, e.rootErr
+	}
+	if e.root == nil {
+		if createDirs {
+			if dir := filepath.Dir(target); dir != "" && dir != "." {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return nil, target, fmt.Errorf("localfile: mkdir %s: %w", dir, err)
+				}
+			}
+		}
+		return func(oflags int) (*os.File, error) {
+			return e.opener(target, oflags, 0o644)
+		}, target, nil
+	}
+
+	rel, err := e.rootRelative(target)
+	if err != nil {
+		return nil, target, err
+	}
+	if createDirs {
+		if dir := filepath.Dir(rel); dir != "" && dir != "." {
+			if err := e.root.MkdirAll(dir, 0o755); err != nil {
+				return nil, target, e.escapeMessage(target, fmt.Errorf("localfile: mkdir %s in root %s: %w", dir, e.rootPath, err))
+			}
+		}
+	}
+	display := filepath.Join(e.rootPath, rel)
+	return func(oflags int) (*os.File, error) {
+		f, err := e.root.OpenFile(rel, oflags, 0o644)
+		if err != nil {
+			return nil, e.escapeMessage(target, err)
+		}
+		return f, nil
+	}, display, nil
+}
+
+// escapeMessage converts an os.Root failure into an engine error. os.Root's
+// escape sentinel is unexported, so an escape is identified by the *os.PathError
+// it carries. The classification only decides the wording: the operation has
+// already been refused either way, so containment never depends on it.
+func (e *LocalFileEngine) escapeMessage(target string, err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) && pe.Err != nil && pe.Err.Error() == "path escapes from parent" {
+		return fmt.Errorf("localfile: target %q escapes root %s (a symlink or path component "+
+			"leaves the root; absolute symlinks are rejected even when they point back inside): %w",
+			target, e.rootPath, engine.ErrOutsideRoot)
+	}
+	return err
 }
 
 // CheckTarget reports whether target is inside the configured containment root,
 // implementing engine.TargetChecker. It lets a caller reject a whole target
-// table before any I/O, including I/O this engine never sees (cache-control
-// fadvise opens the file itself).
+// table before any I/O, including I/O this engine never sees — cache controls
+// open the file themselves to call fadvise, so without this gate a symlinked
+// target would be resolved by the OS outside the root even though every engine
+// call is confined.
+//
+// A target that does not exist yet is allowed: preparation creates it, and the
+// root enforces containment at that point.
 func (e *LocalFileEngine) CheckTarget(target string) error {
-	_, err := e.resolveTarget(target)
-	return err
+	if e.rootErr != nil {
+		return e.rootErr
+	}
+	if e.root == nil {
+		return nil
+	}
+	if _, _, err := e.statTarget(target); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if errors.Is(err, engine.ErrOutsideRoot) {
+			return err
+		}
+		// Fail closed: a target that cannot be confirmed inside the root is not
+		// treated as if it were.
+		return fmt.Errorf("localfile: target %q could not be verified inside root %s: %w",
+			target, e.rootPath, err)
+	}
+	return nil
 }
 
 // NewWithOpener returns a LocalFileEngine that uses openFn to open files.
@@ -208,7 +333,7 @@ func (e *LocalFileEngine) Caps() engine.Capabilities {
 // WriteAt, and Go's WriteAt returns an error on a file opened with O_APPEND.
 // The flag is preserved in the trace IR but treated as unmodeled by the engine.
 func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mode, flags engine.OpenFlags) (engine.Handle, error) {
-	path, err := e.resolveTarget(target)
+	open, path, err := e.openerFor(target, flags&engine.OpenFlagCreate != 0)
 	if err != nil {
 		return 0, err
 	}
@@ -240,15 +365,7 @@ func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mod
 		}
 	}
 
-	if flags&engine.OpenFlagCreate != 0 {
-		if dir := filepath.Dir(path); dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return 0, fmt.Errorf("localfile: mkdir %s: %w", dir, err)
-			}
-		}
-	}
-
-	f, err := e.opener(path, oflags, 0o644)
+	f, err := open(oflags)
 	if err != nil {
 		if wantDirect && isDirectNotSupported(err) {
 			if !e.directFallback {
@@ -256,7 +373,7 @@ func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mod
 			}
 			// Fall back to buffered I/O and record the limitation.
 			oflags &^= openDirectFlag
-			f, err = e.opener(path, oflags, 0o644)
+			f, err = open(oflags)
 			if err != nil {
 				return 0, fmt.Errorf("localfile: open %s: %w", path, err)
 			}
@@ -337,18 +454,37 @@ func (e *LocalFileEngine) Close(_ context.Context, h engine.Handle) error {
 // WithRoot, a target that resolves outside the root is rejected with
 // engine.ErrOutsideRoot rather than probing the host filesystem.
 func (e *LocalFileEngine) Stat(_ context.Context, target string) (engine.ObjectInfo, error) {
-	path, err := e.resolveTarget(target)
+	info, path, err := e.statTarget(target)
 	if err != nil {
-		return engine.ObjectInfo{}, err
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", path, engine.ErrNotFound)
 		}
 		return engine.ObjectInfo{}, fmt.Errorf("localfile: stat %s: %w", path, err)
 	}
 	return engine.ObjectInfo{Name: target, Size: info.Size()}, nil
+}
+
+// statTarget stats target through the containment root when one is configured,
+// so a symlink that leaves the root is refused rather than followed. It returns
+// the path to name in messages alongside the result.
+func (e *LocalFileEngine) statTarget(target string) (fs.FileInfo, string, error) {
+	if e.rootErr != nil {
+		return nil, target, e.rootErr
+	}
+	if e.root == nil {
+		info, err := os.Stat(target)
+		return info, target, err
+	}
+	rel, err := e.rootRelative(target)
+	if err != nil {
+		return nil, target, err
+	}
+	display := filepath.Join(e.rootPath, rel)
+	info, err := e.root.Stat(rel)
+	if err != nil {
+		return nil, display, e.escapeMessage(target, err)
+	}
+	return info, display, nil
 }
 
 // Put, Get, Head, and Delete are not supported by LocalFileEngine

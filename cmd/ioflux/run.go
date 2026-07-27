@@ -55,11 +55,14 @@ S3 flags:
   --s3-multipart-part-size <size>  Multipart part size (default 16MiB; minimum 5MiB)
 
 Local engine flags:
-  --target-root <dir>   Confine every target to this directory. Replay and preparation
-                        reject a target that resolves outside it, so a trace cannot read
-                        or overwrite data elsewhere on the host. Unset means no
-                        containment, which the report records as a limitation.
-                        Cannot be combined with --hosts; set it on each worker instead.
+  --target-root <dir>   Confine every target to this directory, enforced by the OS:
+                        replay and preparation reject a target that resolves outside it
+                        via "..", an absolute path, or a symlink, so a trace cannot read
+                        or overwrite data elsewhere on the host. Created if missing.
+                        Absolute symlinks are rejected even when they point back inside.
+                        Unset means no containment, which the report records as a
+                        limitation. Cannot be combined with --hosts; set it on each
+                        worker instead.
   --allow-direct        Honor O_DIRECT opens from the trace (Linux only; default off)
   --direct-fallback     Fall back to buffered I/O when O_DIRECT is unsupported by the
                         filesystem rather than failing the open

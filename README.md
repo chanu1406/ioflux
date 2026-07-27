@@ -31,9 +31,11 @@ versioning, and full workload qualification are still in progress.
 
 Target names come from the trace, which is imported or hand-edited input, so
 `--target-root` confines the local engine to one directory: replay and dataset
-preparation reject a target that resolves outside it instead of reading or
-overwriting data elsewhere on the host. Without it a run is unconfined, and the
-report says so (see [Target containment](#target-containment)).
+preparation reject a target that resolves outside it — via `..`, an absolute
+path, or a symlink — instead of reading or overwriting data elsewhere on the
+host. Containment is enforced by the OS, not by string comparison. Without it a
+run is unconfined, and the report says so (see
+[Target containment](#target-containment)).
 
 Distributed execution and POSIX-to-object replay are experimental. They are
 valuable implementation and research paths, but their output must not be treated
@@ -103,11 +105,23 @@ bin/ioflux run --trace run.ioflux --engine local --target-root ./scratch \
   --prepare materialize-synthetic --target-map map.yaml -o results.json
 ```
 
+Enforcement is done by the operating system, not by comparing strings: IOFlux
+holds the root open as a directory handle and performs every file operation
+relative to it (`os.Root`), so neither a `..` component nor a symlink can leave
+the root — including a symlink placed inside the root that points outside it,
+which a text-based check would happily follow.
+
 Notes and limits:
 
-- Containment is **lexical**. A symlink *inside* the root that points outside it
-  is not detected. The run records that caveat in `run_env.engine_limitations`
-  rather than implying a stronger guarantee.
+- An **absolute symlink is rejected even when it points back inside the root**,
+  because an absolute link cannot be resolved relative to a root. Relative
+  symlinks that stay inside the root work normally, including ones that
+  traverse `..` without leaving. If a dataset uses absolute symlinks internally,
+  either relativize them or run without `--target-root`.
+- A root confines *path resolution*, not the filesystem. Bind mounts, `/proc`
+  files, and device nodes reachable inside the root remain reachable. The run
+  records this in `run_env.engine_limitations` rather than implying a stronger
+  guarantee.
 - Without `--target-root`, the run is unconfined and records
   `no target root configured: …` in `run_env.engine_limitations`, which the
   report prints under Warnings. The guarantee IOFlux makes is not that targets
@@ -207,4 +221,5 @@ go vet ./...               # static checks
 gofmt -l .                 # formatting check (empty = clean)
 ```
 
-Requires Go 1.22 or newer.
+Requires Go 1.25 or newer (`--target-root` containment uses `os.Root`, whose
+`MkdirAll` landed in 1.25).
