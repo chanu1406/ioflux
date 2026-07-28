@@ -40,7 +40,10 @@ Flags:
   --fill-seed <n>       Seed for deterministic payload fill (default 1)
   --hosts <list>        Comma-separated worker addresses (e.g. hostA:7800,hostB:7800).
                         Omit for a single-node run (an in-process worker).
-  -o <path>             Output path for results.json (required; use - for stdout)
+  -o <path>             Output path for results.json (required; use - for stdout).
+                        Written atomically via a temporary file in the same directory,
+                        so a failed write leaves the previous results intact; this
+                        needs write access to the directory, not only to the file.
   --csv <path>          Append a CSV row to this file (optional; header written once)
 
 S3 flags:
@@ -276,26 +279,19 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Write output.
-	var w io.Writer
+	// Write output. The file path goes through an atomic write so a failure
+	// leaves the previous results intact rather than a truncated file, and
+	// "wrote ..." is printed only once the new results are durable.
 	if outPath == "-" {
-		w = stdout
-	} else {
-		out, err := os.Create(outPath)
-		if err != nil {
-			fmt.Fprintf(stderr, "ioflux run: create output: %v\n", err)
+		if err := results.WriteJSON(stdout, res); err != nil {
+			fmt.Fprintf(stderr, "ioflux run: write results: %v\n", err)
 			return 2
 		}
-		defer out.Close()
-		w = out
-	}
-
-	if err := results.WriteJSON(w, res); err != nil {
-		fmt.Fprintf(stderr, "ioflux run: write results: %v\n", err)
-		return 2
-	}
-
-	if outPath != "-" {
+	} else {
+		if err := results.WriteJSONFile(outPath, res); err != nil {
+			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+			return 2
+		}
 		fmt.Fprintf(stdout, "wrote %s\n", outPath)
 	}
 

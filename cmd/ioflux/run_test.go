@@ -978,3 +978,180 @@ func TestRunCmd_RecordsObjectLevelEquivalence(t *testing.T) {
 			len(objects), objects)
 	}
 }
+
+// TestRunCmd_ResultsWriteFailureExitsNonZero verifies a run that cannot persist
+// its results reports that fact. Printing "wrote results.json" and exiting 0
+// after a failed write is the exact shape of misreporting the honesty
+// guardrails exist to prevent — a scripted pipeline would carry on with a
+// results file that is not there.
+func TestRunCmd_ResultsWriteFailureExitsNonZero(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permissions")
+	}
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	oneTargetReadTrace(t, tracePath, filepath.Join(dir, "shard.dat"), 4096)
+
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resultsPath := filepath.Join(outDir, "results.json")
+	if err := os.Chmod(outDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(outDir, 0o700) })
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 2 {
+		t.Fatalf("runRun exit=%d want 2; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "wrote ") {
+		t.Fatalf("stdout must not claim the results were written, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "results:") {
+		t.Fatalf("stderr should explain the results write failure, got %q", stderr)
+	}
+}
+
+// TestRunCmd_ResultsRewriteIsClean verifies re-running into an existing results
+// file replaces it completely and leaves no temporary file beside it.
+func TestRunCmd_ResultsRewriteIsClean(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "scratch")
+	outDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	resultsPath := filepath.Join(outDir, "results.json")
+	oneTargetReadTrace(t, tracePath, filepath.Join(root, "shard.dat"), 4096)
+
+	args := []string{
+		"--trace", tracePath,
+		"--engine", "local",
+		"--target-root", root,
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	}
+	for i := 0; i < 2; i++ {
+		if code, stdout, stderr := runRunCLI(args); code != 0 {
+			t.Fatalf("run %d exit=%d want 0; stdout=%s stderr=%s", i, code, stdout, stderr)
+		}
+	}
+
+	res := decodeResults(t, resultsPath)
+	if res.BytesMoved != 4096 {
+		t.Fatalf("bytes_moved=%d, want 4096", res.BytesMoved)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "results.json" {
+			t.Errorf("unexpected leftover beside the results file: %q", e.Name())
+		}
+	}
+}
+
+// TestRunCmd_TruncatedTraceRejected is the end-to-end guard on the scenario
+// that produced a fully green report for a workload that was never replayed: a
+// trace cut short at a clean op boundary, as an interrupted copy leaves it.
+// Coverage is measured against the ops present, so the run reported 100% of a
+// trace that had lost half its work.
+func TestRunCmd_TruncatedTraceRejected(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "scratch")
+	fullTrace := filepath.Join(dir, "full.ioflux")
+	shortTrace := filepath.Join(dir, "short.ioflux")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "4",
+		"--shard-size", "64KiB",
+		"--record-size", "16KiB",
+		"--dataloader-workers", "2",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", fullTrace,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+
+	raw, err := os.ReadFile(fullTrace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) < 6 {
+		t.Fatalf("generated trace too small to truncate meaningfully: %d lines", len(lines))
+	}
+	// Drop the trailing ops, keeping whole lines — the header is untouched and
+	// still declares the original totals.
+	kept := lines[:len(lines)-3]
+	if err := os.WriteFile(shortTrace, []byte(strings.Join(kept, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The intact trace replays.
+	mapPath := filepath.Join(dir, "map.yaml")
+	if err := os.WriteFile(mapPath,
+		[]byte("target_rewrite:\n  - from: \"\"\n    to: \""+root+string(os.PathSeparator)+"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseArgs := []string{
+		"--engine", "local",
+		"--target-root", root,
+		"--target-map", mapPath,
+		"--prepare", "materialize-synthetic",
+	}
+	code, stdout, stderr := runRunCLI(append([]string{
+		"--trace", fullTrace, "-o", filepath.Join(dir, "full.json")}, baseArgs...))
+	if code != 0 {
+		t.Fatalf("intact trace should replay: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+
+	// The truncated one must not.
+	code, stdout, stderr = runRunCLI(append([]string{
+		"--trace", shortTrace, "-o", filepath.Join(dir, "short.json")}, baseArgs...))
+	if code == 0 {
+		t.Fatalf("truncated trace replayed successfully; lost ops must not produce a "+
+			"green result (stdout=%s stderr=%s)", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "num_ops") {
+		t.Fatalf("stderr should identify the op-count disagreement, got %q", stderr)
+	}
+}
+
+// TestValidateCmd_TruncatedTraceExitsNonZero verifies the same trace is
+// rejected by the standalone validator, so a broken fixture is caught when it is
+// inspected rather than only when it is replayed.
+func TestValidateCmd_TruncatedTraceExitsNonZero(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	// Header declares 3 ops; only 2 are present.
+	content := `{"ioflux_trace_version":1,"kind":"synthetic","time_unit":"ns","capture_method":"synthetic","scrubbed":false,"targets":[{"id":0,"name":"a.dat","kind":"file","size":4096}],"summary":{"num_ops":3,"num_streams":1,"num_groups":0,"total_bytes":4096,"duration_ns":2}}
+{"t":0,"op_id":0,"s":0,"op":"OPEN","tgt":0,"h":1,"mode":"r"}
+{"t":1,"op_id":1,"s":0,"op":"READ","h":1,"off":0,"len":4096}
+`
+	if err := os.WriteFile(tracePath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runValidate([]string{tracePath}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("validate accepted a truncated trace; exit=%d stdout=%s stderr=%s",
+			code, stdout.String(), stderr.String())
+	}
+	combined := stdout.String() + stderr.String()
+	if !strings.Contains(combined, "num_ops") {
+		t.Fatalf("validate should name the op-count disagreement, got %q", combined)
+	}
+}

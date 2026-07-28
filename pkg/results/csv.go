@@ -20,7 +20,7 @@ var csvColumns = []string{
 
 // AppendCSV appends r as one CSV row to path. The header is written only when
 // the file does not exist or is empty, so multiple runs accumulate cleanly.
-func AppendCSV(path string, r *Results) error {
+func AppendCSV(path string, r *Results) (err error) {
 	fi, statErr := os.Stat(path)
 	writeHeader := statErr != nil || fi.Size() == 0
 
@@ -28,7 +28,13 @@ func AppendCSV(path string, r *Results) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// Report a Close failure when nothing else went wrong: a row that never
+	// reached storage must not be reported as appended.
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
 
 	w := csv.NewWriter(f)
 	if writeHeader {

@@ -6,7 +6,26 @@ import (
 	"testing"
 )
 
+// mustValidate writes h followed by ops and validates the result, recomputing
+// h's op and stream counts from ops first. Validation reconciles the declared
+// summary against the actual op stream, so a fixture that exists to exercise an
+// op invariant should not have to restate the totals — and cannot drift out of
+// agreement with them as ops are added. Tests that exercise the summary fields
+// themselves use mustValidateHeaderAsWritten.
 func mustValidate(t *testing.T, h Header, ops []Op) Report {
+	t.Helper()
+	streams := make(map[int64]struct{}, len(ops))
+	for _, op := range ops {
+		streams[op.S] = struct{}{}
+	}
+	h.Summary.NumOps = int64(len(ops))
+	h.Summary.NumStreams = len(streams)
+	return mustValidateHeaderAsWritten(t, h, ops)
+}
+
+// mustValidateHeaderAsWritten is mustValidate without recomputing the summary,
+// so a test can declare counts that disagree with the ops on purpose.
+func mustValidateHeaderAsWritten(t *testing.T, h Header, ops []Op) Report {
 	t.Helper()
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
@@ -628,7 +647,7 @@ func TestValidate_NegativeSummaryFields(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			h := validSyntheticHeader()
 			c.mutate(&h.Summary)
-			rep := mustValidate(t, h, nil)
+			rep := mustValidateHeaderAsWritten(t, h, nil)
 			if !hasErr(rep, c.want) {
 				t.Fatalf("want %s error, got %v", c.want, rep.Errors)
 			}
@@ -691,5 +710,77 @@ func TestValidate_OpenCarriesOffAndLen(t *testing.T) {
 	}
 	if !hasErr(rep, "OPEN must not carry len") {
 		t.Errorf("want OPEN len error, got %v", rep.Errors)
+	}
+}
+
+// --- Summary reconciliation ---
+
+// TestValidate_TruncatedTraceRejected is the regression test for a trace that
+// lost ops after it was written: an interrupted copy, a failed transfer, a
+// hand-trimmed file. Nothing downstream detects this on its own — replay
+// measures coverage against the ops it finds, so a short trace reports full
+// coverage of itself and the missing work leaves no mark on the result. The
+// declared summary is the only independent record of what should have been
+// there, which is why disagreement is an error.
+func TestValidate_TruncatedTraceRejected(t *testing.T) {
+	ops := []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](1), Mode: ModeRead},
+		{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpRead, H: Ptr[int64](1), Off: Ptr[int64](0), Len: Ptr[int64](1024)},
+		{T: 2, OpID: Ptr[int64](2), S: 0, Op: OpClose, H: Ptr[int64](1)},
+	}
+	h := validSyntheticHeader()
+	h.Summary.NumOps = int64(len(ops))
+	h.Summary.NumStreams = 1
+
+	if rep := mustValidateHeaderAsWritten(t, h, ops); !rep.OK() {
+		t.Fatalf("the complete trace should validate, got %v", rep.Errors)
+	}
+
+	// The same header, with the op stream cut short at a clean boundary — the
+	// shape a truncated file actually takes.
+	rep := mustValidateHeaderAsWritten(t, h, ops[:1])
+	if rep.OK() {
+		t.Fatal("truncated trace validated OK; lost ops must not be invisible")
+	}
+	if !hasErr(rep, "summary.num_ops") {
+		t.Fatalf("want a num_ops reconciliation error, got %v", rep.Errors)
+	}
+	// The count actually read is reported for diagnosis.
+	if rep.NumOpsRead != 1 {
+		t.Errorf("NumOpsRead=%d, want 1", rep.NumOpsRead)
+	}
+}
+
+// TestValidate_StaleStreamCountRejected covers the case truncation does not
+// always change the op count for: a trace whose declared concurrency no longer
+// matches the streams present.
+func TestValidate_StaleStreamCountRejected(t *testing.T) {
+	ops := []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpStat, Tgt: Ptr(0)},
+		{T: 1, OpID: Ptr[int64](0), S: 1, Op: OpStat, Tgt: Ptr(1)},
+	}
+	h := validSyntheticHeader()
+	h.Summary.NumOps = int64(len(ops))
+	h.Summary.NumStreams = 1 // stale: two streams are present
+
+	rep := mustValidateHeaderAsWritten(t, h, ops)
+	if rep.OK() {
+		t.Fatal("stale stream count validated OK")
+	}
+	if !hasErr(rep, "summary.num_streams") {
+		t.Fatalf("want a num_streams reconciliation error, got %v", rep.Errors)
+	}
+}
+
+// TestValidate_EmptyTraceAgrees verifies the reconciliation does not
+// misfire on a legitimately empty trace.
+func TestValidate_EmptyTraceAgrees(t *testing.T) {
+	h := validSyntheticHeader()
+	h.Summary.NumOps = 0
+	h.Summary.NumStreams = 0
+
+	rep := mustValidateHeaderAsWritten(t, h, nil)
+	if hasErr(rep, "summary.num_ops") || hasErr(rep, "summary.num_streams") {
+		t.Fatalf("empty trace should reconcile cleanly, got %v", rep.Errors)
 	}
 }

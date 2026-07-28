@@ -4,7 +4,10 @@ package results
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/chanuollala/ioflux/pkg/fidelity"
@@ -232,6 +235,76 @@ func WriteJSON(w io.Writer, r *Results) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(r)
+}
+
+// resultsFileMode is the permission the results file is given, matching what a
+// plain create under a typical umask produced before writes became atomic.
+const resultsFileMode = 0o644
+
+// WriteJSONFile writes r to path atomically: the JSON goes to a temporary file
+// in the same directory, is flushed to stable storage, and is renamed over path
+// only once it is complete. Either the caller sees the new results or the
+// previous ones — never a half-written file, and never a truncated one left
+// behind by a failure partway through.
+//
+// This matters because the results file is the run's evidence. Creating it
+// directly would destroy the previous run's results the instant the file was
+// opened, before knowing whether the new ones could be written at all, and a
+// write that failed while flushing would still look like it succeeded.
+//
+// The temporary file shares path's directory so the rename stays within one
+// filesystem, where it is atomic. Callers writing to stdout should use
+// WriteJSON; a stream cannot be written atomically.
+func WriteJSONFile(path string, r *Results) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("results: create temp file in %s (the results file is written "+
+			"atomically, which needs write access to its directory, not only to the file): %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := WriteJSON(tmp, r); err != nil {
+		return fmt.Errorf("results: write %s: %w", tmpName, err)
+	}
+	// Durability before visibility: flush the complete contents, then check
+	// Close, which is where a deferred write error (a full disk, a networked
+	// filesystem) surfaces. Ignoring Close is how a failed write gets reported
+	// as a successful one.
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("results: sync %s: %w", tmpName, err)
+	}
+	if err := tmp.Chmod(resultsFileMode); err != nil {
+		return fmt.Errorf("results: chmod %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("results: close %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("results: rename %s to %s: %w", tmpName, path, err)
+	}
+	committed = true
+	syncDir(dir)
+	return nil
+}
+
+// syncDir flushes a directory entry so a completed rename survives a crash.
+// Best-effort: the file contents are already durable at this point, and not
+// every platform or filesystem permits opening a directory to sync it.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // PerOpMap returns a map from op type string to PerOpStats for quick lookup.

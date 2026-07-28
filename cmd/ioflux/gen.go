@@ -151,6 +151,10 @@ func runGenTrainingRead(args []string, stdout, stderr io.Writer) int {
 	})
 
 	var w io.Writer
+	// closeOut is checked before reporting success: a buffered write error
+	// surfaces at Close, and "wrote ..." must not be printed for a trace that
+	// never reached storage.
+	closeOut := func() error { return nil }
 	if out == "-" {
 		w = stdout
 	} else {
@@ -160,11 +164,16 @@ func runGenTrainingRead(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		defer f.Close()
+		closeOut = f.Close
 		w = f
 	}
 
 	if err := trainingread.Generate(p, w); err != nil {
 		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
+		return 2
+	}
+	if err := closeOut(); err != nil {
+		fmt.Fprintf(stderr, "ioflux gen: close %s: %v\n", out, err)
 		return 2
 	}
 
@@ -208,6 +217,10 @@ func runGenCheckpoint(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var w io.Writer
+	// closeOut is checked before reporting success: a buffered write error
+	// surfaces at Close, and "wrote ..." must not be printed for a trace that
+	// never reached storage.
+	closeOut := func() error { return nil }
 	if out == "-" {
 		w = stdout
 	} else {
@@ -217,11 +230,16 @@ func runGenCheckpoint(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		defer f.Close()
+		closeOut = f.Close
 		w = f
 	}
 
 	if err := checkpoint.Generate(p, w); err != nil {
 		fmt.Fprintf(stderr, "ioflux gen: %v\n", err)
+		return 2
+	}
+	if err := closeOut(); err != nil {
+		fmt.Fprintf(stderr, "ioflux gen: close %s: %v\n", out, err)
 		return 2
 	}
 

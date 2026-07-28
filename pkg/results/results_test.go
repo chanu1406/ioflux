@@ -3,6 +3,8 @@ package results_test
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/metrics"
@@ -114,5 +116,129 @@ func TestPerOpStatsMonotonic(t *testing.T) {
 	s := pm["READ"]
 	if !(s.P50NS <= s.P90NS && s.P90NS <= s.P99NS && s.P99NS <= s.MaxNS) {
 		t.Errorf("not monotonic: p50=%d p90=%d p99=%d max=%d", s.P50NS, s.P90NS, s.P99NS, s.MaxNS)
+	}
+}
+
+// --- Atomic results output ---
+
+// TestWriteJSONFileRoundTrip verifies the happy path writes parseable results
+// with the expected permissions and leaves no temporary file behind.
+func TestWriteJSONFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "results.json")
+	want := &results.Results{OpsCompleted: 42, BytesMoved: 4096}
+
+	if err := results.WriteJSONFile(path, want); err != nil {
+		t.Fatalf("WriteJSONFile: %v", err)
+	}
+
+	var got results.Results
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("results file does not parse: %v", err)
+	}
+	if got.OpsCompleted != want.OpsCompleted || got.BytesMoved != want.BytesMoved {
+		t.Fatalf("round trip mismatch: got %+v", got)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o644 {
+		t.Errorf("results file mode = %v, want 0644", perm)
+	}
+	assertNoLeftovers(t, dir, "results.json")
+}
+
+// TestWriteJSONFileReplacesPrevious verifies a second write fully replaces the
+// first rather than overlaying it — a shorter document must not leave a tail of
+// the longer one behind.
+func TestWriteJSONFileReplacesPrevious(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "results.json")
+
+	long := &results.Results{OpsCompleted: 1}
+	for i := 0; i < 50; i++ {
+		long.PerOpStats = append(long.PerOpStats, results.PerOpStats{OpType: "READ", Count: int64(i)})
+	}
+	if err := results.WriteJSONFile(path, long); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := results.WriteJSONFile(path, &results.Results{OpsCompleted: 2}); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	var got results.Results
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("results file does not parse after replace: %v", err)
+	}
+	if got.OpsCompleted != 2 {
+		t.Errorf("OpsCompleted=%d, want 2", got.OpsCompleted)
+	}
+	if len(got.PerOpStats) != 0 {
+		t.Errorf("stale per-op stats survived the replace: %v", got.PerOpStats)
+	}
+	assertNoLeftovers(t, dir, "results.json")
+}
+
+// TestWriteJSONFilePreservesPreviousOnFailure is the point of writing
+// atomically: when the new results cannot be written completely, the previous
+// run's evidence must still be there. Creating the file directly would truncate
+// it at open time — here it would even succeed, silently replacing the previous
+// results in a directory the operator cannot write to.
+//
+// It also pins the behavior change that atomicity requires: write access to the
+// output directory, not only to the results file.
+func TestWriteJSONFilePreservesPreviousOnFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permissions")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "results.json")
+
+	previous := []byte(`{"ops_completed":7}` + "\n")
+	if err := os.WriteFile(path, previous, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Deny creation of the temporary file in the output directory.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	err := results.WriteJSONFile(path, &results.Results{OpsCompleted: 99})
+	if err == nil {
+		t.Fatal("WriteJSONFile succeeded in an unwritable directory; want an error")
+	}
+
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, previous) {
+		t.Fatalf("previous results were damaged by a failed write: got %q, want %q", got, previous)
+	}
+}
+
+// assertNoLeftovers fails if the output directory holds anything beyond the
+// expected file — a leaked temporary would confuse an archived evidence bundle.
+func assertNoLeftovers(t *testing.T, dir, want string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != want {
+			t.Errorf("unexpected leftover file in output directory: %q", e.Name())
+		}
 	}
 }

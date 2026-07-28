@@ -182,7 +182,40 @@ func ValidateWithOps(r *Reader, onOp func(Op) error) (Report, error) {
 		}
 	}
 
+	validateSummaryAgreement(&rep)
+
 	return rep, nil
+}
+
+// validateSummaryAgreement reconciles the header's declared summary against what
+// the op stream actually contained.
+//
+// This is what makes a trace that lost operations after it was written —
+// a truncated copy, an interrupted transfer, a hand-edited file — distinguishable
+// from a complete one. Nothing downstream can tell the difference on its own:
+// replay measures coverage against the ops it finds, so a short trace reports
+// full coverage of itself and the missing work leaves no trace anywhere in the
+// result. The declared counts are the only independent record of what the trace
+// was supposed to contain, so disagreement is an error rather than a warning.
+//
+// Only counts the op stream defines unambiguously are reconciled.
+// summary.num_groups counts explicitly tagged groups rather than distinct group
+// values, and summary.duration_ns is written as the final timestamp by the
+// importers and as a span by the generators; neither can be recomputed here
+// without inventing a definition it was not written against.
+func validateSummaryAgreement(rep *Report) {
+	if declared := rep.Header.Summary.NumOps; declared != rep.NumOpsRead {
+		rep.addError(1, "summary.num_ops", fmt.Sprintf(
+			"header declares %d op(s) but the trace contains %d: the trace is truncated "+
+				"or its summary is stale (regenerate the trace, or correct the summary "+
+				"if the ops were edited deliberately)",
+			declared, rep.NumOpsRead))
+	}
+	if declared, actual := rep.Header.Summary.NumStreams, len(rep.Streams); declared != actual {
+		rep.addError(1, "summary.num_streams", fmt.Sprintf(
+			"header declares %d stream(s) but the trace contains %d: the trace is truncated "+
+				"or its summary is stale", declared, actual))
+	}
 }
 
 // ValidateLoadedRaw validates an already-loaded raw header line and op list.

@@ -152,7 +152,7 @@ func Generate(p Params, w io.Writer) error {
 		Targets:       targets,
 		Summary: trace.Summary{
 			NumOps:     int64(len(all)),
-			NumStreams: p.DataloaderWorkers,
+			NumStreams: countStreams(all),
 			NumGroups:  0,
 			TotalBytes: totalBytes,
 			DurationNS: durationNS,
@@ -314,4 +314,16 @@ func ValidateParams(p Params) error {
 		return fmt.Errorf("gen: read-within-shard must be sequential or random, got %q", p.ReadWithinShard)
 	}
 	return nil
+}
+
+// countStreams returns the number of distinct streams that actually carry ops.
+// It is not the configured worker count: when there are more dataloader workers
+// than shards, the surplus workers are assigned no shard and emit nothing, so
+// declaring the configured count would overstate the trace's concurrency.
+func countStreams(all []streamOp) int {
+	seen := make(map[int64]struct{})
+	for i := range all {
+		seen[all[i].op.S] = struct{}{}
+	}
+	return len(seen)
 }
