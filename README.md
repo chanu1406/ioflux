@@ -33,11 +33,11 @@ manifests, environment comparability, result-schema versioning, and full
 workload qualification are still in progress.
 
 Target names come from the trace, which is imported or hand-edited input, so
-`--target-root` confines the local engine to one directory: replay and dataset
-preparation reject a target that resolves outside it — via `..`, an absolute
-path, or a symlink — instead of reading or overwriting data elsewhere on the
-host. Containment is enforced by the OS, not by string comparison. Without it a
-run is unconfined, and the report says so (see
+`--target-root` confines a run to one place — a directory for the `local` engine
+(enforced by the OS, so `..`, absolute paths, and symlinks cannot escape) or a
+key prefix within the bucket for `s3`. Replay and dataset preparation reject a
+target that resolves outside it instead of reading or overwriting data
+elsewhere. Without it a run is unconfined, and the report says so (see
 [Target containment](#target-containment)).
 
 Distributed execution and POSIX-to-object replay are experimental. They are
@@ -98,21 +98,26 @@ escapes the directory you meant to use — via `allow_passthrough`, a `..`
 sequence, or a rule that does not match what you expected — would truncate real
 data.
 
-`--target-root <dir>` confines the local engine to one directory. Every target is
-resolved (relative names against the working directory) and must land inside the
-root; anything else fails the run before a file is opened, created, or
-truncated:
+`--target-root` confines a run to one place: a directory for the `local` engine,
+a key prefix within `--bucket` for `s3`. Every target must land inside it;
+anything else fails the run before a file is opened, created, or truncated, or
+before any object request is issued.
 
 ```bash
+# local: confined to a directory
 bin/ioflux run --trace run.ioflux --engine local --target-root ./scratch \
   --prepare materialize-synthetic --target-map map.yaml -o results.json
+
+# s3: confined to a key prefix inside the bucket
+bin/ioflux run --trace run.ioflux --engine s3 --bucket bench \
+  --target-root datasets/run-1 --target-map map.yaml -o results.json
 ```
 
-Enforcement is done by the operating system, not by comparing strings: IOFlux
-holds the root open as a directory handle and performs every file operation
-relative to it (`os.Root`), so neither a `..` component nor a symlink can leave
-the root — including a symlink placed inside the root that points outside it,
-which a text-based check would happily follow.
+For the `local` engine, enforcement is done by the operating system rather than
+by comparing strings: IOFlux holds the root open as a directory handle and
+performs every file operation relative to it (`os.Root`), so neither a `..`
+component nor a symlink can leave the root — including a symlink placed inside
+the root that points outside it, which a text-based check would happily follow.
 
 Notes and limits:
 
@@ -130,9 +135,16 @@ Notes and limits:
   report prints under Warnings. The guarantee IOFlux makes is not that targets
   are always confined — it is that a saved report never leaves the question
   unstated.
-- Only the `local` engine can enforce a root. Passing `--target-root` with
-  `--engine mem` or `--engine s3` is a usage error, not a silently ignored flag.
-  Object-prefix containment for S3 is not implemented yet.
+- For `--engine s3`, `--target-root` is a **key prefix** within `--bucket`
+  rather than a directory. Keys outside it are rejected, as are keys carrying a
+  `..` segment: S3 itself treats a key as an opaque string, but a
+  filesystem-backed store may resolve that segment and land outside the prefix,
+  and the guarantee should not depend on what is behind the endpoint. A prefix
+  without a trailing `/` gets one, so `data` confines to `data/` and never
+  admits `database/`. This bounds what IOFlux addresses, not what bucket policy
+  permits.
+- `--engine mem` has no persistent namespace to confine, so passing
+  `--target-root` with it is a usage error rather than a silently ignored flag.
 - `--target-root` cannot be combined with `--hosts`: the root is not part of the
   worker protocol, so a coordinator-side value would not apply on a remote
   worker. Set it on each worker instead (see below).

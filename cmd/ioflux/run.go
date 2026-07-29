@@ -57,15 +57,20 @@ S3 flags:
   --s3-multipart-threshold <size>  Multipart threshold (default 64MiB)
   --s3-multipart-part-size <size>  Multipart part size (default 16MiB; minimum 5MiB)
 
+Containment:
+  --target-root <loc>   Confine every target to one place, so a trace cannot read or
+                        overwrite data elsewhere. Unset means no containment, which the
+                        report records as a limitation. Cannot be combined with --hosts;
+                        set it on each worker instead. Unsupported for --engine mem,
+                        which has no persistent namespace to confine.
+                        local: a directory, enforced by the OS. Targets escaping via
+                          "..", an absolute path, or a symlink are rejected. Created if
+                          missing. Absolute symlinks are rejected even when they point
+                          back inside.
+                        s3:    a key prefix within --bucket. Keys outside it, and keys
+                          carrying a ".." segment, are rejected.
+
 Local engine flags:
-  --target-root <dir>   Confine every target to this directory, enforced by the OS:
-                        replay and preparation reject a target that resolves outside it
-                        via "..", an absolute path, or a symlink, so a trace cannot read
-                        or overwrite data elsewhere on the host. Created if missing.
-                        Absolute symlinks are rejected even when they point back inside.
-                        Unset means no containment, which the report records as a
-                        limitation. Cannot be combined with --hosts; set it on each
-                        worker instead.
   --allow-direct        Honor O_DIRECT opens from the trace (Linux only; default off)
   --direct-fallback     Fall back to buffered I/O when O_DIRECT is unsupported by the
                         filesystem rather than failing the open

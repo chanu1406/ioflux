@@ -786,9 +786,9 @@ func TestRunCmd_TargetRootRejectedWithHosts(t *testing.T) {
 	}
 }
 
-// TestRunCmd_TargetRootRejectedForNonLocalEngine verifies a root the engine
-// cannot enforce is a usage error, not a silently ignored flag.
-func TestRunCmd_TargetRootRejectedForNonLocalEngine(t *testing.T) {
+// TestRunCmd_TargetRootRejectedForMemEngine verifies a root the engine cannot
+// enforce is a usage error, not a silently ignored flag.
+func TestRunCmd_TargetRootRejectedForMemEngine(t *testing.T) {
 	base := t.TempDir()
 	tracePath := filepath.Join(base, "trace.ioflux")
 	oneTargetReadTrace(t, tracePath, filepath.Join(base, "shard.dat"), 4096)
@@ -802,7 +802,7 @@ func TestRunCmd_TargetRootRejectedForNonLocalEngine(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("runRun exit=%d want 2; stdout=%s stderr=%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "only supported by the local engine") {
+	if !strings.Contains(stderr, "only supported by the local and s3 engines") {
 		t.Fatalf("stderr should explain the engine cannot enforce a root, got %q", stderr)
 	}
 }
@@ -1153,5 +1153,158 @@ func TestValidateCmd_TruncatedTraceExitsNonZero(t *testing.T) {
 	combined := stdout.String() + stderr.String()
 	if !strings.Contains(combined, "num_ops") {
 		t.Fatalf("validate should name the op-count disagreement, got %q", combined)
+	}
+}
+
+// TestRunCmd_S3TargetRootRejectsEscapingKey is the object-store counterpart to
+// the local containment guard: a trace whose rewritten keys fall outside
+// --target-root must fail the run before any object is written, so a replay
+// cannot overwrite unrelated objects elsewhere in the bucket.
+func TestRunCmd_S3TargetRootRejectsEscapingKey(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2", "--shard-size", "64KiB", "--record-size", "8KiB",
+		"--dataloader-workers", "1", "--shuffle=false", "--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+	// Rewrite targets outside the prefix the run will be confined to.
+	if err := os.WriteFile(mapPath,
+		[]byte("target_rewrite:\n  - from: \"\"\n    to: \"s3://bench/elsewhere/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var wrote []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			mu.Lock()
+			wrote = append(wrote, r.URL.Path)
+			mu.Unlock()
+		}
+		w.Header().Set("ETag", `"x"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"--endpoint", srv.URL,
+		"--bucket", "bench",
+		"--path-style",
+		"--access-key", "ak",
+		"--secret-key", "sk",
+		"--target-map", mapPath,
+		"--target-root", "datasets/run-1",
+		"--prepare", "materialize-synthetic",
+		"-o", filepath.Join(dir, "results.json"),
+	})
+	if code == 0 {
+		t.Fatalf("run wrote outside --target-root; exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "outside the configured prefix") {
+		t.Fatalf("stderr should explain the prefix rejection, got %q", stderr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(wrote) != 0 {
+		t.Fatalf("objects were written despite the containment failure: %v", wrote)
+	}
+}
+
+// TestRunCmd_S3TargetRootAllowsContainedRun verifies a run whose keys sit under
+// --target-root completes and records that its keys were confined.
+func TestRunCmd_S3TargetRootAllowsContainedRun(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	mapPath := filepath.Join(dir, "map.yaml")
+	resultsPath := filepath.Join(dir, "results.json")
+
+	if code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2", "--shard-size", "64KiB", "--record-size", "8KiB",
+		"--dataloader-workers", "1", "--shuffle=false", "--seed", "1",
+		"-o", tracePath,
+	}); code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+	if err := os.WriteFile(mapPath,
+		[]byte("target_rewrite:\n  - from: \"\"\n    to: \"s3://bench/datasets/run-1/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	objects := make(map[string][]byte)
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/bench/")
+		switch r.Method {
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			objects[key] = body
+			mu.Unlock()
+			w.Header().Set("ETag", `"x"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			mu.Lock()
+			body, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			mu.Lock()
+			body, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			start, end, ok := parseTestRange(r.Header.Get("Range"), len(body))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[start : end+1])
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath,
+		"--engine", "s3",
+		"--endpoint", srv.URL,
+		"--bucket", "bench",
+		"--path-style",
+		"--access-key", "ak",
+		"--secret-key", "sk",
+		"--target-map", mapPath,
+		"--target-root", "datasets/run-1",
+		"--prepare", "materialize-synthetic",
+		"-o", resultsPath,
+	})
+	if code != 0 {
+		t.Fatalf("contained s3 run exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	res := decodeResults(t, resultsPath)
+	joined := strings.Join(res.RunEnv.EngineLimitations, "\n")
+	if strings.Contains(joined, "no target root configured") {
+		t.Fatalf("a confined s3 run must not report itself unconfined: %q", joined)
+	}
+	if !strings.Contains(joined, "datasets/run-1/") {
+		t.Fatalf("engine_limitations should name the enforced prefix, got %q", joined)
 	}
 }

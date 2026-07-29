@@ -333,3 +333,126 @@ func TestPutAcceptsNonSeekableReaderBelowThreshold(t *testing.T) {
 		t.Fatalf("body length=%d, want %d matching bytes", len(gotBody), len(want))
 	}
 }
+
+// --- Key-prefix containment ---
+
+// TestKeyPrefixConfinesEveryEntryPoint verifies the prefix is checked on every
+// method that takes a key, not only the one a test happens to exercise. A gap
+// in any of them is a way for a trace to address an object elsewhere in the
+// bucket.
+func TestKeyPrefixConfinesEveryEntryPoint(t *testing.T) {
+	eng, err := s3engine.New(s3engine.Config{
+		Endpoint: "http://127.0.0.1:1", Bucket: "bench", PathStyle: true,
+		AccessKey: "ak", SecretKey: "sk", KeyPrefix: "datasets/run-1/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	const outside = "other/secret.bin"
+
+	// Each call must be refused before any request is attempted — the endpoint
+	// points at a closed port, so a network error here would mean the check was
+	// skipped and the request went out.
+	checks := map[string]error{
+		"Open": func() error {
+			_, err := eng.Open(ctx, outside, engine.ModeRead, engine.OpenFlagNone)
+			return err
+		}(),
+		"Get": func() error {
+			_, err := eng.Get(ctx, outside, 0, 16, make([]byte, 16))
+			return err
+		}(),
+		"Head":        func() error { _, err := eng.Head(ctx, outside); return err }(),
+		"Stat":        func() error { _, err := eng.Stat(ctx, outside); return err }(),
+		"Put":         eng.Put(ctx, outside, bytes.NewReader([]byte("x")), 1),
+		"Delete":      eng.Delete(ctx, outside),
+		"CheckTarget": eng.CheckTarget(outside),
+	}
+	for name, err := range checks {
+		if !errors.Is(err, engine.ErrOutsideRoot) {
+			t.Errorf("%s(%q) err=%v, want engine.ErrOutsideRoot", name, outside, err)
+		}
+	}
+}
+
+// TestKeyPrefixAllowsKeysInside verifies containment does not reject the keys a
+// confined run is supposed to address.
+func TestKeyPrefixAllowsKeysInside(t *testing.T) {
+	eng, err := s3engine.New(s3engine.Config{
+		Endpoint: "http://127.0.0.1:1", Bucket: "bench", PathStyle: true,
+		AccessKey: "ak", SecretKey: "sk", KeyPrefix: "datasets/run-1/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, key := range []string{
+		"datasets/run-1/shard_0000.tar",
+		"datasets/run-1/nested/deep/obj.bin",
+	} {
+		if err := eng.CheckTarget(key); err != nil {
+			t.Errorf("CheckTarget(%q) rejected a key inside the prefix: %v", key, err)
+		}
+	}
+}
+
+// TestKeyPrefixNormalizesTrailingSlash verifies a prefix without a trailing
+// slash confines to that folder rather than matching any key that merely starts
+// with the same characters — "data" must not admit "database/".
+func TestKeyPrefixNormalizesTrailingSlash(t *testing.T) {
+	eng, err := s3engine.New(s3engine.Config{
+		Endpoint: "http://127.0.0.1:1", Bucket: "bench", PathStyle: true,
+		AccessKey: "ak", SecretKey: "sk", KeyPrefix: "data",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := eng.CheckTarget("data/obj.bin"); err != nil {
+		t.Errorf("CheckTarget in prefix: %v", err)
+	}
+	if err := eng.CheckTarget("database/obj.bin"); !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Errorf("CheckTarget(%q) err=%v, want engine.ErrOutsideRoot — a sibling prefix "+
+			"must not be admitted by string prefix alone", "database/obj.bin", err)
+	}
+}
+
+// TestKeyPrefixRejectsTraversalSegments verifies keys carrying ".." are refused
+// even though they textually sit under the prefix. S3 itself treats a key as an
+// opaque string, but a filesystem-backed store may resolve the segment and land
+// outside the prefix; the guarantee must not depend on which implementation is
+// behind the endpoint.
+func TestKeyPrefixRejectsTraversalSegments(t *testing.T) {
+	eng, err := s3engine.New(s3engine.Config{
+		Endpoint: "http://127.0.0.1:1", Bucket: "bench", PathStyle: true,
+		AccessKey: "ak", SecretKey: "sk", KeyPrefix: "datasets/run-1/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const escaping = "datasets/run-1/../../etc/passwd"
+	if !strings.HasPrefix(escaping, "datasets/run-1/") {
+		t.Fatal("test key should pass a naive prefix check")
+	}
+	if err := eng.CheckTarget(escaping); !errors.Is(err, engine.ErrOutsideRoot) {
+		t.Errorf("CheckTarget(%q) err=%v, want engine.ErrOutsideRoot", escaping, err)
+	}
+}
+
+// TestNoKeyPrefixIsUnconfinedAndSaysSo verifies an unconfined engine allows any
+// key and records that the run had no containment, matching the local engine.
+func TestNoKeyPrefixIsUnconfinedAndSaysSo(t *testing.T) {
+	eng, err := s3engine.New(s3engine.Config{
+		Endpoint: "http://127.0.0.1:1", Bucket: "bench", PathStyle: true,
+		AccessKey: "ak", SecretKey: "sk",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := eng.CheckTarget("anything/at/all"); err != nil {
+		t.Errorf("unconfined engine rejected a key: %v", err)
+	}
+	joined := strings.Join(eng.Limitations(), "\n")
+	if !strings.Contains(joined, "no target root configured") {
+		t.Fatalf("limitations=%q, want a note that keys were not confined", joined)
+	}
+}

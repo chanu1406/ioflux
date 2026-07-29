@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/chanuollala/ioflux/pkg/engine"
-	"github.com/chanuollala/ioflux/pkg/engine/localfile"
 	"github.com/chanuollala/ioflux/pkg/replay"
 	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -201,12 +200,13 @@ func (s *Session) Collect() (*replay.WorkerOutput, error) {
 	return s.out, nil
 }
 
-// engineLimitations extracts honesty notes an engine recorded during the run.
-// Only the local-file engine reports them today (O_DIRECT fallback); other
-// engines contribute none.
+// engineLimitations extracts the honesty notes an engine recorded about what its
+// configuration guaranteed. Asking through engine.Limiter rather than naming a
+// concrete type means a new engine's caveats reach the report by implementing
+// the interface, instead of silently contributing none.
 func engineLimitations(eng engine.Engine) []string {
-	if lfe, ok := eng.(*localfile.LocalFileEngine); ok {
-		return lfe.Limitations()
+	if l, ok := eng.(engine.Limiter); ok {
+		return l.Limitations()
 	}
 	return nil
 }

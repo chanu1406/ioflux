@@ -99,6 +99,14 @@ type TargetChecker interface {
 	CheckTarget(target string) error
 }
 
+// Limiter is implemented by engines that record what their configuration does
+// and does not guarantee — a requested behavior that could not be honored, or a
+// safety property the run did not have. Callers surface these in run metadata so
+// a saved report never leaves the question unanswered.
+type Limiter interface {
+	Limitations() []string
+}
+
 // Shutdowner is implemented by engines holding process-level OS resources
 // beyond individual file handles — the local engine keeps its containment root
 // open as a directory handle. A caller that builds engines repeatedly (a

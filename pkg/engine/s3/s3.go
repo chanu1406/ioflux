@@ -54,6 +54,13 @@ type Config struct {
 	// HeadOnOpen verifies an object exists when a file-shaped trace OPENs it.
 	// Default false keeps OPEN cheap; READ reports missing objects.
 	HeadOnOpen bool
+
+	// KeyPrefix confines the engine to one region of the bucket's key space:
+	// every key the trace addresses must sit under it, so a trace cannot read
+	// or overwrite objects elsewhere in the bucket. Empty applies no
+	// containment. A prefix without a trailing "/" gets one, so "data" confines
+	// to "data/" and never matches "database/".
+	KeyPrefix string
 }
 
 // S3Engine is an Engine backed by S3-compatible object storage.
@@ -85,6 +92,9 @@ func New(cfg Config) (*S3Engine, error) {
 	}
 	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
 		return nil, fmt.Errorf("s3: access key and secret key must be provided together")
+	}
+	if cfg.KeyPrefix != "" && !strings.HasSuffix(cfg.KeyPrefix, "/") {
+		cfg.KeyPrefix += "/"
 	}
 
 	loadOpts := []func(*config.LoadOptions) error{
@@ -123,6 +133,51 @@ func New(cfg Config) (*S3Engine, error) {
 	}, nil
 }
 
+// CheckTarget reports whether key is inside the configured prefix, implementing
+// engine.TargetChecker so a caller can reject a whole target table before any
+// request is issued.
+func (e *S3Engine) CheckTarget(key string) error { return e.checkKey(key) }
+
+// checkKey confines a key to the configured prefix.
+//
+// Unlike a filesystem path, an S3 key is an opaque string: the store does not
+// resolve "..", so a key is exactly what IOFlux sends. That makes a prefix
+// comparison sufficient against S3 itself — but object stores backed by a
+// filesystem (MinIO in filesystem mode, some gateways) do map keys onto paths,
+// where a ".." component can escape. Those keys are rejected rather than left
+// to depend on which implementation is behind the endpoint.
+func (e *S3Engine) checkKey(key string) error {
+	if e.cfg.KeyPrefix == "" {
+		return nil
+	}
+	if !strings.HasPrefix(key, e.cfg.KeyPrefix) {
+		return fmt.Errorf("s3: key %q is outside the configured prefix %q: %w",
+			key, e.cfg.KeyPrefix, engine.ErrOutsideRoot)
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			return fmt.Errorf("s3: key %q contains a %q segment, which a filesystem-backed "+
+				"object store may resolve outside the prefix %q: %w",
+				key, "..", e.cfg.KeyPrefix, engine.ErrOutsideRoot)
+		}
+	}
+	return nil
+}
+
+// Limitations returns honesty notes about what this engine's configuration does
+// and does not guarantee, implementing engine.Limiter. They are fixed at
+// construction; S3 records nothing further during a run.
+func (e *S3Engine) Limitations() []string {
+	if e.cfg.KeyPrefix == "" {
+		return []string{"no target root configured: replay and dataset preparation were not " +
+			"confined to a key prefix, so any key in bucket " + e.cfg.Bucket + " that a rewritten " +
+			"trace target resolves to could be read or overwritten (set --target-root to confine them)"}
+	}
+	return []string{"target keys are confined to prefix " + e.cfg.KeyPrefix + " in bucket " +
+		e.cfg.Bucket + "; this bounds what IOFlux addresses, not what bucket policy or a " +
+		"gateway permits"}
+}
+
 func coldHTTPClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DisableKeepAlives = true
@@ -150,6 +205,9 @@ func (e *S3Engine) Caps() engine.Capabilities {
 func (e *S3Engine) Open(ctx context.Context, target string, mode engine.Mode, _ engine.OpenFlags) (engine.Handle, error) {
 	if mode != engine.ModeRead {
 		return 0, fmt.Errorf("s3: open %q with mode %q: %w", target, mode, engine.ErrUnsupported)
+	}
+	if err := e.checkKey(target); err != nil {
+		return 0, err
 	}
 	if e.cfg.HeadOnOpen {
 		if _, err := e.Head(ctx, target); err != nil {
@@ -202,6 +260,9 @@ func (e *S3Engine) Stat(ctx context.Context, target string) (engine.ObjectInfo, 
 
 // Put writes a whole object. Large objects use multipart upload.
 func (e *S3Engine) Put(ctx context.Context, key string, r io.Reader, size int64) error {
+	if err := e.checkKey(key); err != nil {
+		return err
+	}
 	if size < 0 {
 		return fmt.Errorf("s3: put %q: negative size %d", key, size)
 	}
@@ -240,6 +301,9 @@ func seekableBody(r io.Reader, size int64) (io.ReadSeeker, error) {
 
 // Get reads length bytes from key at off using an S3 Range GET.
 func (e *S3Engine) Get(ctx context.Context, key string, off, length int64, buf []byte) (int, error) {
+	if err := e.checkKey(key); err != nil {
+		return 0, err
+	}
 	if off < 0 {
 		return 0, fmt.Errorf("s3: get %q: offset %d must be non-negative", key, off)
 	}
@@ -276,6 +340,9 @@ func (e *S3Engine) Get(ctx context.Context, key string, off, length int64, buf [
 
 // Head returns object metadata.
 func (e *S3Engine) Head(ctx context.Context, key string) (engine.ObjectInfo, error) {
+	if err := e.checkKey(key); err != nil {
+		return engine.ObjectInfo{}, err
+	}
 	out, err := e.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(e.cfg.Bucket),
 		Key:    aws.String(key),
@@ -292,6 +359,9 @@ func (e *S3Engine) Head(ctx context.Context, key string) (engine.ObjectInfo, err
 
 // Delete removes key.
 func (e *S3Engine) Delete(ctx context.Context, key string) error {
+	if err := e.checkKey(key); err != nil {
+		return err
+	}
 	_, err := e.client.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket: aws.String(e.cfg.Bucket),
 		Key:    aws.String(key),

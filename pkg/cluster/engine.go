@@ -20,10 +20,11 @@ type EngineSpec struct {
 	DirectFallback bool  `json:"direct_fallback,omitempty"`
 	DirectAlign    int64 `json:"direct_align,omitempty"`
 
-	// Root confines the local engine to a directory: every target must resolve
-	// inside it, so a trace cannot read or overwrite data elsewhere on the host.
-	// Empty applies no containment. Only the local engine can honor it;
-	// BuildEngine rejects it for any other engine rather than ignoring it.
+	// Root confines the engine to one region of its namespace, so a trace cannot
+	// read or overwrite data elsewhere: a directory for the local engine, a key
+	// prefix within the bucket for s3. Empty applies no containment. The mem
+	// engine has nothing persistent to confine, so BuildEngine rejects a root
+	// there rather than ignoring it.
 	//
 	// Root is deliberately NOT carried over the gRPC wire (clusterpb.EngineSpec
 	// has no matching field, and regenerating it needs a protoc toolchain this
@@ -42,9 +43,11 @@ type EngineSpec struct {
 // engine uses an object-store bucket namespace.
 func BuildEngine(spec EngineSpec) (engine.Engine, string, error) {
 	// Fail closed: a containment root the chosen engine cannot enforce must
-	// stop the run, never be silently dropped.
-	if spec.Root != "" && spec.Name != "local" {
-		return nil, "", fmt.Errorf("target root is only supported by the local engine, not %q", spec.Name)
+	// stop the run, never be silently dropped. The mem engine has no persistent
+	// namespace to confine, so accepting a root there would imply a guarantee
+	// that means nothing.
+	if spec.Root != "" && spec.Name != "local" && spec.Name != "s3" {
+		return nil, "", fmt.Errorf("target root is only supported by the local and s3 engines, not %q", spec.Name)
 	}
 	switch spec.Name {
 	case "mem":
@@ -68,6 +71,9 @@ func BuildEngine(spec EngineSpec) (engine.Engine, string, error) {
 	case "s3":
 		cfg := spec.S3
 		cfg.DisableHTTPKeepAlive = spec.CacheMode == "cold"
+		// For an object store the containment root is a key prefix within the
+		// configured bucket.
+		cfg.KeyPrefix = spec.Root
 		eng, err := s3engine.New(cfg)
 		if err != nil {
 			return nil, "", err
