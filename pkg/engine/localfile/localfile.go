@@ -114,9 +114,23 @@ func New(opts ...Option) *LocalFileEngine {
 	for _, opt := range opts {
 		opt(e)
 	}
+	e.addLimitation(posixFormLimitation)
 	e.initRoot()
 	return e
 }
+
+// posixFormLimitation records the syscall-form substitution this engine makes
+// on every run. It is not conditional on the trace: reads and writes always go
+// through ReadAt/WriteAt (pread/pwrite), and a confined engine resolves targets
+// relative to a directory handle, so the syscalls the kernel sees differ in form
+// from a source workload that used sequential read/write and path-based stat --
+// even when every offset and length matches exactly. A result that claims
+// syscall-level equivalence needs to say which syscalls.
+const posixFormLimitation = "replay is positional: READ/WRITE are issued as " +
+	"pread/pwrite at explicit offsets and never move a file cursor, so a source " +
+	"workload's sequential read/write calls and its lseek calls are not reproduced in " +
+	"form (offsets and lengths are); STAT is issued against the target path, not as " +
+	"fstat on an open descriptor"
 
 // initRoot opens a configured containment root and records what the run may and
 // may not conclude about target safety. Both the confined and the unconfined

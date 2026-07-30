@@ -22,15 +22,33 @@ process capture is not implemented yet.
 IOFlux is useful today for controlled experiments and simple, synchronous,
 same-domain replays. It is not yet a production-qualified benchmark for storage
 purchasing, capacity planning, or whole-application reproduction. In particular,
-imported traces retain capture-method limitations, short transfers make a run
-fail, a latency sample outside the histogram's 100s trackable range (e.g. a
-hang or stall) also fails the run instead of silently vanishing from every
-percentile, saved reports identify detected operation failures as invalid
-execution, and every run records whether it was an exact op-for-op replay or a
-transformation of the trace (`replay_equivalence`), so a comparison between the
-two is flagged rather than presented as a backend difference. Importer loss
-manifests, environment comparability, result-schema versioning, and full
-workload qualification are still in progress.
+imported traces retain capture-method limitations, a short transfer *during
+replay* makes a run fail, a latency sample outside the histogram's 100s
+trackable range (e.g. a hang or stall) also fails the run instead of silently
+vanishing from every percentile, saved reports identify detected operation
+failures as invalid execution, and every run records whether it was an exact
+op-for-op replay or a transformation of the trace (`replay_equivalence`), so a
+comparison between the two is flagged rather than presented as a backend
+difference. Importer loss manifests, environment comparability, result-schema
+versioning, and full workload qualification are still in progress.
+
+A short transfer *in the source workload* is a different case, and it does not
+fail the run: the trace IR carries one length per transfer op and it holds the
+bytes the source actually moved, so a source read of 256 KiB that returned
+111 KiB replays as a 111 KiB request. The replay is not short and reports no
+error, but the source's request shape was not reproduced. Import counts these
+(`short_transfer_requested_len_dropped`), records the count in the trace's
+header notes, and states the loss in the capture limitations that every saved
+result carries. Representing a requested length properly needs trace schema v2.
+
+Similarly, the `local` engine replays reads and writes positionally
+(`pread`/`pwrite` at explicit offsets) and stats targets by path, so a source
+workload's sequential `read`/`write` calls, its file-cursor semantics, and its
+`lseek` calls are not reproduced in form — offsets and lengths are. Every run
+records this in `run_env.engine_limitations`.
+
+Both limits were found by measurement, not inspection; see
+[`qualification/RESULTS.md`](qualification/RESULTS.md).
 
 Target names come from the trace, which is imported or hand-edited input, so
 `--target-root` confines a run to one place — a directory for the `local` engine
@@ -244,3 +262,21 @@ gofmt -l .                 # formatting check (empty = clean)
 
 Requires Go 1.25 or newer (`--target-root` containment uses `os.Root`, whose
 `MkdirAll` landed in 1.25).
+
+## Qualification
+
+[`qualification/`](qualification/) holds the pinned fixture and harness that
+check whether a replay actually reproduces the workload it claims to replay,
+measured against an oracle that is independent of the importer.
+
+```bash
+qualification/qualify.sh    # live -> capture -> import -> replay -> reconcile (~40s)
+qualification/spike.sh      # acquisition-source comparison
+```
+
+- [`FIXTURE.md`](qualification/FIXTURE.md) — the fixture contract: dataset shape,
+  worker model, cache assumptions, oracle, primary metric.
+- [`RESULTS.md`](qualification/RESULTS.md) — what matched, what did not, and what
+  could not be measured.
+
+Requires Linux (`posix_fadvise`, `/proc/<pid>/io`), `strace`, and Python 3.11+.

@@ -420,3 +420,100 @@ func TestImport_Empty(t *testing.T) {
 		t.Errorf("empty import report = %+v, want 0 ops / 0 streams", rep)
 	}
 }
+
+// TestImport_ShortReadRecordsDroppedRequestedLength pins the disclosure that a
+// short transfer loses the byte count the application asked for. The trace IR has
+// one length field per transfer op and it holds what actually moved, so a
+// consumer can only learn that replay will under-request by reading this count.
+//
+// The qualification fixture (qualification/FIXTURE.md) reads shards whose size is
+// not a multiple of its block size, which produces exactly this case; the
+// reported count was cross-checked against an independent oracle.
+func TestImport_ShortReadRecordsDroppedRequestedLength(t *testing.T) {
+	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/shard.bin", O_RDONLY) = 3 <0.000010>
+12:00:00.000100 read(3, ""..., 262144) = 262144 <0.000050>
+12:00:00.000200 read(3, ""..., 262144) = 111392 <0.000040>
+12:00:00.000300 read(3, "", 262144) = 0 <0.000005>
+12:00:00.000400 close(3) = 0 <0.000005>
+`
+	rep, hdr, ops := importString(t, in)
+
+	if got := rep.Lossy[importer.LossyNote]; got != 1 {
+		t.Errorf("Lossy[%s] = %d, want 1 (only the 111392-of-262144 read is short)",
+			importer.LossyNote, got)
+	}
+	// The full-length read must not be counted, and the EOF read is a skip, not a
+	// loss: it produced no op at all.
+	if rep.SkippedReasons["eof_read"] != 1 {
+		t.Errorf("eof_read skips = %d, want 1", rep.SkippedReasons["eof_read"])
+	}
+	if got := len(rep.Lossy); got != 1 {
+		t.Errorf("len(Lossy) = %d, want exactly 1 reason: %v", got, rep.Lossy)
+	}
+
+	// The emitted op keeps the transferred length, which is what makes the
+	// requested length unrecoverable from the trace alone.
+	var reads []trace.Op
+	for _, op := range ops {
+		if op.Op == trace.OpRead {
+			reads = append(reads, op)
+		}
+	}
+	if len(reads) != 2 {
+		t.Fatalf("got %d READ ops, want 2", len(reads))
+	}
+	if *reads[1].Len != 111392 {
+		t.Errorf("short READ len = %d, want 111392 (returned bytes)", *reads[1].Len)
+	}
+
+	// The count must travel with the trace, not only with the terminal that ran
+	// the import.
+	if !strings.Contains(hdr.Notes, "lossy: "+importer.LossyNote+"=1") {
+		t.Errorf("header notes do not carry the lossy count: %q", hdr.Notes)
+	}
+	for _, want := range []string{"not the byte count it", "EOF) is dropped", "replayed positionally"} {
+		if !strings.Contains(hdr.CaptureLimitations, want) {
+			t.Errorf("capture limitations missing %q: %q", want, hdr.CaptureLimitations)
+		}
+	}
+}
+
+// TestImport_FullTransfersAreNotLossy guards against the loss counter firing on
+// ordinary full-length reads, which would make the disclosure meaningless.
+func TestImport_FullTransfersAreNotLossy(t *testing.T) {
+	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/f", O_RDONLY) = 3 <0.000010>
+12:00:00.000100 read(3, ""..., 4096) = 4096 <0.000050>
+12:00:00.000200 pread64(3, ""..., 4096, 8192) = 4096 <0.000050>
+12:00:00.000300 close(3) = 0 <0.000005>
+`
+	rep, hdr, _ := importString(t, in)
+	if len(rep.Lossy) != 0 {
+		t.Errorf("Lossy = %v, want empty for full-length transfers", rep.Lossy)
+	}
+	if strings.Contains(hdr.Notes, "lossy:") {
+		t.Errorf("notes should not mention loss when none occurred: %q", hdr.Notes)
+	}
+}
+
+// TestImport_ShortPositionalReadIsLossy covers pread64, whose requested count is
+// in the same argument position as read's but which carries an explicit offset.
+func TestImport_ShortPositionalReadIsLossy(t *testing.T) {
+	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/f", O_RDONLY) = 3 <0.000010>
+12:00:00.000100 pread64(3, ""..., 65536, 131072) = 4096 <0.000050>
+12:00:00.000200 close(3) = 0 <0.000005>
+`
+	rep, _, ops := importString(t, in)
+	if got := rep.Lossy[importer.LossyNote]; got != 1 {
+		t.Errorf("Lossy[%s] = %d, want 1", importer.LossyNote, got)
+	}
+	for _, op := range ops {
+		if op.Op == trace.OpRead {
+			if *op.Off != 131072 {
+				t.Errorf("pread64 offset = %d, want 131072", *op.Off)
+			}
+			if *op.Len != 4096 {
+				t.Errorf("pread64 len = %d, want 4096 (returned)", *op.Len)
+			}
+		}
+	}
+}

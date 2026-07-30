@@ -34,6 +34,14 @@ const (
 	captureLimitations = "DFTracer POSIX trace; STDIO (fread/fwrite) and MPI-IO events not represented; " +
 		"mmap page-fault I/O not captured; ops on file descriptors opened before tracing are skipped; " +
 		"cross-thread fd sharing not modeled (fd opened by one thread is unresolved when accessed by another); " +
+		"stat/fstat events are not represented, so a workload's metadata operations are absent from the trace; " +
+		"a READ/WRITE op records the bytes the source actually transferred, not the byte count it " +
+		"requested, because the trace IR has one length field per transfer: where the source read or " +
+		"wrote short, replay issues a smaller request than the application did and so does not " +
+		"reproduce the source request shape for those ops (see the lossy counts in notes); " +
+		"a read that returned 0 (EOF) is dropped entirely, so replay performs one fewer read per " +
+		"sequential read-to-EOF loop than the application did; " +
+		"reads are replayed positionally, so the source's file-cursor semantics are not reproduced; " +
 		"hashed-filename traces (DFTracer 2.x) resolve paths via FH metadata and reconstruct read/write " +
 		"offsets from sequential per-file cursors, since that format records byte counts but no offsets"
 	generatedBy = "ioflux-import 0.1.0 / dftracer"
@@ -379,6 +387,13 @@ func (p *parser) doRW(stream, t int64, dur *int64, a *dfArgs, kind trace.OpKind,
 		p.b.Skip("append_write_unmodeled")
 		return
 	}
+	// args.count is the byte count the application requested; the trace IR has
+	// only one length per transfer op and it holds what actually moved. Where the
+	// two differ the request shape is lost, and a consumer can only know that if
+	// it is recorded.
+	if requested, ok := rawInt(a.Count); ok && requested > n {
+		p.b.Note(importer.LossyNote)
+	}
 
 	var off int64
 	if positional && a.Offset != nil {
@@ -452,16 +467,19 @@ func (p *parser) stream(pt pidTID) int64 {
 }
 
 func (p *parser) notes() string {
-	if len(p.streamOrder) == 0 {
-		return "dftracer import"
-	}
 	var sb strings.Builder
-	sb.WriteString("dftracer import; streams: ")
-	for i, pt := range p.streamOrder {
-		if i > 0 {
-			sb.WriteString(", ")
+	sb.WriteString("dftracer import")
+	if len(p.streamOrder) > 0 {
+		sb.WriteString("; streams: ")
+		for i, pt := range p.streamOrder {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "s%d=pid %d tid %d", p.ptToStream[pt], pt.pid, pt.tid)
 		}
-		fmt.Fprintf(&sb, "s%d=pid %d tid %d", p.ptToStream[pt], pt.pid, pt.tid)
+	}
+	if lossy := p.b.LossySummary(); lossy != "" {
+		sb.WriteString("; " + lossy)
 	}
 	return sb.String()
 }

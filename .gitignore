@@ -20,3 +20,6 @@ go.work.sum
 
 # Local demo outputs
 /demo/
+
+# Python bytecode cache from the qualification harness
+__pycache__/

@@ -23,7 +23,16 @@ const (
 	captureMethod      = "import:strace"
 	captureLimitations = "strace syscall trace; mmap page-fault I/O not captured; " +
 		"ops on file descriptors opened before tracing or shared across threads are skipped; " +
-		"STDIO/socket/non-file syscalls ignored; strace -T durations are preserved as optional op metadata; " +
+		"STDIO/socket/non-file syscalls ignored; " +
+		"a READ/WRITE op records the bytes the source actually transferred, not the byte count it " +
+		"requested, because the trace IR has one length field per transfer: where the source read or " +
+		"wrote short, replay issues a smaller request than the application did and so does not " +
+		"reproduce the source request shape for those ops (see the lossy counts in notes); " +
+		"a read that returned 0 (EOF) is dropped entirely, so replay performs one fewer read per " +
+		"sequential read-to-EOF loop than the application did; " +
+		"reads are replayed positionally, so the source's file-cursor semantics and its lseek calls " +
+		"are not reproduced; " +
+		"strace -T durations are preserved as optional op metadata; " +
 		"ptrace-based tracing itself is slow (commonly 10-100x wall-clock overhead) and distorts the " +
 		"captured timeline, so timeline/scaled replay of this trace should not be trusted for absolute " +
 		"pacing — prefer asap-mode replay or compare against the preserved per-op durations"
@@ -348,6 +357,15 @@ func (p *parser) doRW(s, t int64, name string, a []string, ret string, dur *int6
 		return
 	}
 
+	// The trace IR stores one length per transfer op, and that length is the
+	// bytes actually moved (n). strace does record the count the application
+	// asked for -- read(fd, buf, count) -- so when the two differ the loss is
+	// detectable here, and recording it is the only way a consumer can know that
+	// replaying this op will request less than the source did.
+	if requested, ok := parseLeadingInt(argAt(a, 2)); ok && requested > n {
+		p.b.Note(importer.LossyNote)
+	}
+
 	positional := strings.HasPrefix(name, "pread") || strings.HasPrefix(name, "pwrite")
 	var off int64
 	if positional {
@@ -558,18 +576,29 @@ func (p *parser) finish() {
 }
 
 func (p *parser) notes() string {
-	if len(p.streamOrder) == 0 {
-		return "strace import"
-	}
 	var sb strings.Builder
-	sb.WriteString("strace import; streams: ")
-	for i, pid := range p.streamOrder {
-		if i > 0 {
-			sb.WriteString(", ")
+	sb.WriteString("strace import")
+	if len(p.streamOrder) > 0 {
+		sb.WriteString("; streams: ")
+		for i, pid := range p.streamOrder {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "s%d=pid %d", p.pidToStream[pid], pid)
 		}
-		fmt.Fprintf(&sb, "s%d=pid %d", p.pidToStream[pid], pid)
+	}
+	if lossy := p.b.LossySummary(); lossy != "" {
+		sb.WriteString("; " + lossy)
 	}
 	return sb.String()
+}
+
+// argAt returns argument i, or "" when the call had fewer arguments.
+func argAt(a []string, i int) string {
+	if i >= len(a) {
+		return ""
+	}
+	return a[i]
 }
 
 // splitPID separates an optional leading PID column (digits followed by

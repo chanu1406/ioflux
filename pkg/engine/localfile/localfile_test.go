@@ -650,3 +650,38 @@ func TestShutdownOnUnconfinedEngineIsNoop(t *testing.T) {
 	}
 	eng.Close(context.Background(), h)
 }
+
+// TestLimitations_DeclaresPositionalReplayForm pins the disclosure that this
+// engine substitutes the syscall form on every run: offsets and lengths are
+// reproduced exactly, but pread/pwrite replace the source's sequential
+// read/write and path-based stat replaces fstat. The qual-01 reconciliation
+// confirmed the substitution against a straced replay, so a result claiming
+// syscall-level equivalence must carry the qualifier.
+func TestLimitations_DeclaresPositionalReplayForm(t *testing.T) {
+	// Unconditional: it does not depend on the trace, the root, or O_DIRECT.
+	for _, tc := range []struct {
+		name string
+		eng  *localfile.LocalFileEngine
+	}{
+		{"unconfined", localfile.New()},
+		{"confined", localfile.New(localfile.WithRoot(t.TempDir()))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer tc.eng.Shutdown()
+			var found string
+			for _, l := range tc.eng.Limitations() {
+				if strings.Contains(l, "replay is positional") {
+					found = l
+				}
+			}
+			if found == "" {
+				t.Fatalf("Limitations() does not declare positional replay: %v", tc.eng.Limitations())
+			}
+			for _, want := range []string{"pread/pwrite", "lseek", "fstat"} {
+				if !strings.Contains(found, want) {
+					t.Errorf("limitation does not mention %q: %q", want, found)
+				}
+			}
+		})
+	}
+}

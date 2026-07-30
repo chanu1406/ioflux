@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/chanuollala/ioflux/pkg/importer"
 	"github.com/chanuollala/ioflux/pkg/importer/dftracer"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
@@ -532,5 +533,62 @@ func TestImport_MultiStream(t *testing.T) {
 			}
 			handles[*op.H] = op.S
 		}
+	}
+}
+
+// TestImport_ShortTransferRecordsDroppedRequestedLength pins the same
+// disclosure as the strace importer's equivalent test: DFTracer records both
+// args.count (requested) and return_val (transferred), but the trace IR has one
+// length field per transfer op, so a short read loses the requested count and
+// replay will under-request. The loss must be counted and must travel with the
+// trace.
+func TestImport_ShortTransferRecordsDroppedRequestedLength(t *testing.T) {
+	const in = `{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","flags":0,"return_val":3}}
+{"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":262144,"return_val":262144}}
+{"name":"read","cat":"POSIX","ph":"X","ts":1020.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":262144,"return_val":111392}}
+{"name":"close","cat":"POSIX","ph":"X","ts":1030.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"return_val":0}}
+`
+	var buf bytes.Buffer
+	rep, err := dftracer.Import(strings.NewReader(in), &buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+	hdr, ops := readTrace(t, buf.Bytes())
+
+	if got := rep.Lossy[importer.LossyNote]; got != 1 {
+		t.Errorf("Lossy[%s] = %d, want 1 (only the short read)", importer.LossyNote, got)
+	}
+	if !strings.Contains(hdr.Notes, "lossy: "+importer.LossyNote+"=1") {
+		t.Errorf("header notes do not carry the lossy count: %q", hdr.Notes)
+	}
+	for _, want := range []string{"not the byte count it", "stat/fstat events are not represented"} {
+		if !strings.Contains(hdr.CaptureLimitations, want) {
+			t.Errorf("capture limitations missing %q: %q", want, hdr.CaptureLimitations)
+		}
+	}
+	if n := countKind(ops, trace.OpRead); n != 2 {
+		t.Fatalf("READ count = %d, want 2", n)
+	}
+}
+
+// TestImport_FullTransfersAreNotLossy keeps the loss counter meaningful by
+// proving it stays silent when every transfer moved what it asked for.
+func TestImport_FullTransfersAreNotLossy(t *testing.T) {
+	const in = `{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","flags":0,"return_val":3}}
+{"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":4096,"return_val":4096}}
+{"name":"close","cat":"POSIX","ph":"X","ts":1030.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"return_val":0}}
+`
+	var buf bytes.Buffer
+	rep, err := dftracer.Import(strings.NewReader(in), &buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	hdr, _ := readTrace(t, buf.Bytes())
+	if len(rep.Lossy) != 0 {
+		t.Errorf("Lossy = %v, want empty", rep.Lossy)
+	}
+	if strings.Contains(hdr.Notes, "lossy:") {
+		t.Errorf("notes should not mention loss when none occurred: %q", hdr.Notes)
 	}
 }

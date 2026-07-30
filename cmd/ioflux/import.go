@@ -178,6 +178,19 @@ func printImportSummary(stderr io.Writer, source string, data []byte, rep import
 			fmt.Fprintf(stderr, "  %-24s %d\n", r, rep.SkippedReasons[r])
 		}
 	}
+	if len(rep.Lossy) > 0 {
+		// Distinct from skips: these ops ARE in the trace, but replaying them will
+		// not reproduce the source operation exactly.
+		fmt.Fprintf(stderr, "imported with loss (op present, source property not representable):\n")
+		reasons := make([]string, 0, len(rep.Lossy))
+		for r := range rep.Lossy {
+			reasons = append(reasons, r)
+		}
+		sort.Strings(reasons)
+		for _, r := range reasons {
+			fmt.Fprintf(stderr, "  %-36s %d\n", r, rep.Lossy[r])
+		}
+	}
 	if rep.TimestampClamped > 0 {
 		fmt.Fprintf(stderr, "timestamps clamped (non-monotonic source clock): %d\n", rep.TimestampClamped)
 	}

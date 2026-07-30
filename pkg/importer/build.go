@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
@@ -31,6 +32,13 @@ type HeaderMeta struct {
 
 // Report summarizes what an import produced, including everything that was
 // dropped, so the CLI can print an honest account of fidelity.
+//
+// SkippedReasons and Lossy answer two different questions and must not be
+// merged. A skip means no op was emitted at all. A Lossy entry means an op WAS
+// emitted but some property of the source operation could not be represented,
+// so the op replays as something subtly different from what the application did.
+// Counting the second kind as a skip would understate op coverage; counting it
+// as nothing at all would let a trace claim fidelity it does not have.
 type Report struct {
 	NumOps           int
 	NumStreams       int
@@ -38,6 +46,7 @@ type Report struct {
 	SkippedOps       int
 	TimestampClamped int
 	SkippedReasons   map[string]int
+	Lossy            map[string]int
 }
 
 type streamOp struct {
@@ -61,7 +70,10 @@ func NewBuilder() *Builder {
 		targets:   make([]trace.TargetInfo, 0),
 		targetIdx: make(map[string]int),
 		perStream: make(map[int64][]streamOp),
-		report:    Report{SkippedReasons: make(map[string]int)},
+		report: Report{
+			SkippedReasons: make(map[string]int),
+			Lossy:          make(map[string]int),
+		},
 	}
 }
 
@@ -92,6 +104,42 @@ func (b *Builder) Add(op trace.Op) {
 func (b *Builder) Skip(reason string) {
 	b.report.SkippedReasons[reason]++
 	b.report.SkippedOps++
+}
+
+// Note records that an emitted op lost a property of its source operation,
+// under reason. The op still counts toward coverage; what is recorded here is
+// that replaying it will not reproduce the source exactly.
+func (b *Builder) Note(reason string) { b.report.Lossy[reason]++ }
+
+// LossyNote is the reason recorded when a short read or write is imported. The
+// trace IR carries one length per transfer op, and it holds the bytes the source
+// actually moved; the count the application asked for has nowhere to go. Replay
+// therefore issues a request the size of the source's *result*, so the source's
+// request shape is not reproduced for these ops.
+const LossyNote = "short_transfer_requested_len_dropped"
+
+// LossySummary renders the recorded lossy notes as a stable, sorted string for
+// inclusion in a trace's header notes, so the information travels with the trace
+// rather than living only in the terminal that ran the import. Empty when
+// nothing was lost.
+func (b *Builder) LossySummary() string {
+	if len(b.report.Lossy) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(b.report.Lossy))
+	for k := range b.report.Lossy {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var sb strings.Builder
+	sb.WriteString("lossy: ")
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "%s=%d", k, b.report.Lossy[k])
+	}
+	return sb.String()
 }
 
 // ClampedTimestamp records that one op's timestamp was adjusted to preserve
