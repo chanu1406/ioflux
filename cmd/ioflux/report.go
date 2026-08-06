@@ -64,11 +64,18 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		if code != 0 {
 			return code
 		}
-		if art.trials != nil {
+		switch {
+		case art.paired != nil:
+			// A paired experiment already carries its own verdict; re-printing it
+			// must reach the same conclusion, including the refusal.
+			if !printPairedReport(stdout, art.paired) {
+				return 1
+			}
+		case art.trials != nil:
 			printTrialSetReport(stdout, art.trials)
-			return 0
+		default:
+			printRunReport(stdout, art.single)
 		}
-		printRunReport(stdout, art.single)
 		return 0
 	case 2:
 		a, code := loadArtifact(fs.Arg(0), stderr)
@@ -78,6 +85,14 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		b, code := loadArtifact(fs.Arg(1), stderr)
 		if code != 0 {
 			return code
+		}
+		// A paired experiment is already a comparison and carries its own verdict;
+		// comparing two of them is a different question (was the treatment's
+		// effect the same on two occasions?) that this command does not answer.
+		if a.paired != nil || b.paired != nil {
+			fmt.Fprintln(stderr, "ioflux report: a paired experiment is already a comparison — "+
+				"print it on its own with `ioflux report <file>`")
+			return 2
 		}
 		// Comparing a trial set against a single run would silently reduce the
 		// set to one number, which is the thing repeated trials exist to prevent.
@@ -107,6 +122,7 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 type artifact struct {
 	single *results.Results
 	trials *results.TrialSet
+	paired *results.PairedExperiment
 }
 
 // loadArtifact reads a results file and determines which kind it is. A trial
@@ -127,11 +143,26 @@ func loadArtifact(path string, stderr io.Writer) (artifact, int) {
 	}
 
 	var probe struct {
-		Trials []json.RawMessage `json:"trials"`
+		Trials    []json.RawMessage `json:"trials"`
+		Baseline  json.RawMessage   `json:"baseline"`
+		Treatment json.RawMessage   `json:"treatment"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		fmt.Fprintf(stderr, "ioflux report: parse %s: %v\n", path, err)
 		return artifact{}, 1
+	}
+	if probe.Baseline != nil && probe.Treatment != nil {
+		var pe results.PairedExperiment
+		if err := json.Unmarshal(data, &pe); err != nil {
+			fmt.Fprintf(stderr, "ioflux report: parse paired experiment: %v\n", err)
+			return artifact{}, 1
+		}
+		if pe.Baseline == nil || pe.Treatment == nil ||
+			len(pe.Baseline.Trials) == 0 || len(pe.Treatment.Trials) == 0 {
+			fmt.Fprintf(stderr, "ioflux report: %s is a paired experiment with an empty arm\n", path)
+			return artifact{}, 1
+		}
+		return artifact{paired: &pe}, 0
 	}
 	if probe.Trials != nil {
 		var ts results.TrialSet
@@ -381,7 +412,7 @@ func printComparison(w io.Writer, a, b *results.Results) bool {
 		return false
 	}
 
-	printComparisonCaveats(w, elig)
+	printComparisonCaveats(w, elig, "backend")
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%-14s %16s %16s %16s\n", "", "A", "B", "Δ (B-A)")
@@ -511,7 +542,7 @@ func printTrialComparison(w io.Writer, a, b *results.TrialSet, policy results.Tr
 		return false
 	}
 
-	printComparisonCaveats(w, tc.Eligibility)
+	printComparisonCaveats(w, tc.Eligibility, "backend")
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%-14s %18s %18s\n", "duration", "A", "B")
@@ -552,14 +583,125 @@ func separationSentence(tc results.TrialComparison) string {
 	}
 }
 
+// printPairedReport prints a paired experiment, returning false when the
+// comparison was refused.
+func printPairedReport(w io.Writer, pe *results.PairedExperiment) bool {
+	fmt.Fprintln(w)
+	if pe.Claim != "" {
+		fmt.Fprintf(w, "Claim:     %s\n", pe.Claim)
+	}
+	fmt.Fprintf(w, "Trace:     %s\n", describeSide(pe.Baseline.Representative()))
+	if len(pe.TreatmentVariables) == 0 {
+		fmt.Fprintf(w, "Treatment: none — the two arms were configured identically\n")
+	} else {
+		fmt.Fprintf(w, "Treatment: %v\n", pe.TreatmentVariables)
+		for _, name := range pe.TreatmentVariables {
+			fmt.Fprintf(w, "             %-16s baseline %-20s treatment %s\n", name,
+				armFieldValue(pe.Baseline, name), armFieldValue(pe.Treatment, name))
+		}
+	}
+	fmt.Fprintf(w, "Pairs:     %d measured, interleaved (seed %d)\n", len(pe.PairOrder), pe.Seed)
+	fmt.Fprintf(w, "Policy:    at least %d valid trial(s) per arm, CV at most %.1f%%\n",
+		pe.Policy.MinValidTrials, pe.Policy.MaxCVPercent)
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Eligibility: %s\n", strings.ToUpper(string(pe.Eligibility.Verdict)))
+
+	if !pe.Eligibility.Comparable() {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Refusing to report a difference:\n")
+		for _, reason := range pe.Eligibility.Blocking {
+			fmt.Fprintf(w, "  ! %s\n", reason)
+		}
+		return false
+	}
+
+	printComparisonCaveats(w, pe.Eligibility, "treatment")
+
+	b, tr := pe.Baseline.Summary.DurationNS, pe.Treatment.Summary.DurationNS
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "duration", "baseline", "treatment")
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "  median",
+		fmtDuration(int64(b.Median)), fmtDuration(int64(tr.Median)))
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "  CV",
+		fmt.Sprintf("%.1f%%", b.CVPercent), fmt.Sprintf("%.1f%%", tr.CVPercent))
+
+	p := pe.Paired
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Paired difference over %d pair(s) (treatment - baseline):\n", p.Pairs)
+	fmt.Fprintf(w, "  median:  %s (%+.1f%%)\n", fmtSignedDuration(int64(p.Delta.Median)), p.DeltaPercent)
+	if p.Delta.CI95Available {
+		fmt.Fprintf(w, "  95%% CI:  %s … %s\n",
+			fmtSignedDuration(int64(p.Delta.CI95Lo)), fmtSignedDuration(int64(p.Delta.CI95Hi)))
+	} else {
+		fmt.Fprintf(w, "  95%% CI:  unavailable — %d pair(s) is too few to bound the difference\n", p.Pairs)
+	}
+	fmt.Fprintf(w, "  %s\n", pairedVerdictSentence(p))
+	return true
+}
+
+// pairedVerdictSentence states what the interval on the paired difference does
+// and does not establish.
+func pairedVerdictSentence(p results.PairedSummary) string {
+	switch {
+	case !p.Delta.CI95Available:
+		return "too few pairs to bound the difference, so nothing is established."
+	case p.ExcludesZero:
+		return "the interval excludes zero, so the treatment changed the workload's duration."
+	default:
+		return "the interval includes zero, so these pairs do not establish a difference — " +
+			"which is not the same as showing there is none."
+	}
+}
+
+// armFieldValue reports one arm's value for a named setting, read back from the
+// result rather than from the config, so the report shows what ran.
+func armFieldValue(ts *results.TrialSet, name string) string {
+	rep := ts.Representative()
+	if rep == nil {
+		return "?"
+	}
+	switch name {
+	case "engine":
+		return rep.Plan.Engine
+	case "mode":
+		return rep.Plan.Mode
+	case "max_inflight":
+		return fmt.Sprint(rep.Plan.MaxInflight)
+	case "cache_mode":
+		return orDash(rep.RunEnv.CacheMode)
+	case "target_root":
+		return orDash(rep.Plan.TargetRoot)
+	case "trace":
+		return rep.Plan.TracePath
+	case "prepare":
+		return orDash(rep.Plan.PrepareMode)
+	case "bucket":
+		return orDash(rep.Plan.Bucket)
+	case "endpoint":
+		return orDash(rep.Plan.Endpoint)
+	case "fill":
+		return orDash(rep.Plan.FillMode)
+	case "fill_seed":
+		return fmt.Sprint(rep.Plan.FillSeed)
+	case "speedup":
+		return fmt.Sprint(rep.Plan.SpeedupFactor)
+	default:
+		// A setting the result does not echo back (a target map path, a host
+		// list). Naming it is still useful; inventing a value would not be.
+		return "(not echoed in results)"
+	}
+}
+
 // printComparisonCaveats renders the differences that change what the delta
-// below them means.
-func printComparisonCaveats(w io.Writer, elig results.Eligibility) {
+// below them means. subject names what the delta would otherwise be credited
+// to — the backend for an ad-hoc comparison, the treatment for an experiment.
+func printComparisonCaveats(w io.Writer, elig results.Eligibility, subject string) {
 	if len(elig.Caveats) == 0 {
 		fmt.Fprintf(w, "  the two runs agree on trace, engine, environment, and build\n")
 		return
 	}
-	fmt.Fprintf(w, "  the delta below is not attributable to the backend alone:\n")
+	fmt.Fprintf(w, "  the difference below is not attributable to the %s alone:\n", subject)
 	for _, c := range elig.Caveats {
 		fmt.Fprintf(w, "  ! %s: A=%s  B=%s\n", c.Field, c.A, c.B)
 		fmt.Fprintf(w, "      %s\n", c.Note)

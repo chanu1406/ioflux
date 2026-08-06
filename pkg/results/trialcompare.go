@@ -80,13 +80,7 @@ func CompareTrialSets(a, b *TrialSet, policy TrialPolicy) TrialComparison {
 		tc.Eligibility.Blocking = append(tc.Eligibility.Blocking, trialSetBlockers(side.label, side.set, policy)...)
 	}
 
-	if len(tc.Eligibility.Blocking) > 0 {
-		tc.Eligibility.Verdict = VerdictIncomparable
-	} else if len(tc.Eligibility.Caveats) > 0 {
-		tc.Eligibility.Verdict = VerdictCaveated
-	} else {
-		tc.Eligibility.Verdict = VerdictComparable
-	}
+	tc.Eligibility.Verdict = verdictFor(tc.Eligibility)
 
 	da, db := a.Summary.DurationNS, b.Summary.DurationNS
 	tc.DeltaMedianNS = db.Median - da.Median

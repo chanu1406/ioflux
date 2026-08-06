@@ -79,6 +79,7 @@ Run `bin/ioflux <command> -h` for all available options.
 | `ioflux import dftracer` | Import a DFTracer capture. |
 | `ioflux validate` | Validate a `.ioflux` trace and its invariants. |
 | `ioflux run` | Replay a trace against the `mem`, `local`, or `s3` engine. |
+| `ioflux experiment` | Run two configurations interleaved and compare them pairwise. |
 | `ioflux worker` | Start a worker for distributed replay. |
 | `ioflux report` | Print one report or trial set, or compare two if they are comparable. |
 
@@ -154,6 +155,61 @@ bin/ioflux report --min-trials 10 --max-cv 5 before.json after.json
 `--max-cv` is the important one. If a configuration's own run-to-run spread is
 wider than the difference being looked for, no number of trials makes the
 comparison mean anything, and the comparison is refused rather than printed.
+
+## Paired experiments
+
+Running one configuration to completion and then the other assigns any drift in
+the machine — thermal throttling, a neighbouring tenant, a cache warming up — to
+whichever arm ran second, where it cannot be told apart from the change being
+measured. When the thing you are changing is a replay setting rather than the
+machine itself, run the two arms interleaved instead:
+
+```yaml
+# experiment.yaml
+claim: does capping in-flight I/O at 4 slow this workload down?
+trials: 10
+warmup: 2
+seed: 42
+policy:
+  min_trials: 10
+  max_cv_percent: 5
+
+run:                       # shared by both arms
+  trace: workload.ioflux
+  engine: local
+  target_root: ./ioflux-data
+  target_map: map.yaml
+  cache_mode: cold
+  max_inflight: 16
+
+baseline: {}               # no overrides
+treatment:
+  max_inflight: 4          # whatever differs here is the treatment
+```
+
+```bash
+bin/ioflux experiment --config experiment.yaml -o experiment.json
+```
+
+The arms alternate in a randomized within-pair order — recorded via `seed`, so
+the ordering is reproducible — and each pair is differenced. Whatever the two
+runs shared cancels, which resolves differences that the arms' own spread would
+otherwise hide.
+
+The treatment variable is derived from what actually differs between the two
+resolved configurations, not from which keys the treatment block lists. A
+treatment that restates a value it already had is reported as no treatment,
+rather than as a clean null result. A misspelled key is an error, since it would
+otherwise silently produce an experiment with nothing in it.
+
+Because the treatment is declared, it is not also reported as uncontrolled
+drift; only differences nobody chose are. S3 credentials are not config fields —
+a config file travels with its results, so credentials come from the environment.
+
+Interleaving only applies when the change is a replay setting. If the treatment
+is the machine itself — a kernel, a mount option, a firmware revision — the two
+arms cannot be alternated, and `--trials` with two separate runs is the option;
+that comparison does not control for drift, and its caveats say so.
 
 A delta between two runs is also only meaningful if the runs were comparable at
 all, so the comparison is checked before it is printed. Every result records what produced

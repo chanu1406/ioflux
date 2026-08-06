@@ -16,6 +16,7 @@ Commands:
   import   <source> [flags]   Import an external trace (e.g. strace) into .ioflux.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
   run      [flags]            Replay a trace against a storage engine.
+  experiment --config f.yaml  Run two configurations interleaved and compare them.
   worker   --listen :7800     Run a replay worker for distributed runs.
   report   <results.json>     Pretty-print a saved run report.
 
@@ -39,6 +40,8 @@ func main() {
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "run":
 		os.Exit(runRun(args, os.Stdout, os.Stderr))
+	case "experiment":
+		os.Exit(runExperiment(args, os.Stdout, os.Stderr))
 	case "worker":
 		os.Exit(runWorker(args, os.Stdout, os.Stderr))
 	case "report":

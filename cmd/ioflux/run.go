@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 
@@ -15,7 +13,6 @@ import (
 	s3engine "github.com/chanuollala/ioflux/pkg/engine/s3"
 	"github.com/chanuollala/ioflux/pkg/payload"
 	"github.com/chanuollala/ioflux/pkg/results"
-	"github.com/chanuollala/ioflux/pkg/targetmap"
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
@@ -180,31 +177,6 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, runUsage)
 		return 2
 	}
-	switch mode {
-	case "asap", "timeline", "scaled":
-	default:
-		fmt.Fprintf(stderr, "ioflux run: unsupported mode %q (want asap | timeline | scaled)\n", mode)
-		return 2
-	}
-	if maxInflight <= 0 {
-		fmt.Fprintf(stderr, "ioflux run: --max-inflight must be > 0, got %d\n", maxInflight)
-		return 2
-	}
-	if mode == "scaled" && speedup <= 0 {
-		fmt.Fprintf(stderr, "ioflux run: --speedup must be > 0 for --mode scaled, got %v\n", speedup)
-		return 2
-	}
-	if prepareScope != "" && prepareScope != cluster.PrepareScopeShared && prepareScope != cluster.PrepareScopePerWorker {
-		fmt.Fprintf(stderr, "ioflux run: unsupported --prepare-scope %q (want shared | per-worker)\n", prepareScope)
-		return 2
-	}
-	if fillMode != string(payload.ModeSeeded) && fillMode != string(payload.ModeZero) {
-		fmt.Fprintf(stderr, "ioflux run: unsupported --fill %q (want seeded | zero)\n", fillMode)
-		return 2
-	}
-	if fillSeed == 0 {
-		fillSeed = payload.DefaultSeed
-	}
 	if trials < 1 {
 		fmt.Fprintf(stderr, "ioflux run: --trials must be >= 1, got %d\n", trials)
 		return 2
@@ -213,66 +185,14 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ioflux run: --warmup must be >= 0, got %d\n", warmup)
 		return 2
 	}
-	// The containment root is not part of the worker protocol, so a
-	// coordinator-side --target-root would apply to nothing on a remote worker.
-	// Refuse the combination rather than let the operator believe the run was
-	// confined when it was not.
-	if targetRoot != "" && len(splitHosts(hosts)) > 0 {
-		fmt.Fprintln(stderr, "ioflux run: --target-root cannot be combined with --hosts: the containment "+
-			"root is not carried in the worker protocol, so it would not apply on remote workers.")
-		fmt.Fprintln(stderr, "  Set it on each worker instead: ioflux worker --listen :7800 --target-root <dir>")
-		return 2
-	}
 
-	// Read the trace into memory; the plan inlines it for every worker.
-	traceBytes, err := os.ReadFile(tracePath)
-	if err != nil {
-		fmt.Fprintf(stderr, "ioflux run: open trace: %v\n", err)
-		return 2
-	}
-	r, err := trace.NewReader(bytes.NewReader(traceBytes))
-	if err != nil {
-		fmt.Fprintf(stderr, "ioflux run: parse trace: %v\n", err)
-		return 1
-	}
-	hdr := r.Header()
-
-	spec := cluster.EngineSpec{
-		Name:           engineName,
-		CacheMode:      cacheMode,
-		Root:           targetRoot,
-		AllowDirect:    allowDirect,
-		DirectFallback: directFallback,
-		DirectAlign:    directAlign,
-		S3:             s3Cfg,
-	}
-	// Pre-flight: validate the engine config now so usage errors (missing bucket,
-	// bad multipart size) fail fast as exit-2 before any distribution. The worker
-	// rebuilds the engine from the same spec at PREPARE.
-	if _, _, err := buildRunEngine(spec, hdr); err != nil {
-		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
-		return 2
-	}
-
-	var rewriteRules []targetmap.Rule
-	if targetMapPath != "" {
-		tmap, err := targetmap.Load(targetMapPath)
-		if err != nil {
-			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
-			return 1
-		}
-		rewriteRules = tmap.Rules
-		allowPassthrough = allowPassthrough || tmap.AllowPassthrough
-	}
-
-	plan := cluster.Plan{
+	plan, perr := buildPlan(runSettings{
 		TracePath:        tracePath,
-		TraceBytes:       traceBytes,
-		Engine:           spec,
+		EngineName:       engineName,
 		Mode:             mode,
 		MaxInflight:      maxInflight,
-		SpeedupFactor:    speedup,
-		TargetRewrite:    rewriteRules,
+		Speedup:          speedup,
+		TargetMapPath:    targetMapPath,
 		AllowPassthrough: allowPassthrough,
 		PrepareMode:      prepareMode,
 		PrepareScope:     prepareScope,
@@ -280,6 +200,16 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		CacheMode:        cacheMode,
 		FillMode:         fillMode,
 		FillSeed:         fillSeed,
+		TargetRoot:       targetRoot,
+		AllowDirect:      allowDirect,
+		DirectFallback:   directFallback,
+		DirectAlign:      directAlign,
+		Hosts:            hosts,
+		S3:               s3Cfg,
+	})
+	if perr != nil {
+		fmt.Fprintf(stderr, "ioflux run: %v\n", perr)
+		return perr.Code
 	}
 
 	// Preflight the worker set so an unreachable host fails immediately as a

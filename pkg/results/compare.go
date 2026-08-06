@@ -155,15 +155,23 @@ func CheckEligibility(a, b *Results) Eligibility {
 		})
 	}
 
+	e.Verdict = verdictFor(e)
+	return e
+}
+
+// verdictFor derives the verdict from what a gate found. It is shared so a
+// caller that adds or removes findings after the fact — a paired experiment
+// discounting its own declared treatment — cannot leave the verdict disagreeing
+// with the reasons printed beneath it.
+func verdictFor(e Eligibility) Verdict {
 	switch {
 	case len(e.Blocking) > 0:
-		e.Verdict = VerdictIncomparable
+		return VerdictIncomparable
 	case len(e.Caveats) > 0:
-		e.Verdict = VerdictCaveated
+		return VerdictCaveated
 	default:
-		e.Verdict = VerdictComparable
+		return VerdictComparable
 	}
-	return e
 }
 
 // checkTraceIdentity compares what the two runs replayed. A differing digest is
