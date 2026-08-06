@@ -78,6 +78,7 @@ Run `bin/ioflux <command> -h` for all available options.
 | `ioflux import strace` | Import a `strace` capture. |
 | `ioflux import dftracer` | Import a DFTracer capture. |
 | `ioflux validate` | Validate a `.ioflux` trace and its invariants. |
+| `ioflux transform` | Apply a declared transformation to a trace. |
 | `ioflux run` | Replay a trace against the `mem`, `local`, or `s3` engine. |
 | `ioflux experiment` | Run two configurations interleaved and compare them pairwise. |
 | `ioflux worker` | Start a worker for distributed replay. |
@@ -206,7 +207,39 @@ Because the treatment is declared, it is not also reported as uncontrolled
 drift; only differences nobody chose are. S3 credentials are not config fields —
 a config file travels with its results, so credentials come from the environment.
 
-Interleaving only applies when the change is a replay setting. If the treatment
+### Changing the workload itself
+
+Some treatments are a change to the workload rather than to a setting — reading
+the same data in smaller blocks, for instance. `ioflux transform` produces a new
+trace for those:
+
+```bash
+bin/ioflux transform split-reads --block 64KiB -o small-reads.ioflux workload.ioflux
+```
+
+`split-reads` divides every read larger than the block into requests of at most
+that size, over identical extents: same targets, same offsets covered, same
+total bytes, more and smaller operations.
+
+The output records what was done to it — the transformation, its parameters, and
+a digest of the trace it came from — in the trace header, so it travels with the
+file. A replay of a transformed trace carries that ledger into its results, and
+a comparison uses it to tell "the treatment is the same workload read
+differently" apart from "the two runs replayed unrelated traces", which are
+otherwise indistinguishable when all you have is two differing digests.
+
+Use it as the treatment by pointing the two arms at the two traces:
+
+```yaml
+run:
+  trace: workload.ioflux
+  # ...
+baseline: {}
+treatment:
+  trace: small-reads.ioflux
+```
+
+Interleaving only applies when the change is a replay setting or the trace. If the treatment
 is the machine itself — a kernel, a mount option, a firmware revision — the two
 arms cannot be alternated, and `--trials` with two separate runs is the option;
 that comparison does not control for drift, and its caveats say so.

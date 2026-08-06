@@ -15,6 +15,7 @@ Commands:
   gen      <profile> [flags]  Generate a synthetic trace.
   import   <source> [flags]   Import an external trace (e.g. strace) into .ioflux.
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
+  transform <kind> [flags]    Apply a declared transformation to a trace.
   run      [flags]            Replay a trace against a storage engine.
   experiment --config f.yaml  Run two configurations interleaved and compare them.
   worker   --listen :7800     Run a replay worker for distributed runs.
@@ -36,6 +37,8 @@ func main() {
 		os.Exit(runGen(args, os.Stdout, os.Stderr))
 	case "import":
 		os.Exit(runImport(args, os.Stdout, os.Stderr))
+	case "transform":
+		os.Exit(runTransform(args, os.Stdout, os.Stderr))
 	case "validate":
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "run":

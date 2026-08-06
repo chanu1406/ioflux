@@ -370,6 +370,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		NumOps:                    e.hdr.Summary.NumOps,
 		TotalBytes:                e.hdr.Summary.TotalBytes,
 		TracePartialReads:         e.hdr.Summary.NumPartialReads,
+		TraceTransformations:      e.hdr.Transformations,
 		PrepareMode:               e.plan.PrepareMode,
 		FillMode:                  string(e.prepMeta.Fill.Mode),
 		FillSeed:                  e.prepMeta.Fill.Seed,

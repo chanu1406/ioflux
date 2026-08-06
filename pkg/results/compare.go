@@ -2,6 +2,7 @@ package results
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -194,6 +195,20 @@ func (e *Eligibility) checkTraceIdentity(a, b *Results) {
 	if da == db {
 		return
 	}
+	// Two differing digests look identical whether one trace is a declared
+	// transformation of the other or the two are unrelated workloads. The ledger
+	// is what tells them apart, and the distinction matters: "the treatment
+	// replayed the same workload with smaller reads" supports a conclusion that
+	// "these are two different workloads" does not.
+	if note := derivationNote(a, b); note != "" {
+		e.Caveats = append(e.Caveats, Difference{
+			Field: "trace",
+			A:     digestLabel(a),
+			B:     digestLabel(b),
+			Note:  note,
+		})
+		return
+	}
 	e.Caveats = append(e.Caveats, Difference{
 		Field: "trace",
 		A:     digestLabel(a),
@@ -201,6 +216,55 @@ func (e *Eligibility) checkTraceIdentity(a, b *Results) {
 		Note: "the runs replayed different traces, so the delta measures the difference between two " +
 			"workloads and not between two backends",
 	})
+}
+
+// derivationNote describes how one side's trace was derived from the other's,
+// or "" when neither was.
+func derivationNote(a, b *Results) string {
+	if desc := transformDescription(b, a.Plan.TraceDigest); desc != "" {
+		return "B replayed a declared transformation of A's trace (" + desc +
+			"), so the difference measures that change and not two unrelated workloads"
+	}
+	if desc := transformDescription(a, b.Plan.TraceDigest); desc != "" {
+		return "A replayed a declared transformation of B's trace (" + desc +
+			"), so the difference measures that change and not two unrelated workloads"
+	}
+	return ""
+}
+
+// TransformationOf renders the transformations in r's trace that were applied
+// to sourceDigest, or "" when r's trace was not derived from it. It lets a
+// report state that one run replayed a declared transformation of another's
+// trace rather than an unrelated file.
+func TransformationOf(r *Results, sourceDigest string) string {
+	return transformDescription(r, sourceDigest)
+}
+
+// transformDescription renders the transformations in r's trace that were
+// applied to sourceDigest, or "" when none were.
+func transformDescription(r *Results, sourceDigest string) string {
+	if sourceDigest == "" {
+		return ""
+	}
+	var parts []string
+	for _, t := range r.Plan.TraceTransformations {
+		if t.SourceDigest != sourceDigest {
+			continue
+		}
+		desc := t.Kind
+		if len(t.Params) > 0 {
+			keys := make([]string, 0, len(t.Params))
+			for k := range t.Params {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				desc += " " + k + "=" + t.Params[k]
+			}
+		}
+		parts = append(parts, desc)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // diff records a caveat when two values disagree.

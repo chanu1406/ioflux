@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/chanuollala/ioflux/pkg/metrics"
@@ -42,7 +43,7 @@ func TestBuildAndWriteJSON(t *testing.T) {
 	if r.DurationNS != 10_000_000 {
 		t.Errorf("DurationNS=%d, want 10000000", r.DurationNS)
 	}
-	if r.Plan != plan {
+	if !reflect.DeepEqual(r.Plan, plan) {
 		t.Errorf("Plan mismatch: got %+v, want %+v", r.Plan, plan)
 	}
 

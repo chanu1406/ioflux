@@ -295,6 +295,7 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 		NumOps:                    hdr.Summary.NumOps,
 		TotalBytes:                hdr.Summary.TotalBytes,
 		TracePartialReads:         hdr.Summary.NumPartialReads,
+		TraceTransformations:      hdr.Transformations,
 		PrepareMode:               plan.PrepareMode,
 		PrepareScope:              plan.PrepareScope,
 		FillMode:                  string(fill.Mode),

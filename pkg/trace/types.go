@@ -22,13 +22,21 @@ const TraceFormatVersion = 1
 // than read with its unrecognized fields silently dropped: a field the reader
 // does not know about decodes as a benign default — "the whole request was
 // transferred" — which is exactly how an invalid run would look green.
-const TraceFormatVersionMax = 2
+const TraceFormatVersionMax = 3
 
 // VersionPartialTransfer is the ioflux_trace_version required by an op carrying
 // ret. A reader that predates ret would interpret len as the transferred count
 // and issue a request the size of the source's *result*, so such a trace must
 // fail closed on an older build instead of replaying a different workload.
 const VersionPartialTransfer = 2
+
+// VersionTransformed is the ioflux_trace_version required by a header carrying
+// a transformation ledger. The ops of a transformed trace are self-describing,
+// so an older reader would replay them perfectly well — and report the run as
+// an exact replay of a captured workload, because the one field saying
+// otherwise is the one it does not know about. Absence reading as "not
+// transformed" is precisely the benign default that must fail closed.
+const VersionTransformed = 3
 
 // TimeUnitNanoseconds is the supported time_unit.
 const TimeUnitNanoseconds = "ns"
@@ -215,6 +223,60 @@ type Header struct {
 	Targets            []TargetInfo  `json:"targets"`
 	Summary            Summary       `json:"summary"`
 	Notes              string        `json:"notes,omitempty"`
+	// Transformations is the ledger of declared changes applied to this trace
+	// after capture, oldest first. Empty means the trace still describes what was
+	// captured or generated.
+	//
+	// It travels in the trace rather than alongside it because a transformed
+	// trace outlives the terminal that produced it, and a replay of one is not a
+	// replay of the source workload — a claim a result must not be able to make
+	// by having lost the paperwork.
+	Transformations []Transformation `json:"transformations,omitempty"`
+}
+
+// Transformation records one declared, deliberate change to a trace: what was
+// done, with what parameters, and to which trace.
+//
+// SourceDigest is what makes the ledger verifiable rather than a note. It ties
+// this trace to the exact bytes it was derived from, so a comparison can tell
+// "the treatment is a declared transformation of the baseline" apart from "the
+// two runs replayed unrelated workloads" — which look identical when all you
+// have is two differing digests.
+type Transformation struct {
+	Kind         string            `json:"kind"`
+	Params       map[string]string `json:"params,omitempty"`
+	SourceDigest string            `json:"source_digest,omitempty"`
+	AppliedUTC   string            `json:"applied_utc,omitempty"`
+	Note         string            `json:"note,omitempty"`
+}
+
+// TransformSplitReads is the kind recorded by `ioflux transform split-reads`.
+const TransformSplitReads = "split-reads"
+
+// MinVersionForHeader returns the lowest ioflux_trace_version whose readers can
+// interpret h correctly, ignoring its ops (see MinVersionForOps).
+func MinVersionForHeader(h Header) int {
+	if len(h.Transformations) > 0 {
+		return VersionTransformed
+	}
+	return TraceFormatVersion
+}
+
+// IsTransformed reports whether the trace carries a transformation ledger.
+func (h Header) IsTransformed() bool { return len(h.Transformations) > 0 }
+
+// DerivedFrom reports whether any transformation in h names digest as the trace
+// it was derived from.
+func (h Header) DerivedFrom(digest string) bool {
+	if digest == "" {
+		return false
+	}
+	for _, t := range h.Transformations {
+		if t.SourceDigest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // Op is a single storage operation record.

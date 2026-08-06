@@ -75,6 +75,12 @@ type PlanInfo struct {
 	PrepareCopied             int    `json:"prepare_copied,omitempty"`
 	PrepareSkippedSizeUnknown int    `json:"prepare_skipped_size_unknown,omitempty"`
 	PrepareDerivedSizeFromOps int    `json:"prepare_derived_size_from_ops,omitempty"`
+	// TraceTransformations is the trace's declared transformation ledger, empty
+	// when the trace still describes what was captured or generated. Carried into
+	// the result so a transformed replay cannot be read as a replay of the source
+	// workload, and so a comparison can recognize one side as a declared
+	// transformation of the other rather than an unrelated trace.
+	TraceTransformations []trace.Transformation `json:"trace_transformations,omitempty"`
 	// ReplayEquivalence is "syscall-level" for a faithful op-for-op replay, or
 	// "object-level" when write ops were coalesced into a single PUT because
 	// the backend cannot replay offset writes directly (see pkg/replay

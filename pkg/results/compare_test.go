@@ -7,6 +7,7 @@ import (
 
 	"github.com/chanuollala/ioflux/pkg/fidelity"
 	"github.com/chanuollala/ioflux/pkg/results"
+	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
 const (
@@ -320,5 +321,61 @@ func TestCheckEligibilityDoesNotMutateInputs(t *testing.T) {
 
 	if !reflect.DeepEqual(*a, beforeA) || !reflect.DeepEqual(*b, beforeB) {
 		t.Error("CheckEligibility mutated one of its inputs")
+	}
+}
+
+// Two differing digests look the same whether one trace is a declared
+// transformation of the other or the two are unrelated. The ledger tells them
+// apart, and the distinction changes what the difference means.
+func TestEligibilityRecognizesDeclaredTransformation(t *testing.T) {
+	a := comparableResult()
+	b := comparableResult()
+	b.Plan.TraceDigest = digestB
+	b.Plan.TraceTransformations = []trace.Transformation{{
+		Kind:         trace.TransformSplitReads,
+		Params:       map[string]string{"block": "65536"},
+		SourceDigest: digestA,
+	}}
+
+	e := results.CheckEligibility(a, b)
+
+	var note string
+	for _, c := range e.Caveats {
+		if c.Field == "trace" {
+			note = c.Note
+		}
+	}
+	if note == "" {
+		t.Fatalf("expected a trace caveat; got %v", fieldsOf(e))
+	}
+	if !strings.Contains(note, "declared transformation") {
+		t.Errorf("caveat should name the derivation; got %q", note)
+	}
+	if !strings.Contains(note, "split-reads block=65536") {
+		t.Errorf("caveat should describe the transformation; got %q", note)
+	}
+	// The unrelated-workloads wording belongs to the other branch; a derived
+	// trace must not be described with it.
+	if strings.Contains(note, "difference between two workloads") {
+		t.Errorf("a derived trace must not be described as two unrelated workloads; got %q", note)
+	}
+}
+
+// A ledger naming some other trace does not make these two related.
+func TestEligibilityUnrelatedTransformationIsStillUnrelated(t *testing.T) {
+	a := comparableResult()
+	b := comparableResult()
+	b.Plan.TraceDigest = digestB
+	b.Plan.TraceTransformations = []trace.Transformation{{
+		Kind:         trace.TransformSplitReads,
+		SourceDigest: "sha256:something-else",
+	}}
+
+	e := results.CheckEligibility(a, b)
+
+	for _, c := range e.Caveats {
+		if c.Field == "trace" && !strings.Contains(c.Note, "different traces") {
+			t.Errorf("a ledger naming another trace must not imply derivation; got %q", c.Note)
+		}
 	}
 }

@@ -412,7 +412,7 @@ func printComparison(w io.Writer, a, b *results.Results) bool {
 		return false
 	}
 
-	printComparisonCaveats(w, elig, "backend")
+	printComparisonCaveats(w, elig, "backend", "the two runs agree on trace, engine, environment, and build")
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%-14s %16s %16s %16s\n", "", "A", "B", "Δ (B-A)")
@@ -542,7 +542,7 @@ func printTrialComparison(w io.Writer, a, b *results.TrialSet, policy results.Tr
 		return false
 	}
 
-	printComparisonCaveats(w, tc.Eligibility, "backend")
+	printComparisonCaveats(w, tc.Eligibility, "backend", "the two runs agree on trace, engine, environment, and build")
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%-14s %18s %18s\n", "duration", "A", "B")
@@ -600,6 +600,12 @@ func printPairedReport(w io.Writer, pe *results.PairedExperiment) bool {
 				armFieldValue(pe.Baseline, name), armFieldValue(pe.Treatment, name))
 		}
 	}
+	if desc := results.TransformationOf(
+		pe.Treatment.Representative(), pe.Baseline.Representative().Plan.TraceDigest); desc != "" {
+		// Without this the treatment reads as an unrelated file swapped in; the
+		// ledger is what makes it the same workload under a declared change.
+		fmt.Fprintf(w, "             the treatment trace is a declared transformation of the baseline's: %s\n", desc)
+	}
 	fmt.Fprintf(w, "Pairs:     %d measured, interleaved (seed %d)\n", len(pe.PairOrder), pe.Seed)
 	fmt.Fprintf(w, "Policy:    at least %d valid trial(s) per arm, CV at most %.1f%%\n",
 		pe.Policy.MinValidTrials, pe.Policy.MaxCVPercent)
@@ -616,7 +622,7 @@ func printPairedReport(w io.Writer, pe *results.PairedExperiment) bool {
 		return false
 	}
 
-	printComparisonCaveats(w, pe.Eligibility, "treatment")
+	printComparisonCaveats(w, pe.Eligibility, "treatment", "nothing differs between the arms beyond the declared treatment")
 
 	b, tr := pe.Baseline.Summary.DurationNS, pe.Treatment.Summary.DurationNS
 	fmt.Fprintln(w)
@@ -696,9 +702,9 @@ func armFieldValue(ts *results.TrialSet, name string) string {
 // printComparisonCaveats renders the differences that change what the delta
 // below them means. subject names what the delta would otherwise be credited
 // to — the backend for an ad-hoc comparison, the treatment for an experiment.
-func printComparisonCaveats(w io.Writer, elig results.Eligibility, subject string) {
+func printComparisonCaveats(w io.Writer, elig results.Eligibility, subject, cleanNote string) {
 	if len(elig.Caveats) == 0 {
-		fmt.Fprintf(w, "  the two runs agree on trace, engine, environment, and build\n")
+		fmt.Fprintf(w, "  %s\n", cleanNote)
 		return
 	}
 	fmt.Fprintf(w, "  the difference below is not attributable to the %s alone:\n", subject)
