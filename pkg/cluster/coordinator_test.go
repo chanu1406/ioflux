@@ -93,6 +93,48 @@ func TestCoordinator_DistributedEquivalence(t *testing.T) {
 
 // TestCoordinator_NoWorkers rejects an empty worker set rather than producing a
 // silently-empty result.
+// TestCoordinator_RecordsRunProvenance pins the fields a later comparison gates
+// on. They are computed here, at the one place that holds both the plan and the
+// trace bytes, so a run that silently stopped recording them would leave every
+// comparison unable to tell one workload from another.
+func TestCoordinator_RecordsRunProvenance(t *testing.T) {
+	traceBytes, _ := genTrace(t, 2, 4)
+	res := coordRun(t, traceBytes, 1)
+
+	if got, want := res.Plan.TraceDigest, trace.Digest(traceBytes); got != want {
+		t.Errorf("trace digest = %q, want %q (the digest of the bytes actually replayed)", got, want)
+	}
+	if res.SchemaVersion != results.SchemaVersion {
+		t.Errorf("result schema version = %d, want %d", res.SchemaVersion, results.SchemaVersion)
+	}
+	if res.Tool.Version == "" {
+		t.Error("tool version not recorded")
+	}
+	if res.Host.OS == "" || res.Host.CPUs == 0 {
+		t.Errorf("host not recorded: %+v", res.Host)
+	}
+}
+
+// Two runs of the same trace bytes must produce the same digest, and a run of
+// different bytes a different one — the property the comparison gate relies on
+// to tell "same workload" from "same file name".
+func TestCoordinator_DigestTracksTraceContent(t *testing.T) {
+	traceBytes, _ := genTrace(t, 2, 4)
+	other, _ := genTrace(t, 3, 8)
+
+	first := coordRun(t, traceBytes, 1)
+	repeat := coordRun(t, traceBytes, 1)
+	different := coordRun(t, other, 1)
+
+	if first.Plan.TraceDigest != repeat.Plan.TraceDigest {
+		t.Errorf("same trace produced different digests: %q vs %q",
+			first.Plan.TraceDigest, repeat.Plan.TraceDigest)
+	}
+	if first.Plan.TraceDigest == different.Plan.TraceDigest {
+		t.Errorf("different traces produced the same digest %q", first.Plan.TraceDigest)
+	}
+}
+
 func TestCoordinator_NoWorkers(t *testing.T) {
 	traceBytes, _ := genTrace(t, 2, 4)
 	c := &cluster.Coordinator{}

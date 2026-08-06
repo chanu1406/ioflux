@@ -12,11 +12,19 @@ import (
 	"github.com/chanuollala/ioflux/pkg/results"
 )
 
+// testTraceDigest is the trace identity shared by every result makeTestResults
+// builds, so a comparison of two unmodified fixtures is a same-workload one.
+const testTraceDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
 func makeTestResults() *results.Results {
 	return &results.Results{
-		GeneratedAt: "2026-06-04T10:00:00Z",
+		SchemaVersion: results.SchemaVersion,
+		GeneratedAt:   "2026-06-04T10:00:00Z",
+		Tool:          results.Tool{Version: "0.4.0", Revision: "abc123"},
+		Host:          results.Host{Hostname: "bench-01", OS: "linux", Arch: "amd64", CPUs: 28},
 		Plan: results.PlanInfo{
 			TracePath:          "/data/trace.ioflux",
+			TraceDigest:        testTraceDigest,
 			TraceKind:          "imported",
 			CaptureMethod:      "import:strace",
 			CaptureLimitations: "mmap page-fault I/O not captured",
@@ -510,6 +518,7 @@ func TestReportCmd_Comparison(t *testing.T) {
 
 	b := makeTestResults()
 	b.Plan.TracePath = "/data/ckpt.json"
+	b.Plan.TraceDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	b.Plan.Profile = "checkpoint-write"
 	b.DurationNS = 1_000_000_000
 	b.BytesMoved = 134217728
@@ -554,17 +563,24 @@ func TestReportCmd_Comparison(t *testing.T) {
 			t.Errorf("comparison output missing %q\nfull output:\n%s", want, out)
 		}
 	}
+	// The two sides replayed different traces, which must be stated rather than
+	// left for the reader to infer from the differing profile names.
+	if !strings.Contains(out, "different traces") {
+		t.Errorf("comparison of two different traces should say so; got:\n%s", out)
+	}
 }
 
-// TestReportCmd_ComparisonNoWarningsWhenComparable verifies that two reports
-// with matching fidelity and replay equivalence produce a "Comparability:
-// none" section rather than a spurious mismatch flag.
-func TestReportCmd_ComparisonNoWarningsWhenComparable(t *testing.T) {
+// TestReportCmd_ComparisonCleanWhenFullyComparable verifies that two runs which
+// agree on trace identity, engine, environment, and build are reported as
+// comparable outright, with no caveats invented for fields that match.
+func TestReportCmd_ComparisonCleanWhenFullyComparable(t *testing.T) {
 	a := makeTestResults()
 	a.Plan.ReplayEquivalence = "syscall-level"
 	b := makeTestResults()
-	b.Plan.TracePath = "/data/b.json"
 	b.Plan.ReplayEquivalence = "syscall-level"
+	// A different file name for the same bytes is the same workload; identity
+	// comes from the digest, not the path.
+	b.Plan.TracePath = "/data/b.ioflux"
 
 	dir := t.TempDir()
 	pA := filepath.Join(dir, "a.json")
@@ -583,11 +599,11 @@ func TestReportCmd_ComparisonNoWarningsWhenComparable(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
 	}
-	if !strings.Contains(out, "Comparability:\n  none") {
-		t.Errorf("comparable reports should print 'Comparability: none'; got:\n%s", out)
+	if !strings.Contains(out, "Eligibility: COMPARABLE\n") {
+		t.Errorf("fully comparable reports should be reported as COMPARABLE; got:\n%s", out)
 	}
-	if strings.Contains(out, "replay equivalence differs") || strings.Contains(out, "fidelity mismatch") {
-		t.Errorf("comparable reports must not print a mismatch warning; got:\n%s", out)
+	if strings.Contains(out, "!") {
+		t.Errorf("comparable reports must not print any caveat; got:\n%s", out)
 	}
 }
 
@@ -619,7 +635,7 @@ func TestReportCmd_ComparisonFlagsEquivalenceMismatch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
 	}
-	if !strings.Contains(out, "replay equivalence differs: A is object-level, B is syscall-level") {
+	if !strings.Contains(out, "replay equivalence: A=object-level  B=syscall-level") {
 		t.Errorf("output should flag the equivalence mismatch; got:\n%s", out)
 	}
 }
@@ -651,8 +667,100 @@ func TestReportCmd_ComparisonFlagsFidelityMismatch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
 	}
-	if !strings.Contains(out, "fidelity mismatch: B is low-fidelity and A is not") {
+	if !strings.Contains(out, "fidelity: A=ok  B=low") {
 		t.Errorf("output should flag the fidelity mismatch; got:\n%s", out)
+	}
+}
+
+// writeResultsPair writes a and b to a temp dir and returns their paths.
+func writeResultsPair(t *testing.T, a, b *results.Results) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	pA := filepath.Join(dir, "a.json")
+	pB := filepath.Join(dir, "b.json")
+	for p, res := range map[string]*results.Results{pA: a, pB: b} {
+		data, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return pA, pB
+}
+
+// TestReportCmd_ComparisonRefusesInvalidRun is the regression test for the
+// behaviour this gate exists to fix: the same results file that the one-file
+// report calls INVALID used to produce a clean-looking delta table in the
+// two-file comparison. A refusal must print no delta and exit non-zero, so a
+// CI step comparing two runs fails instead of reporting a speedup.
+func TestReportCmd_ComparisonRefusesInvalidRun(t *testing.T) {
+	a := makeTestResults()
+	b := makeTestResults()
+	b.Errors = 417
+	b.ShortReads = 12
+
+	pA, pB := writeResultsPair(t, a, b)
+	code, out, stderr := runReportCLI([]string{pA, pB})
+
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1 for a refused comparison; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "Eligibility: INCOMPARABLE") {
+		t.Errorf("output should state the verdict; got:\n%s", out)
+	}
+	if !strings.Contains(out, "B: 417 operation failure(s)") {
+		t.Errorf("output should name the blocking reason and its side; got:\n%s", out)
+	}
+	// The delta table is the part that gets quoted, so its absence is the
+	// substance of the refusal rather than a cosmetic detail.
+	for _, forbidden := range []string{"Δ (B-A)", "ops/s", "GiB/s"} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("a refused comparison must not print %q; got:\n%s", forbidden, out)
+		}
+	}
+}
+
+// A caveated comparison still prints its numbers and still exits 0 — the
+// caveats qualify the delta, they do not withdraw it.
+func TestReportCmd_CaveatedComparisonStillPrintsDelta(t *testing.T) {
+	a := makeTestResults()
+	b := makeTestResults()
+	b.RunEnv.CacheMode = "warm"
+
+	pA, pB := writeResultsPair(t, a, b)
+	code, out, stderr := runReportCLI([]string{pA, pB})
+
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0 for a caveated comparison; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "Eligibility: COMPARABLE-WITH-CAVEATS") {
+		t.Errorf("output should state the verdict; got:\n%s", out)
+	}
+	if !strings.Contains(out, "cache mode: A=cold  B=warm") {
+		t.Errorf("output should name the differing field; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Δ (B-A)") {
+		t.Errorf("a caveated comparison should still print the delta; got:\n%s", out)
+	}
+}
+
+// The single-run report and the comparison gate must agree about what makes a
+// run invalid; they are the two readers of one definition.
+func TestReportCmd_SingleAndComparisonAgreeOnInvalidity(t *testing.T) {
+	a := makeTestResults()
+	b := makeTestResults()
+	b.HistogramOverflows = 3
+
+	pA, pB := writeResultsPair(t, a, b)
+
+	if code, out, _ := runReportCLI([]string{pB}); code != 0 ||
+		!strings.Contains(out, "Execution: INVALID") {
+		t.Errorf("single report should call the run INVALID; got:\n%s", out)
+	}
+	if code, _, _ := runReportCLI([]string{pA, pB}); code != 1 {
+		t.Errorf("comparison exit=%d, want 1 — it must not accept a run the single report rejects", code)
 	}
 }
 

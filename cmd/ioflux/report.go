@@ -17,13 +17,18 @@ const reportUsage = `Usage:
 
 Pretty-print a saved run report. Pass - to read from stdin.
 
-Given two reports, print a side-by-side comparison of their headline scalars
-(throughput, CPU, duration, fidelity) and each side's dominant data-op latency
-— e.g. to compare a checkpoint-write report against a training-read report.
+Given two reports, check whether they may be compared and, if so, print a
+side-by-side comparison of their headline scalars (throughput, CPU, duration,
+fidelity) and each side's dominant data-op latency.
+
+The comparison is gated. A run that did not execute validly cannot be either
+side of a comparison, so the delta is refused rather than printed. Differences
+that change what a delta means — a different trace, engine, cache state, host,
+or build — are reported as caveats above the numbers they qualify.
 
 Exit codes:
-  0   report printed
-  1   parse error
+  0   report printed, or comparison printed (with or without caveats)
+  1   parse error, or comparison refused as incomparable
   2   usage error or I/O failure
 `
 
@@ -53,7 +58,9 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		if code != 0 {
 			return code
 		}
-		printComparison(stdout, a, b)
+		if !printComparison(stdout, a, b) {
+			return 1
+		}
 		return 0
 	default:
 		fmt.Fprint(stderr, reportUsage)
@@ -125,19 +132,7 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 	fmt.Fprintf(w, "Run:       %s   duration: %s\n",
 		res.GeneratedAt, fmtDuration(res.DurationNS))
-	var invalidReasons []string
-	if res.Errors > 0 {
-		reason := fmt.Sprintf("%d operation failure(s)", res.Errors)
-		if res.ShortReads > 0 {
-			reason += fmt.Sprintf(", including %d read(s) whose returned byte count "+
-				"disagreed with the source", res.ShortReads)
-		}
-		invalidReasons = append(invalidReasons, reason)
-	}
-	if res.HistogramOverflows > 0 {
-		invalidReasons = append(invalidReasons, fmt.Sprintf(
-			"%d latency sample(s) exceeded the histogram's trackable range", res.HistogramOverflows))
-	}
+	invalidReasons := res.ExecutionInvalidReasons()
 	if len(invalidReasons) > 0 {
 		fmt.Fprintf(w, "Execution: INVALID — %s\n", strings.Join(invalidReasons, "; "))
 	} else {
@@ -302,14 +297,36 @@ func throughput(res *results.Results) (opsPerSec, gibPerSec float64) {
 	return float64(res.OpsCompleted) / secs, float64(res.BytesMoved) / float64(1<<30) / secs
 }
 
-// printComparison prints a side-by-side delta of two run reports' headline
-// scalars, followed by each side's dominant data-op latency table. It is
-// used to compare e.g. a checkpoint-write report against a training-read
-// report.
-func printComparison(w io.Writer, a, b *results.Results) {
+// printComparison prints the eligibility verdict for two run reports and, when
+// the verdict permits it, a side-by-side delta of their headline scalars
+// followed by each side's dominant data-op latency table.
+//
+// It returns false when the comparison was refused. A refusal prints no deltas
+// at all: the throughput numbers are the part of this output that gets quoted,
+// and printing them under a warning has repeatedly proved to be the same thing
+// as printing them without one.
+func printComparison(w io.Writer, a, b *results.Results) bool {
+	elig := results.CheckEligibility(a, b)
+
 	fmt.Fprintf(w, "Comparing two reports:\n")
-	fmt.Fprintf(w, "  A: %s\n", a.Plan.TracePath)
-	fmt.Fprintf(w, "  B: %s\n", b.Plan.TracePath)
+	fmt.Fprintf(w, "  A: %s\n", describeSide(a))
+	fmt.Fprintf(w, "  B: %s\n", describeSide(b))
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Eligibility: %s\n", strings.ToUpper(string(elig.Verdict)))
+
+	if !elig.Comparable() {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Refusing to report a delta — at least one run is not a valid measurement:\n")
+		for _, reason := range elig.Blocking {
+			fmt.Fprintf(w, "  ! %s\n", reason)
+		}
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Inspect each run on its own with `ioflux report <file>`.\n")
+		return false
+	}
+
+	printComparisonCaveats(w, elig)
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%-14s %16s %16s %16s\n", "", "A", "B", "Δ (B-A)")
@@ -322,7 +339,13 @@ func printComparison(w io.Writer, a, b *results.Results) {
 
 	row2("kind", a.Plan.TraceKind, b.Plan.TraceKind)
 	row2("profile", orDash(a.Plan.Profile), orDash(b.Plan.Profile))
+	// Engine and cache state belong in the table for the same reason the delta
+	// does: they are what a reader needs in order to know what the delta is a
+	// delta of.
+	row2("engine", orDash(a.Plan.Engine), orDash(b.Plan.Engine))
+	row2("cache", orDash(a.RunEnv.CacheMode), orDash(b.RunEnv.CacheMode))
 	row2("mode", a.Plan.Mode, b.Plan.Mode)
+	row2("max-inflight", fmt.Sprint(a.Plan.MaxInflight), fmt.Sprint(b.Plan.MaxInflight))
 	row2("equivalence", orDash(a.Plan.ReplayEquivalence), orDash(b.Plan.ReplayEquivalence))
 
 	row("duration", fmtDuration(a.DurationNS), fmtDuration(b.DurationNS), fmtSignedDuration(b.DurationNS-a.DurationNS))
@@ -339,18 +362,36 @@ func printComparison(w io.Writer, a, b *results.Results) {
 	row2("low-fidelity", lowFidelityLabel(a), lowFidelityLabel(b))
 
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Comparability:\n")
-	if warnings := comparabilityWarnings(a, b); len(warnings) == 0 {
-		fmt.Fprintf(w, "  none\n")
-	} else {
-		for _, msg := range warnings {
-			fmt.Fprintf(w, "  ! %s\n", msg)
-		}
-	}
-
-	fmt.Fprintln(w)
 	printDominantOpLatency(w, "A", a)
 	printDominantOpLatency(w, "B", b)
+	return true
+}
+
+// printComparisonCaveats renders the differences that change what the delta
+// below them means.
+func printComparisonCaveats(w io.Writer, elig results.Eligibility) {
+	if len(elig.Caveats) == 0 {
+		fmt.Fprintf(w, "  the two runs agree on trace, engine, environment, and build\n")
+		return
+	}
+	fmt.Fprintf(w, "  the delta below is not attributable to the backend alone:\n")
+	for _, c := range elig.Caveats {
+		fmt.Fprintf(w, "  ! %s: A=%s  B=%s\n", c.Field, c.A, c.B)
+		fmt.Fprintf(w, "      %s\n", c.Note)
+	}
+}
+
+// describeSide labels one side of a comparison by the trace it replayed, with
+// its identity where recorded.
+func describeSide(res *results.Results) string {
+	if d := res.Plan.TraceDigest; d != "" {
+		short := d
+		if i := strings.IndexByte(d, ':'); i >= 0 && len(d) > i+13 {
+			short = d[:i+13]
+		}
+		return fmt.Sprintf("%s [%s]", res.Plan.TracePath, short)
+	}
+	return res.Plan.TracePath
 }
 
 // orDash returns s, or "-" if it is empty (e.g. a field not recorded by an
@@ -360,38 +401,6 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-// comparabilityWarnings flags conditions that can make a side-by-side
-// comparison misleading even though both reports parse and print cleanly:
-// differing replay equivalence (one side's writes were coalesced into
-// object-level PUTs while the other replayed at the syscall level) or a
-// low-fidelity/full-fidelity mismatch. Per the honesty rule (PRD §6), the
-// tool flags these rather than silently presenting the delta as an
-// apples-to-apples backend comparison. Empty when both sides are comparable
-// on these axes, or when a field is missing from an older results.json.
-func comparabilityWarnings(a, b *results.Results) []string {
-	var warnings []string
-
-	ea, eb := a.Plan.ReplayEquivalence, b.Plan.ReplayEquivalence
-	if ea != "" && eb != "" && ea != eb {
-		warnings = append(warnings, fmt.Sprintf(
-			"replay equivalence differs: A is %s, B is %s — one side's writes were coalesced into "+
-				"object-level PUTs while the other replayed at the syscall level; the delta may reflect "+
-				"that difference, not backend performance", ea, eb))
-	}
-
-	if a.Fidelity.LowFidelity != b.Fidelity.LowFidelity {
-		low, full := "A", "B"
-		if b.Fidelity.LowFidelity {
-			low, full = "B", "A"
-		}
-		warnings = append(warnings, fmt.Sprintf(
-			"fidelity mismatch: %s is low-fidelity and %s is not — cross-fidelity deltas may reflect "+
-				"measurement noise, not backend performance", low, full))
-	}
-
-	return warnings
 }
 
 // lowFidelityLabel summarizes a run's low-fidelity flag and category for the

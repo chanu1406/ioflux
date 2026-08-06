@@ -276,7 +276,13 @@ func schedulerOpts(plan Plan, hdr trace.Header, preps []PrepareResult) replay.Sc
 	}
 	fill := payload.Config{Mode: payload.Mode(plan.FillMode), Seed: plan.FillSeed}.Normalize()
 	planInfo := results.PlanInfo{
-		TracePath:                 plan.TracePath,
+		TracePath: plan.TracePath,
+		// Computed from the bytes the workers actually replay rather than carried
+		// alongside them, so the digest and the trace can never disagree.
+		TraceDigest:               trace.Digest(plan.TraceBytes),
+		TargetRoot:                plan.Engine.Root,
+		Bucket:                    plan.Engine.S3.Bucket,
+		Endpoint:                  plan.Engine.S3.Endpoint,
 		Engine:                    plan.Engine.Name,
 		Mode:                      plan.Mode,
 		MaxInflight:               plan.MaxInflight,

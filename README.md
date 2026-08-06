@@ -80,7 +80,7 @@ Run `bin/ioflux <command> -h` for all available options.
 | `ioflux validate` | Validate a `.ioflux` trace and its invariants. |
 | `ioflux run` | Replay a trace against the `mem`, `local`, or `s3` engine. |
 | `ioflux worker` | Start a worker for distributed replay. |
-| `ioflux report` | Print one report or compare two reports side by side. |
+| `ioflux report` | Print one report, or compare two reports if they are comparable. |
 
 ## Importing a real trace
 
@@ -114,6 +114,37 @@ bin/ioflux run \
 Imported traces retain the limitations of their capture method. IOFlux records
 those limitations and replay-fidelity information in the trace and result
 metadata.
+
+## Comparing two runs
+
+Replay the same trace before and after a change, then compare the two results:
+
+```bash
+bin/ioflux report before.json after.json
+```
+
+A delta between two runs is only meaningful if the runs were comparable, so the
+comparison is checked before it is printed. Every result records what produced
+it — a digest of the trace bytes, the engine and its configuration, the cache
+recipe, the containment root, the host, and the ioflux build — and the
+comparison reports one of three outcomes:
+
+- **comparable** — the runs agree on all of it, and the delta is attributable to
+  what changed between them.
+- **comparable with caveats** — something else differs too. The difference is
+  named above the numbers it qualifies: a different trace means the delta
+  measures two workloads rather than two backends, a different cache recipe
+  usually dominates a read workload's timing, and so on. The delta is still
+  printed.
+- **incomparable** — at least one run is not a valid measurement, because
+  operations failed or latency samples fell outside the histogram's range. No
+  delta is printed and the command exits `1`, so a comparison in CI fails rather
+  than reporting a speedup that a broken run produced.
+
+Trace identity comes from the digest rather than the file name, so the same
+bytes under a different path still compare as one workload. Results written
+before this metadata existed compare with an explicit note that their identity
+could not be verified — never as agreement.
 
 ## Target safety
 

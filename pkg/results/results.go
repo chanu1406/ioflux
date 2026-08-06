@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
+	"github.com/chanuollala/ioflux/pkg/buildinfo"
 	"github.com/chanuollala/ioflux/pkg/fidelity"
 	"github.com/chanuollala/ioflux/pkg/metrics"
 	"github.com/chanuollala/ioflux/pkg/trace"
@@ -29,7 +31,14 @@ const (
 
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
-	TracePath          string  `json:"trace_path"`
+	TracePath string `json:"trace_path"`
+	// TraceDigest identifies the trace bytes this run replayed
+	// ("sha256:<hex>"; see trace.Digest). TracePath cannot serve this purpose:
+	// two runs of "trace.ioflux" may be two different workloads, and two runs of
+	// differently named copies may be one. Empty in results written before the
+	// field existed, which a comparison must report as unverifiable rather than
+	// assume means "same".
+	TraceDigest        string  `json:"trace_digest,omitempty"`
 	Engine             string  `json:"engine"`
 	Mode               string  `json:"mode"`
 	MaxInflight        int     `json:"max_inflight"`
@@ -41,6 +50,16 @@ type PlanInfo struct {
 	NumStreams         int     `json:"num_streams"`
 	NumOps             int64   `json:"num_ops"`
 	TotalBytes         int64   `json:"total_bytes"`
+	// TargetRoot is the containment root the run was confined to, empty when the
+	// run was unconfined. Recorded because it changes what the run was able to
+	// touch, so a confined and an unconfined run are not the same experiment.
+	TargetRoot string `json:"target_root,omitempty"`
+	// Bucket is the object-store bucket the run addressed, empty for engines
+	// with no bucket namespace.
+	Bucket string `json:"bucket,omitempty"`
+	// Endpoint is the S3-compatible endpoint override the run used, empty when
+	// the default endpoint for the region applied.
+	Endpoint string `json:"endpoint,omitempty"`
 	// TracePartialReads counts READ/GET ops whose source transferred fewer bytes
 	// than it requested. A run reproducing them is correct and reports no short
 	// read, so without this the report could not distinguish "the workload had no
@@ -101,6 +120,49 @@ type RunEnv struct {
 	EngineLimitations []string `json:"engine_limitations,omitempty"`
 }
 
+// Tool identifies the IOFlux build that produced a result, so a comparison can
+// tell whether two results came from the same measuring instrument.
+type Tool struct {
+	Version  string `json:"version,omitempty"`
+	Revision string `json:"revision,omitempty"`
+}
+
+// Host records the machine that produced a result. Two runs measured on
+// different hosts are not a controlled comparison unless the host is the
+// declared treatment, so the fields exist to make that difference visible
+// rather than leave it to be remembered.
+//
+// For a distributed run this is the coordinator, which is not where the I/O
+// happened; the hosts that replayed it are in Results.Hosts. The distinction
+// matters when reading a comparison: agreeing Host fields across two
+// distributed runs mean the same coordinator, not the same workers.
+//
+// The fields here are the portable ones. Kernel release, filesystem type,
+// mount options, and device topology are the other half of environment
+// comparability (they matter at least as much for a storage experiment) but
+// they are platform-specific to discover and are deliberately left to a
+// separate change rather than half-populated here.
+type Host struct {
+	Hostname string `json:"hostname,omitempty"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	CPUs     int    `json:"cpus,omitempty"`
+}
+
+// CurrentHost describes the machine this process is running on.
+func CurrentHost() Host {
+	h := Host{OS: runtime.GOOS, Arch: runtime.GOARCH, CPUs: runtime.NumCPU()}
+	if name, err := os.Hostname(); err == nil {
+		h.Hostname = name
+	}
+	return h
+}
+
+// CurrentTool describes the build of IOFlux running this process.
+func CurrentTool() Tool {
+	return Tool{Version: buildinfo.Version, Revision: buildinfo.Revision()}
+}
+
 // CPU records per-process CPU time consumed by the run. Reported alongside
 // throughput so a CPU-bound result is not mistaken for a storage-bound one.
 type CPU struct {
@@ -135,16 +197,27 @@ type StragglerWindow struct {
 	LastDoneGiBPerSec  float64 `json:"last_done_gib_per_sec"`
 }
 
+// SchemaVersion is the result_schema_version written into every new result.
+// It exists so a reader can tell a result that omits a field because the field
+// did not exist from one that omits it because the value was absent — the
+// distinction a comparison needs before it can treat a missing trace digest as
+// "unverifiable" rather than "unset".
+const SchemaVersion = 2
+
 // Results is the full output of a replay run written to results.json.
 type Results struct {
-	GeneratedAt  string   `json:"generated_at"`
-	Plan         PlanInfo `json:"plan"`
-	RunEnv       RunEnv   `json:"run_env"`
-	DurationNS   int64    `json:"duration_ns"`
-	OpsCompleted int64    `json:"ops_completed"`
-	BytesMoved   int64    `json:"bytes_moved"`
-	Errors       int64    `json:"errors"`
-	ShortReads   int64    `json:"short_reads,omitempty"`
+	// SchemaVersion is 0 in results written before the field existed.
+	SchemaVersion int      `json:"result_schema_version,omitempty"`
+	GeneratedAt   string   `json:"generated_at"`
+	Tool          Tool     `json:"tool,omitempty"`
+	Host          Host     `json:"host,omitempty"`
+	Plan          PlanInfo `json:"plan"`
+	RunEnv        RunEnv   `json:"run_env"`
+	DurationNS    int64    `json:"duration_ns"`
+	OpsCompleted  int64    `json:"ops_completed"`
+	BytesMoved    int64    `json:"bytes_moved"`
+	Errors        int64    `json:"errors"`
+	ShortReads    int64    `json:"short_reads,omitempty"`
 	// HistogramOverflows counts latency samples that exceeded the histogram's
 	// 100s trackable range and were excluded from every percentile in
 	// PerOpStats/ServiceTimeStats. The underlying op still completed and is
@@ -208,7 +281,10 @@ func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64
 		}
 	}
 	r := &Results{
+		SchemaVersion:      SchemaVersion,
 		GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
+		Tool:               CurrentTool(),
+		Host:               CurrentHost(),
 		Plan:               plan,
 		RunEnv:             runEnv,
 		DurationNS:         durationNS,
