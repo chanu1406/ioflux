@@ -181,7 +181,10 @@ func TestImport_Basic(t *testing.T) {
 			if op.Off != nil && *op.Off == 0 && op.Len != nil && *op.Len == 4096 {
 				sawRead0 = true
 			}
-			if op.Off != nil && *op.Off == 4096 && op.Len != nil && *op.Len == 2048 {
+			// Asks for 4096, gets 2048: both counts survive, and the offset follows
+			// the first read's transferred bytes.
+			if op.Off != nil && *op.Off == 4096 &&
+				op.Len != nil && *op.Len == 4096 && op.Ret != nil && *op.Ret == 2048 {
 				sawRead4096 = true
 			}
 			if op.Off != nil && *op.Off == 100000 && op.Len != nil && *op.Len == 1024 {
@@ -193,7 +196,7 @@ func TestImport_Basic(t *testing.T) {
 		t.Error("missing READ at off=0 len=4096 (first sequential read)")
 	}
 	if !sawRead4096 {
-		t.Error("missing READ at off=4096 len=2048 (cursor-tracked second read)")
+		t.Error("missing short READ at off=4096 len=4096 ret=2048 (cursor-tracked second read)")
 	}
 	if !sawPread {
 		t.Error("missing READ at off=100000 len=1024 (pread64 positional)")
@@ -536,13 +539,11 @@ func TestImport_MultiStream(t *testing.T) {
 	}
 }
 
-// TestImport_ShortTransferRecordsDroppedRequestedLength pins the same
-// disclosure as the strace importer's equivalent test: DFTracer records both
-// args.count (requested) and return_val (transferred), but the trace IR has one
-// length field per transfer op, so a short read loses the requested count and
-// replay will under-request. The loss must be counted and must travel with the
-// trace.
-func TestImport_ShortTransferRecordsDroppedRequestedLength(t *testing.T) {
+// TestImport_ShortTransferPreservesRequestedLength is the DFTracer counterpart
+// of the strace test: when the source reports args.count, both the requested and
+// the transferred count survive, so replay issues the request the application
+// made rather than one the size of its result.
+func TestImport_ShortTransferPreservesRequestedLength(t *testing.T) {
 	const in = `{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","flags":0,"return_val":3}}
 {"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":262144,"return_val":262144}}
 {"name":"read","cat":"POSIX","ph":"X","ts":1020.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"count":262144,"return_val":111392}}
@@ -556,19 +557,80 @@ func TestImport_ShortTransferRecordsDroppedRequestedLength(t *testing.T) {
 	assertValid(t, buf.Bytes())
 	hdr, ops := readTrace(t, buf.Bytes())
 
-	if got := rep.Lossy[importer.LossyNote]; got != 1 {
-		t.Errorf("Lossy[%s] = %d, want 1 (only the short read)", importer.LossyNote, got)
+	if len(rep.Lossy) != 0 {
+		t.Errorf("Lossy = %v, want empty: args.count made the requested length representable", rep.Lossy)
 	}
-	if !strings.Contains(hdr.Notes, "lossy: "+importer.LossyNote+"=1") {
-		t.Errorf("header notes do not carry the lossy count: %q", hdr.Notes)
-	}
-	for _, want := range []string{"not the byte count it", "stat/fstat events are not represented"} {
+	for _, want := range []string{"records the requested byte count", "stat/fstat events are not represented"} {
 		if !strings.Contains(hdr.CaptureLimitations, want) {
 			t.Errorf("capture limitations missing %q: %q", want, hdr.CaptureLimitations)
 		}
 	}
 	if n := countKind(ops, trace.OpRead); n != 2 {
 		t.Fatalf("READ count = %d, want 2", n)
+	}
+
+	var reads []trace.Op
+	for _, op := range ops {
+		if op.Op == trace.OpRead {
+			reads = append(reads, op)
+		}
+	}
+	if *reads[0].Len != 262144 || reads[0].Ret != nil {
+		t.Errorf("full READ = (len %d, ret %v), want (262144, nil)", *reads[0].Len, reads[0].Ret)
+	}
+	if *reads[1].Len != 262144 {
+		t.Errorf("short READ len = %d, want 262144 (requested)", *reads[1].Len)
+	}
+	if reads[1].Ret == nil || *reads[1].Ret != 111392 {
+		t.Fatalf("short READ ret = %v, want 111392 (returned)", reads[1].Ret)
+	}
+	// The second read's offset must follow the first read's *transferred* bytes.
+	if *reads[1].Off != 262144 {
+		t.Errorf("short READ off = %d, want 262144: the cursor advances by bytes moved", *reads[1].Off)
+	}
+	if hdr.Version != trace.VersionPartialTransfer {
+		t.Errorf("header version = %d, want %d", hdr.Version, trace.VersionPartialTransfer)
+	}
+	if hdr.Summary.NumPartialReads != 1 {
+		t.Errorf("summary.num_partial_reads = %d, want 1", hdr.Summary.NumPartialReads)
+	}
+}
+
+// TestImport_MissingCountRecordsUnobservableRequestedLength covers the hashed
+// 2.x form, which reports what moved but never what was asked for. The format
+// can represent a partial transfer now, so what remains is a limit of the
+// capture — and a consumer can only know a short read is indistinguishable from
+// a full one of the same size if that is recorded.
+func TestImport_MissingCountRecordsUnobservableRequestedLength(t *testing.T) {
+	const in = `{"name":"open","cat":"POSIX","ph":"X","ts":1000.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","flags":0,"return_val":3}}
+{"name":"read","cat":"POSIX","ph":"X","ts":1010.0,"dur":5.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"return_val":111392}}
+{"name":"close","cat":"POSIX","ph":"X","ts":1030.0,"dur":1.0,"pid":100,"tid":100,"args":{"fname":"/data/f.bin","fd":3,"return_val":0}}
+`
+	var buf bytes.Buffer
+	rep, err := dftracer.Import(strings.NewReader(in), &buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	assertValid(t, buf.Bytes())
+	hdr, ops := readTrace(t, buf.Bytes())
+
+	if got := rep.Lossy[importer.LossyRequestedLenUnobservable]; got != 1 {
+		t.Errorf("Lossy[%s] = %d, want 1", importer.LossyRequestedLenUnobservable, got)
+	}
+	if !strings.Contains(hdr.Notes, "lossy: "+importer.LossyRequestedLenUnobservable+"=1") {
+		t.Errorf("header notes do not carry the lossy count: %q", hdr.Notes)
+	}
+	// Without a requested count there is nothing to record but what moved, so the
+	// trace stays v1 and claims no partial transfer it cannot substantiate.
+	for _, op := range ops {
+		if op.Op == trace.OpRead {
+			if *op.Len != 111392 || op.Ret != nil {
+				t.Errorf("READ = (len %d, ret %v), want (111392, nil)", *op.Len, op.Ret)
+			}
+		}
+	}
+	if hdr.Version != trace.TraceFormatVersion {
+		t.Errorf("header version = %d, want %d", hdr.Version, trace.TraceFormatVersion)
 	}
 }
 
@@ -584,11 +646,19 @@ func TestImport_FullTransfersAreNotLossy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	hdr, _ := readTrace(t, buf.Bytes())
+	hdr, ops := readTrace(t, buf.Bytes())
 	if len(rep.Lossy) != 0 {
 		t.Errorf("Lossy = %v, want empty", rep.Lossy)
 	}
 	if strings.Contains(hdr.Notes, "lossy:") {
 		t.Errorf("notes should not mention loss when none occurred: %q", hdr.Notes)
+	}
+	for _, op := range ops {
+		if op.Ret != nil {
+			t.Errorf("%s carries ret %d, want nil for a full transfer", op.Op, *op.Ret)
+		}
+	}
+	if hdr.Version != trace.TraceFormatVersion {
+		t.Errorf("header version = %d, want %d", hdr.Version, trace.TraceFormatVersion)
 	}
 }

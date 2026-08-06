@@ -87,6 +87,54 @@ func TestReportCmd_PrintsCaptureProvenance(t *testing.T) {
 	}
 }
 
+// TestReportCmd_StatesSourcePartialReads pins that a run reproducing a source's
+// short reads says so. Reproducing them correctly means the replay reports no
+// short read and no error, which is indistinguishable from a workload that never
+// had one — so without this line the report cannot tell the two apart.
+func TestReportCmd_StatesSourcePartialReads(t *testing.T) {
+	res := makeTestResults()
+	res.Plan.TracePartialReads = 32
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr)
+	}
+	if !strings.Contains(out, "32 source read(s) returned less than requested") {
+		t.Errorf("report does not state the source's partial reads; got:\n%s", out)
+	}
+	// A clean run must still read as clean.
+	if !strings.Contains(out, "Execution: no detected operation failures") {
+		t.Errorf("reproducing a source short read must not invalidate the run; got:\n%s", out)
+	}
+}
+
+// TestReportCmd_OmitsPartialReadsWhenNone keeps the line meaningful.
+func TestReportCmd_OmitsPartialReadsWhenNone(t *testing.T) {
+	data, err := json.Marshal(makeTestResults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if strings.Contains(out, "returned less than requested") {
+		t.Errorf("report mentions partial reads for a trace with none; got:\n%s", out)
+	}
+}
+
 func runReportCLI(args []string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
 	code := runReport(args, &stdout, &stderr)
@@ -369,7 +417,8 @@ func TestReportCmd_ErrorsReportedAsWarning(t *testing.T) {
 	if !strings.Contains(out, "3 op error(s)") {
 		t.Errorf("output should mention op errors; got:\n%s", out)
 	}
-	if !strings.Contains(out, "Execution: INVALID — 3 operation failure(s), including 1 short read(s)") {
+	if !strings.Contains(out,
+		"Execution: INVALID — 3 operation failure(s), including 1 read(s) whose returned byte count disagreed with the source") {
 		t.Errorf("output should give failed operations an explicit invalid execution verdict; got:\n%s", out)
 	}
 }

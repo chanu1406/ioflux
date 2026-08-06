@@ -157,10 +157,24 @@ func TestValidate_MissingVersion(t *testing.T) {
 
 func TestValidate_WrongVersion(t *testing.T) {
 	h := validSyntheticHeader()
-	h.Version = 2
+	h.Version = TraceFormatVersionMax + 1
 	rep := mustValidate(t, h, nil)
 	if !hasErr(rep, "unsupported version") {
 		t.Fatalf("want unsupported version error, got %v", rep.Errors)
+	}
+}
+
+// TestValidate_AcceptsVersionRange pins that widening the range for ret did not
+// orphan traces written before it: a v1 trace must keep validating on a build
+// that understands v2, or every archived fixture becomes unreadable.
+func TestValidate_AcceptsVersionRange(t *testing.T) {
+	for v := TraceFormatVersion; v <= TraceFormatVersionMax; v++ {
+		h := validSyntheticHeader()
+		h.Version = v
+		rep := mustValidate(t, h, nil)
+		if hasErr(rep, "ioflux_trace_version") {
+			t.Errorf("version %d rejected: %v", v, rep.Errors)
+		}
 	}
 }
 
@@ -500,6 +514,96 @@ func TestValidate_PutNegativeLen(t *testing.T) {
 	rep := mustValidate(t, validSyntheticHeader(), ops)
 	if !hasErr(rep, "PUT len -5 must be non-negative") {
 		t.Fatalf("want PUT negative len, got %v", rep.Errors)
+	}
+}
+
+// partialReadHeader is validSyntheticHeader declaring the version and count a
+// trace carrying ret must declare.
+func partialReadHeader() Header {
+	h := validSyntheticHeader()
+	h.Version = VersionPartialTransfer
+	h.Summary.NumPartialReads = 1
+	return h
+}
+
+func partialReadOps(ret int64) []Op {
+	return []Op{
+		{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeRead},
+		{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpRead, H: Ptr[int64](42),
+			Off: Ptr[int64](0), Len: Ptr[int64](4096), Ret: Ptr(ret)},
+	}
+}
+
+func TestValidate_PartialReadAccepted(t *testing.T) {
+	rep := mustValidate(t, partialReadHeader(), partialReadOps(1000))
+	if !rep.OK() {
+		t.Fatalf("want OK, got %v", rep.Errors)
+	}
+	if rep.NumPartialReads != 1 {
+		t.Errorf("NumPartialReads = %d, want 1", rep.NumPartialReads)
+	}
+}
+
+func TestValidate_RetExceedingLen(t *testing.T) {
+	rep := mustValidate(t, partialReadHeader(), partialReadOps(8192))
+	if !hasErr(rep, "cannot return more than it asked for") {
+		t.Fatalf("want ret>len error, got %v", rep.Errors)
+	}
+}
+
+func TestValidate_RetNegative(t *testing.T) {
+	rep := mustValidate(t, partialReadHeader(), partialReadOps(-1))
+	if !hasErr(rep, "ret -1 must be non-negative") {
+		t.Fatalf("want negative ret error, got %v", rep.Errors)
+	}
+}
+
+// TestValidate_RetOnWriteRejected pins the deliberate asymmetry: a partial read
+// describes the target's length and is reproducible; a partial write describes
+// backend state a healthy replay backend cannot be asked to reproduce.
+func TestValidate_RetOnWriteRejected(t *testing.T) {
+	for _, kind := range []OpKind{OpWrite, OpPut} {
+		h := partialReadHeader()
+		h.Summary.NumPartialReads = 0
+		ops := []Op{
+			{T: 0, OpID: Ptr[int64](0), S: 0, Op: OpOpen, Tgt: Ptr(0), H: Ptr[int64](42), Mode: ModeWrite},
+			{T: 1, OpID: Ptr[int64](1), S: 0, Op: kind, H: Ptr[int64](42),
+				Off: Ptr[int64](0), Len: Ptr[int64](4096), Ret: Ptr[int64](1000)},
+		}
+		if kind == OpPut {
+			ops[1] = Op{T: 1, OpID: Ptr[int64](1), S: 0, Op: OpPut, Tgt: Ptr(0),
+				Len: Ptr[int64](4096), Ret: Ptr[int64](1000)}
+		}
+		rep := mustValidate(t, h, ops)
+		if !hasErr(rep, "must not carry ret") {
+			t.Errorf("%s: want ret-forbidden error, got %v", kind, rep.Errors)
+		}
+	}
+}
+
+// TestValidate_RetRequiresDeclaredVersion is the fail-closed check. A build that
+// predates ret ignores the field and reads len as the transferred count, so it
+// would replay a different request size and report a green run. Declaring v1
+// while carrying ret is therefore an error, not a tolerated inconsistency.
+func TestValidate_RetRequiresDeclaredVersion(t *testing.T) {
+	h := partialReadHeader()
+	h.Version = TraceFormatVersion // v1, but the ops use a v2 field
+	rep := mustValidate(t, h, partialReadOps(1000))
+	if !hasErr(rep, "ret requires ioflux_trace_version") {
+		t.Fatalf("want version-gate error, got %v", rep.Errors)
+	}
+}
+
+// TestValidate_PartialReadCountReconciled proves the header's count is
+// recomputed rather than trusted: it is the only thing a consumer holding just
+// the header — a distributed coordinator, a saved report — can rely on.
+func TestValidate_PartialReadCountReconciled(t *testing.T) {
+	h := partialReadHeader()
+	h.Summary.NumOps, h.Summary.NumStreams = 2, 1
+	h.Summary.NumPartialReads = 7 // the ops contain exactly 1
+	rep := mustValidateHeaderAsWritten(t, h, partialReadOps(1000))
+	if !hasErr(rep, "summary.num_partial_reads") {
+		t.Fatalf("want num_partial_reads reconciliation error, got %v", rep.Errors)
 	}
 }
 

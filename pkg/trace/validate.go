@@ -25,14 +25,15 @@ func (i Issue) String() string {
 }
 
 // Report is the result of Validate. Errors are spec violations; Warnings are
-// suspicious-but-permitted patterns. NumOpsRead and Streams are populated even
-// on failure for diagnostic context.
+// suspicious-but-permitted patterns. NumOpsRead, NumPartialReads, and Streams
+// are populated even on failure for diagnostic context.
 type Report struct {
-	Header     Header
-	NumOpsRead int64
-	Streams    map[int64]int64
-	Errors     []Issue
-	Warnings   []Issue
+	Header          Header
+	NumOpsRead      int64
+	NumPartialReads int64
+	Streams         map[int64]int64
+	Errors          []Issue
+	Warnings        []Issue
 }
 
 // OK reports whether the trace passes validation (no errors). Warnings do not
@@ -164,6 +165,11 @@ func ValidateWithOps(r *Reader, onOp func(Op) error) (Report, error) {
 			forbidPositional(line, op, &rep)
 		}
 
+		validateRet(line, op, &rep)
+		if op.IsPartialTransfer() {
+			rep.NumPartialReads++
+		}
+
 		if op.Dur != nil && *op.Dur < 0 {
 			rep.addError(line, "dur", fmt.Sprintf("dur %d must be non-negative", *op.Dur))
 		}
@@ -215,6 +221,15 @@ func validateSummaryAgreement(rep *Report) {
 		rep.addError(1, "summary.num_streams", fmt.Sprintf(
 			"header declares %d stream(s) but the trace contains %d: the trace is truncated "+
 				"or its summary is stale", declared, actual))
+	}
+	// Recomputed, not trusted: this count is the only thing a consumer holding
+	// just the header can use to know the trace contains partial transfers, so a
+	// stale or edited value would misrepresent the workload to every reader that
+	// never sees the ops.
+	if declared := rep.Header.Summary.NumPartialReads; declared != rep.NumPartialReads {
+		rep.addError(1, "summary.num_partial_reads", fmt.Sprintf(
+			"header declares %d partial read(s) but the trace contains %d: the trace is "+
+				"truncated or its summary is stale", declared, rep.NumPartialReads))
 	}
 }
 
@@ -311,10 +326,10 @@ func validateHeaderPresence(raw []byte, rep *Report) {
 func validateHeader(h Header, rep *Report) {
 	if h.Version == 0 {
 		rep.addError(1, "ioflux_trace_version", "missing required field")
-	} else if h.Version != TraceFormatVersion {
+	} else if h.Version < TraceFormatVersion || h.Version > TraceFormatVersionMax {
 		rep.addError(1, "ioflux_trace_version",
-			fmt.Sprintf("unsupported version %d (this build expects %d)",
-				h.Version, TraceFormatVersion))
+			fmt.Sprintf("unsupported version %d (this build reads %d-%d)",
+				h.Version, TraceFormatVersion, TraceFormatVersionMax))
 	}
 
 	if h.Kind == "" {
@@ -457,6 +472,41 @@ func requireOffLen(line int, op Op, rep *Report) {
 			fmt.Sprintf("%s off %d must be non-negative", op.Op, *op.Off))
 	}
 	requireLen(line, op, rep)
+}
+
+// validateRet checks the partial-transfer field: which ops may carry it, that
+// it is a coherent subset of the requested length, and that the header declares
+// a version whose readers understand it.
+//
+// The version check is the load-bearing one. Every other field here is
+// self-describing on a reader that ignores it; ret is not. A build that drops
+// it silently reads len as "bytes transferred" and replays a different request
+// size, which produces a green result for a workload that was never run.
+func validateRet(line int, op Op, rep *Report) {
+	if op.Ret == nil {
+		return
+	}
+	switch op.Op {
+	case OpRead, OpGet:
+	default:
+		rep.addError(line, "ret", fmt.Sprintf(
+			"%s must not carry ret (a partial transfer is only representable for READ and GET)", op.Op))
+		return
+	}
+	if *op.Ret < 0 {
+		rep.addError(line, "ret", fmt.Sprintf("ret %d must be non-negative", *op.Ret))
+	}
+	if op.Len != nil && *op.Ret > *op.Len {
+		rep.addError(line, "ret", fmt.Sprintf(
+			"ret %d exceeds requested len %d: a transfer cannot return more than it asked for",
+			*op.Ret, *op.Len))
+	}
+	if v := op.MinVersion(); rep.Header.Version > 0 && rep.Header.Version < v {
+		rep.addError(line, "ret", fmt.Sprintf(
+			"ret requires ioflux_trace_version %d but the header declares %d: an older reader "+
+				"would ignore ret and replay len as the transferred count",
+			v, rep.Header.Version))
+	}
 }
 
 func requireLen(line int, op Op, rep *Report) {

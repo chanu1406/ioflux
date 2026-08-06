@@ -167,8 +167,11 @@ func TestImport_Basic(t *testing.T) {
 		if op.Op == trace.OpRead && op.Off != nil && *op.Off == 100000 && op.Len != nil && *op.Len == 1024 {
 			sawPread = true
 		}
-		if op.Op == trace.OpRead && op.Off != nil && *op.Off == 4096 && op.Len != nil && *op.Len == 2048 {
-			sawSecondRead = true // off tracked via cursor after the first 4096-byte read
+		// The fixture's second read asks for 4096 and gets 2048, so it carries both
+		// counts; its offset follows the *transferred* bytes of the first read.
+		if op.Op == trace.OpRead && op.Off != nil && *op.Off == 4096 &&
+			op.Len != nil && *op.Len == 4096 && op.Ret != nil && *op.Ret == 2048 {
+			sawSecondRead = true
 		}
 		if op.Op == trace.OpOpen && op.Mode == trace.ModeWrite && hasFlag(op.Flags, "append") {
 			sawAppendOpen = true
@@ -178,7 +181,7 @@ func TestImport_Basic(t *testing.T) {
 		t.Error("missing pread64 op at off=100000 len=1024")
 	}
 	if !sawSecondRead {
-		t.Error("missing cursor-tracked read at off=4096 len=2048")
+		t.Error("missing cursor-tracked short read at off=4096 len=4096 ret=2048")
 	}
 	if !sawAppendOpen {
 		t.Error("missing append-mode OPEN (flag preserved even though its writes are skipped)")
@@ -421,15 +424,16 @@ func TestImport_Empty(t *testing.T) {
 	}
 }
 
-// TestImport_ShortReadRecordsDroppedRequestedLength pins the disclosure that a
-// short transfer loses the byte count the application asked for. The trace IR has
-// one length field per transfer op and it holds what actually moved, so a
-// consumer can only learn that replay will under-request by reading this count.
+// TestImport_ShortReadPreservesRequestedLength pins the fix for the one
+// dimension the qual-01 reconciliation measured as failing: a short read used to
+// lose the byte count the application asked for, so replay issued a request the
+// size of the source's *result* and reported a green, short-read-free run for a
+// request the application never made.
 //
-// The qualification fixture (qualification/FIXTURE.md) reads shards whose size is
-// not a multiple of its block size, which produces exactly this case; the
-// reported count was cross-checked against an independent oracle.
-func TestImport_ShortReadRecordsDroppedRequestedLength(t *testing.T) {
+// The qualification fixture (qualification/FIXTURE.md) reads shards whose size
+// is not a multiple of its block size, which produces exactly this case; the
+// count was cross-checked against an independent oracle.
+func TestImport_ShortReadPreservesRequestedLength(t *testing.T) {
 	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/shard.bin", O_RDONLY) = 3 <0.000010>
 12:00:00.000100 read(3, ""..., 262144) = 262144 <0.000050>
 12:00:00.000200 read(3, ""..., 262144) = 111392 <0.000040>
@@ -438,21 +442,16 @@ func TestImport_ShortReadRecordsDroppedRequestedLength(t *testing.T) {
 `
 	rep, hdr, ops := importString(t, in)
 
-	if got := rep.Lossy[importer.LossyNote]; got != 1 {
-		t.Errorf("Lossy[%s] = %d, want 1 (only the 111392-of-262144 read is short)",
-			importer.LossyNote, got)
+	// Nothing is lost any more: strace reports the requested count and the IR can
+	// now hold it.
+	if len(rep.Lossy) != 0 {
+		t.Errorf("Lossy = %v, want empty: the requested length is representable", rep.Lossy)
 	}
-	// The full-length read must not be counted, and the EOF read is a skip, not a
-	// loss: it produced no op at all.
+	// The EOF read remains a skip, not a loss: it produced no op at all.
 	if rep.SkippedReasons["eof_read"] != 1 {
 		t.Errorf("eof_read skips = %d, want 1", rep.SkippedReasons["eof_read"])
 	}
-	if got := len(rep.Lossy); got != 1 {
-		t.Errorf("len(Lossy) = %d, want exactly 1 reason: %v", got, rep.Lossy)
-	}
 
-	// The emitted op keeps the transferred length, which is what makes the
-	// requested length unrecoverable from the trace alone.
 	var reads []trace.Op
 	for _, op := range ops {
 		if op.Op == trace.OpRead {
@@ -462,58 +461,128 @@ func TestImport_ShortReadRecordsDroppedRequestedLength(t *testing.T) {
 	if len(reads) != 2 {
 		t.Fatalf("got %d READ ops, want 2", len(reads))
 	}
-	if *reads[1].Len != 111392 {
-		t.Errorf("short READ len = %d, want 111392 (returned bytes)", *reads[1].Len)
+	// Full-length read: one count suffices, so ret is omitted.
+	if *reads[0].Len != 262144 || reads[0].Ret != nil {
+		t.Errorf("full READ = (len %d, ret %v), want (262144, nil)", *reads[0].Len, reads[0].Ret)
+	}
+	// Short read: both counts survive. len is what replay will request.
+	if *reads[1].Len != 262144 {
+		t.Errorf("short READ len = %d, want 262144 (the requested count)", *reads[1].Len)
+	}
+	if reads[1].Ret == nil || *reads[1].Ret != 111392 {
+		t.Fatalf("short READ ret = %v, want 111392 (the returned count)", reads[1].Ret)
 	}
 
-	// The count must travel with the trace, not only with the terminal that ran
-	// the import.
-	if !strings.Contains(hdr.Notes, "lossy: "+importer.LossyNote+"=1") {
-		t.Errorf("header notes do not carry the lossy count: %q", hdr.Notes)
+	// A build predating ret would read len as the transferred count and replay a
+	// different request, so the trace must declare a version that build rejects.
+	if hdr.Version != trace.VersionPartialTransfer {
+		t.Errorf("header version = %d, want %d", hdr.Version, trace.VersionPartialTransfer)
 	}
-	for _, want := range []string{"not the byte count it", "EOF) is dropped", "replayed positionally"} {
+	// The count reaches a consumer holding only the header.
+	if hdr.Summary.NumPartialReads != 1 {
+		t.Errorf("summary.num_partial_reads = %d, want 1", hdr.Summary.NumPartialReads)
+	}
+	// total_bytes counts what moved, so it agrees with what a replay reports.
+	if want := int64(262144 + 111392); hdr.Summary.TotalBytes != want {
+		t.Errorf("summary.total_bytes = %d, want %d (transferred, not requested)",
+			hdr.Summary.TotalBytes, want)
+	}
+	for _, want := range []string{"records both the byte count the source requested",
+		"EOF) is dropped", "replayed positionally"} {
 		if !strings.Contains(hdr.CaptureLimitations, want) {
 			t.Errorf("capture limitations missing %q: %q", want, hdr.CaptureLimitations)
 		}
 	}
 }
 
-// TestImport_FullTransfersAreNotLossy guards against the loss counter firing on
-// ordinary full-length reads, which would make the disclosure meaningless.
+// TestImport_FullTransfersAreNotLossy guards against ret firing on ordinary
+// full-length reads, which would push every trace to v2 for no reason and make
+// the partial-read count meaningless.
 func TestImport_FullTransfersAreNotLossy(t *testing.T) {
 	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/f", O_RDONLY) = 3 <0.000010>
 12:00:00.000100 read(3, ""..., 4096) = 4096 <0.000050>
 12:00:00.000200 pread64(3, ""..., 4096, 8192) = 4096 <0.000050>
 12:00:00.000300 close(3) = 0 <0.000005>
 `
-	rep, hdr, _ := importString(t, in)
+	rep, hdr, ops := importString(t, in)
 	if len(rep.Lossy) != 0 {
 		t.Errorf("Lossy = %v, want empty for full-length transfers", rep.Lossy)
 	}
 	if strings.Contains(hdr.Notes, "lossy:") {
 		t.Errorf("notes should not mention loss when none occurred: %q", hdr.Notes)
 	}
+	for _, op := range ops {
+		if op.Ret != nil {
+			t.Errorf("%s carries ret %d, want nil for a full transfer", op.Op, *op.Ret)
+		}
+	}
+	if hdr.Version != trace.TraceFormatVersion {
+		t.Errorf("header version = %d, want %d: a trace using no v2 field must stay readable "+
+			"by builds that predate one", hdr.Version, trace.TraceFormatVersion)
+	}
+	if hdr.Summary.NumPartialReads != 0 {
+		t.Errorf("summary.num_partial_reads = %d, want 0", hdr.Summary.NumPartialReads)
+	}
 }
 
-// TestImport_ShortPositionalReadIsLossy covers pread64, whose requested count is
-// in the same argument position as read's but which carries an explicit offset.
-func TestImport_ShortPositionalReadIsLossy(t *testing.T) {
+// TestImport_ShortPositionalReadPreservesRequestedLength covers pread64, whose
+// requested count shares read's argument position but which carries an explicit
+// offset that must not be confused with it.
+func TestImport_ShortPositionalReadPreservesRequestedLength(t *testing.T) {
 	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/f", O_RDONLY) = 3 <0.000010>
 12:00:00.000100 pread64(3, ""..., 65536, 131072) = 4096 <0.000050>
 12:00:00.000200 close(3) = 0 <0.000005>
 `
 	rep, _, ops := importString(t, in)
-	if got := rep.Lossy[importer.LossyNote]; got != 1 {
-		t.Errorf("Lossy[%s] = %d, want 1", importer.LossyNote, got)
+	if len(rep.Lossy) != 0 {
+		t.Errorf("Lossy = %v, want empty", rep.Lossy)
 	}
+	var found bool
 	for _, op := range ops {
-		if op.Op == trace.OpRead {
-			if *op.Off != 131072 {
-				t.Errorf("pread64 offset = %d, want 131072", *op.Off)
-			}
-			if *op.Len != 4096 {
-				t.Errorf("pread64 len = %d, want 4096 (returned)", *op.Len)
-			}
+		if op.Op != trace.OpRead {
+			continue
 		}
+		found = true
+		if *op.Off != 131072 {
+			t.Errorf("pread64 offset = %d, want 131072", *op.Off)
+		}
+		if *op.Len != 65536 {
+			t.Errorf("pread64 len = %d, want 65536 (requested)", *op.Len)
+		}
+		if op.Ret == nil || *op.Ret != 4096 {
+			t.Errorf("pread64 ret = %v, want 4096 (returned)", op.Ret)
+		}
+	}
+	if !found {
+		t.Fatal("no READ op emitted")
+	}
+}
+
+// TestImport_ShortWriteKeepsTransferredLength pins the deliberate asymmetry: a
+// partial read is a property of the target's length and is reproducible, while a
+// partial write is backend state (a full disk) that a healthy replay backend
+// cannot be asked to reproduce. The write records what landed and says so.
+func TestImport_ShortWriteKeepsTransferredLength(t *testing.T) {
+	const in = `12:00:00.000000 openat(AT_FDCWD, "/data/w", O_WRONLY|O_CREAT) = 3 <0.000010>
+12:00:00.000100 write(3, ""..., 4096) = 1000 <0.000050>
+12:00:00.000200 close(3) = 0 <0.000005>
+`
+	_, hdr, ops := importString(t, in)
+	for _, op := range ops {
+		if op.Op != trace.OpWrite {
+			continue
+		}
+		if *op.Len != 1000 {
+			t.Errorf("short WRITE len = %d, want 1000 (bytes that landed)", *op.Len)
+		}
+		if op.Ret != nil {
+			t.Errorf("short WRITE ret = %d, want nil: writes are not partial-transfer ops", *op.Ret)
+		}
+	}
+	if hdr.Version != trace.TraceFormatVersion {
+		t.Errorf("header version = %d, want %d", hdr.Version, trace.TraceFormatVersion)
+	}
+	if !strings.Contains(hdr.CaptureLimitations, "a WRITE op records only the bytes that landed") {
+		t.Errorf("capture limitations do not disclose the write asymmetry: %q", hdr.CaptureLimitations)
 	}
 }

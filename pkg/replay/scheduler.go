@@ -582,10 +582,11 @@ func dispatchOp(
 
 	case trace.OpRead:
 		rh := handleMap[*op.H]
-		off, length := *op.Off, *op.Len
-		buf = growBuf(buf, length)
-		n, err := eng.Read(ctx, rh.handle, off, length, buf[:length])
-		bytesN, shortRead, opErr = checkedReadTransfer(n, length, err)
+		off, requested := *op.Off, *op.Len
+		expected, _ := op.TransferredBytes()
+		buf = growBuf(buf, requested)
+		n, err := eng.Read(ctx, rh.handle, off, requested, buf[:requested])
+		bytesN, shortRead, opErr = checkedReadTransfer(n, requested, expected, err)
 
 	case trace.OpWrite:
 		rh := handleMap[*op.H]
@@ -645,10 +646,11 @@ func dispatchOp(
 
 	case trace.OpGet:
 		key := hdr.Targets[*op.Tgt].Name
-		off, length := *op.Off, *op.Len
-		buf = growBuf(buf, length)
-		n, err := eng.Get(ctx, key, off, length, buf[:length])
-		bytesN, shortRead, opErr = checkedReadTransfer(n, length, err)
+		off, requested := *op.Off, *op.Len
+		expected, _ := op.TransferredBytes()
+		buf = growBuf(buf, requested)
+		n, err := eng.Get(ctx, key, off, requested, buf[:requested])
+		bytesN, shortRead, opErr = checkedReadTransfer(n, requested, expected, err)
 
 	case trace.OpHead:
 		_, opErr = eng.Head(ctx, hdr.Targets[*op.Tgt].Name)
@@ -660,19 +662,38 @@ func dispatchOp(
 	return bytesN, shortRead, opErr
 }
 
-// checkedReadTransfer validates both parts of an Engine Read/Get outcome. A
-// short result is an operation failure even when an engine returns nil, because
-// completing less work than the trace requested cannot support a valid run.
-func checkedReadTransfer(n int, requested int64, err error) (bytesN int64, short bool, opErr error) {
+// checkedReadTransfer validates an Engine Read/Get outcome against the two
+// counts the trace records: requested is what the source asked the backend for,
+// expected is what the source actually got back (equal unless the source read
+// short at EOF).
+//
+// The comparison is against expected, not requested. That is what turns a short
+// read from "the backend under-delivered" into "the backend disagreed with the
+// source about how many bytes are there" — a real backend-validation signal.
+// Requesting the source's *result* instead would measure the backend on a
+// request the application never issued and could never disagree at all.
+func checkedReadTransfer(n int, requested, expected int64, err error) (bytesN int64, short bool, opErr error) {
+	// Bounded by requested, not expected: a backend that returns more than the
+	// source did has still moved those bytes, and the op fails on the expected
+	// comparison below. Clamping to expected would understate real traffic.
 	bytesN = validTransferredBytes(n, requested)
-	short = int64(n) != requested || errors.Is(err, engine.ErrShortRead)
 	if int64(n) < 0 || int64(n) > requested {
-		return bytesN, short, fmt.Errorf("engine returned invalid read count %d for %d requested bytes", n, requested)
+		return bytesN, true, fmt.Errorf("engine returned invalid read count %d for %d requested bytes", n, requested)
 	}
-	if short && err == nil {
-		err = fmt.Errorf("%w: completed %d of %d requested bytes", engine.ErrShortRead, n, requested)
+	if int64(n) != expected {
+		if err == nil {
+			err = fmt.Errorf("%w: completed %d of %d expected bytes (%d requested)",
+				engine.ErrShortRead, n, expected, requested)
+		}
+		return bytesN, true, err
 	}
-	return bytesN, short, err
+	// The source's outcome was reproduced exactly. An engine signalling a partial
+	// transfer is reporting the condition the trace predicted, so that sentinel —
+	// and only that sentinel — is absorbed; every other error still fails the op.
+	if errors.Is(err, engine.ErrShortRead) {
+		err = nil
+	}
+	return bytesN, false, err
 }
 
 // checkedWriteTransfer rejects a short or otherwise impossible Engine Write

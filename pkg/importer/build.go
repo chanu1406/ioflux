@@ -111,12 +111,16 @@ func (b *Builder) Skip(reason string) {
 // that replaying it will not reproduce the source exactly.
 func (b *Builder) Note(reason string) { b.report.Lossy[reason]++ }
 
-// LossyNote is the reason recorded when a short read or write is imported. The
-// trace IR carries one length per transfer op, and it holds the bytes the source
-// actually moved; the count the application asked for has nowhere to go. Replay
-// therefore issues a request the size of the source's *result*, so the source's
-// request shape is not reproduced for these ops.
-const LossyNote = "short_transfer_requested_len_dropped"
+// LossyRequestedLenUnobservable is the reason recorded when a transfer op is
+// imported from a source that reports how many bytes moved but not how many
+// were asked for. The trace IR can represent a partial transfer (trace.Op.Ret),
+// so this is no longer a limit of the format — it is a limit of the capture, and
+// it means a short transfer is indistinguishable from a full one of the same
+// size. Replay will issue a request the size of the source's *result*.
+//
+// A source that does report the requested count (strace, or DFTracer with
+// args.count) records both and loses nothing.
+const LossyRequestedLenUnobservable = "requested_len_unobservable"
 
 // LossySummary renders the recorded lossy notes as a stable, sorted string for
 // inclusion in a trace's header notes, so the information travels with the trace
@@ -196,12 +200,23 @@ func (b *Builder) WriteTo(w io.Writer, meta HeaderMeta) (Report, error) {
 		return cmp.Compare(a.localIdx, c.localIdx)
 	})
 
-	var totalBytes, durationNS int64
+	var totalBytes, durationNS, numPartialReads int64
+	version := trace.TraceFormatVersion
 	for i := range all {
 		id := int64(i)
 		all[i].op.OpID = &id
-		if countsBytes(all[i].op.Op) && all[i].op.Len != nil {
-			totalBytes += *all[i].op.Len
+		op := all[i].op
+		// Transferred, not requested: total_bytes must agree with what a replay
+		// actually moves (results.BytesMoved), or every partial transfer shows up
+		// as a spurious shortfall between the trace and the run.
+		if moved, ok := op.TransferredBytes(); ok && countsBytes(op.Op) {
+			totalBytes += moved
+		}
+		if op.IsPartialTransfer() {
+			numPartialReads++
+		}
+		if v := op.MinVersion(); v > version {
+			version = v
 		}
 	}
 	if len(all) > 0 {
@@ -209,7 +224,7 @@ func (b *Builder) WriteTo(w io.Writer, meta HeaderMeta) (Report, error) {
 	}
 
 	hdr := trace.Header{
-		Version:            trace.TraceFormatVersion,
+		Version:            version,
 		Kind:               meta.Kind,
 		GeneratedBy:        meta.GeneratedBy,
 		CreatedUTC:         meta.CreatedUTC,
@@ -218,11 +233,12 @@ func (b *Builder) WriteTo(w io.Writer, meta HeaderMeta) (Report, error) {
 		CaptureLimitations: meta.CaptureLimitations,
 		Targets:            b.targets,
 		Summary: trace.Summary{
-			NumOps:     int64(len(all)),
-			NumStreams: len(streamIDs),
-			NumGroups:  0,
-			TotalBytes: totalBytes,
-			DurationNS: durationNS,
+			NumOps:          int64(len(all)),
+			NumStreams:      len(streamIDs),
+			NumGroups:       0,
+			TotalBytes:      totalBytes,
+			DurationNS:      durationNS,
+			NumPartialReads: numPartialReads,
 		},
 		Notes: meta.Notes,
 	}

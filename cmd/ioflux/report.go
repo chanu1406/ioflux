@@ -104,6 +104,14 @@ func printRunReport(w io.Writer, res *results.Results) {
 	if plan.CaptureMethod != "" {
 		fmt.Fprintf(w, "Source:    %s\n", plan.CaptureMethod)
 	}
+	if plan.TracePartialReads > 0 {
+		// Stated explicitly because reproducing these is invisible otherwise: the
+		// replay matched the source and so reports no short read, which is
+		// indistinguishable from a workload that had none.
+		fmt.Fprintf(w, "           [%d source read(s) returned less than requested; "+
+			"replay issues the source's request size and requires its returned size]\n",
+			plan.TracePartialReads)
+	}
 	if plan.CaptureLimitations != "" {
 		fmt.Fprintf(w, "Capture limitations: %s\n", plan.CaptureLimitations)
 	}
@@ -121,7 +129,8 @@ func printRunReport(w io.Writer, res *results.Results) {
 	if res.Errors > 0 {
 		reason := fmt.Sprintf("%d operation failure(s)", res.Errors)
 		if res.ShortReads > 0 {
-			reason += fmt.Sprintf(", including %d short read(s)", res.ShortReads)
+			reason += fmt.Sprintf(", including %d read(s) whose returned byte count "+
+				"disagreed with the source", res.ShortReads)
 		}
 		invalidReasons = append(invalidReasons, reason)
 	}
@@ -256,8 +265,13 @@ func printRunReport(w io.Writer, res *results.Results) {
 		warnings = append(warnings, fmt.Sprintf("%d op error(s)", res.Errors))
 	}
 	if res.ShortReads > 0 {
+		// Not necessarily *fewer*: the trace records what the source received, so a
+		// target longer than the source's returns more than expected and is just as
+		// much a disagreement. Naming only the undersized case would misdescribe
+		// half the failures this check exists to catch.
 		warnings = append(warnings, fmt.Sprintf(
-			"%d short read(s): backend returned fewer bytes than the trace requested (undersized targets?)", res.ShortReads))
+			"%d read(s) returned a different number of bytes than the source did "+
+				"(mismatched target sizes?)", res.ShortReads))
 	}
 	if res.HistogramOverflows > 0 {
 		warnings = append(warnings, fmt.Sprintf(

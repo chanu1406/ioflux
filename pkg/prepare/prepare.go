@@ -72,7 +72,10 @@ func MetadataFromOps(_ []trace.TargetInfo, ops []trace.Op, fill payload.Config) 
 		if !ok {
 			continue
 		}
-		end := *op.Off + *op.Len
+		// Transferred, not requested: a short read proves the target ends at
+		// off+ret, so materializing off+len would erase the partial transfer.
+		moved, _ := op.TransferredBytes()
+		end := *op.Off + moved
 		if end > meta.Extents[idx] {
 			meta.Extents[idx] = end
 		}

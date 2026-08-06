@@ -24,10 +24,10 @@ const (
 	captureLimitations = "strace syscall trace; mmap page-fault I/O not captured; " +
 		"ops on file descriptors opened before tracing or shared across threads are skipped; " +
 		"STDIO/socket/non-file syscalls ignored; " +
-		"a READ/WRITE op records the bytes the source actually transferred, not the byte count it " +
-		"requested, because the trace IR has one length field per transfer: where the source read or " +
-		"wrote short, replay issues a smaller request than the application did and so does not " +
-		"reproduce the source request shape for those ops (see the lossy counts in notes); " +
+		"a READ op records both the byte count the source requested (len) and the count it received " +
+		"(ret), so a short read replays as the request the application actually made; a WRITE op " +
+		"records only the bytes that landed, so a source short write replays as a full write of that " +
+		"smaller size and its request shape is not reproduced; " +
 		"a read that returned 0 (EOF) is dropped entirely, so replay performs one fewer read per " +
 		"sequential read-to-EOF loop than the application did; " +
 		"reads are replayed positionally, so the source's file-cursor semantics and its lseek calls " +
@@ -357,13 +357,24 @@ func (p *parser) doRW(s, t int64, name string, a []string, ret string, dur *int6
 		return
 	}
 
-	// The trace IR stores one length per transfer op, and that length is the
-	// bytes actually moved (n). strace does record the count the application
-	// asked for -- read(fd, buf, count) -- so when the two differ the loss is
-	// detectable here, and recording it is the only way a consumer can know that
-	// replaying this op will request less than the source did.
-	if requested, ok := parseLeadingInt(argAt(a, 2)); ok && requested > n {
-		p.b.Note(importer.LossyNote)
+	// read(fd, buf, count) and pread64(fd, buf, count, off) both carry the
+	// requested count as the third argument, so a short read records what the
+	// application asked for (len) alongside what it got (ret) and replay issues
+	// the request the source issued. A count that cannot be parsed falls back to
+	// the transferred size and is recorded as a capture loss, since that op will
+	// replay as a smaller request than the source made.
+	//
+	// Writes take the fallback unconditionally: a source short write is backend
+	// state (a full disk), not a property of the target, so asking a healthy
+	// replay backend to reproduce it would demand a divergence rather than
+	// describe one.
+	requested := n
+	if kind == trace.OpRead {
+		if c, ok := parseLeadingInt(argAt(a, 2)); ok && c >= n {
+			requested = c
+		} else if !ok {
+			p.b.Note(importer.LossyRequestedLenUnobservable)
+		}
 	}
 
 	positional := strings.HasPrefix(name, "pread") || strings.HasPrefix(name, "pwrite")
@@ -383,7 +394,11 @@ func (p *parser) doRW(s, t int64, name string, a []string, ret string, dur *int6
 		off = e.Cursor
 		p.fdt.Advance(s, int(fd), n)
 	}
-	p.b.Add(trace.Op{T: t, S: s, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n), Dur: dur})
+	op := trace.Op{T: t, S: s, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(requested), Dur: dur}
+	if requested != n {
+		op.Ret = trace.Ptr(n)
+	}
+	p.b.Add(op)
 }
 
 func (p *parser) doClose(s, t int64, a []string, ret string, dur *int64) {

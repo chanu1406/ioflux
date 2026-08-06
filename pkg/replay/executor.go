@@ -196,7 +196,12 @@ func updatePrepMetadata(meta prepare.Metadata, handleToTarget map[int64]int, op 
 		if !ok {
 			return
 		}
-		end := *op.Off + *op.Len
+		// Transferred, not requested: a short read proves the target *ends* at
+		// off+ret. Sizing from the request would materialize a target longer than
+		// the source's, and the read would then come back full — silently erasing
+		// the very partial transfer the trace recorded.
+		moved, _ := op.TransferredBytes()
+		end := *op.Off + moved
 		if end > meta.Extents[idx] {
 			meta.Extents[idx] = end
 		}
@@ -212,7 +217,8 @@ func updatePrepMetadata(meta prepare.Metadata, handleToTarget map[int64]int, op 
 		if op.Off != nil {
 			off = *op.Off
 		}
-		end := off + *op.Len
+		moved, _ := op.TransferredBytes()
+		end := off + moved
 		if end > meta.Extents[*op.Tgt] {
 			meta.Extents[*op.Tgt] = end
 		}
@@ -363,6 +369,7 @@ func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 		NumStreams:                e.hdr.Summary.NumStreams,
 		NumOps:                    e.hdr.Summary.NumOps,
 		TotalBytes:                e.hdr.Summary.TotalBytes,
+		TracePartialReads:         e.hdr.Summary.NumPartialReads,
 		PrepareMode:               e.plan.PrepareMode,
 		FillMode:                  string(e.prepMeta.Fill.Mode),
 		FillSeed:                  e.prepMeta.Fill.Seed,

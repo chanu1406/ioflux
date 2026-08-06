@@ -29,28 +29,33 @@ const (
 
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
-	TracePath                 string  `json:"trace_path"`
-	Engine                    string  `json:"engine"`
-	Mode                      string  `json:"mode"`
-	MaxInflight               int     `json:"max_inflight"`
-	SpeedupFactor             float64 `json:"speedup_factor,omitempty"`
-	TraceKind                 string  `json:"trace_kind"`
-	Profile                   string  `json:"profile,omitempty"`
-	CaptureMethod             string  `json:"capture_method,omitempty"`
-	CaptureLimitations        string  `json:"capture_limitations,omitempty"`
-	NumStreams                int     `json:"num_streams"`
-	NumOps                    int64   `json:"num_ops"`
-	TotalBytes                int64   `json:"total_bytes"`
-	PrepareMode               string  `json:"prepare_mode,omitempty"`
-	PrepareScope              string  `json:"prepare_scope,omitempty"`
-	FillMode                  string  `json:"fill_mode,omitempty"`
-	FillSeed                  int64   `json:"fill_seed,omitempty"`
-	PrepareTouchedSameData    bool    `json:"prepare_touched_same_data,omitempty"`
-	PrepareVerified           int     `json:"prepare_verified,omitempty"`
-	PrepareCreated            int     `json:"prepare_created,omitempty"`
-	PrepareCopied             int     `json:"prepare_copied,omitempty"`
-	PrepareSkippedSizeUnknown int     `json:"prepare_skipped_size_unknown,omitempty"`
-	PrepareDerivedSizeFromOps int     `json:"prepare_derived_size_from_ops,omitempty"`
+	TracePath          string  `json:"trace_path"`
+	Engine             string  `json:"engine"`
+	Mode               string  `json:"mode"`
+	MaxInflight        int     `json:"max_inflight"`
+	SpeedupFactor      float64 `json:"speedup_factor,omitempty"`
+	TraceKind          string  `json:"trace_kind"`
+	Profile            string  `json:"profile,omitempty"`
+	CaptureMethod      string  `json:"capture_method,omitempty"`
+	CaptureLimitations string  `json:"capture_limitations,omitempty"`
+	NumStreams         int     `json:"num_streams"`
+	NumOps             int64   `json:"num_ops"`
+	TotalBytes         int64   `json:"total_bytes"`
+	// TracePartialReads counts READ/GET ops whose source transferred fewer bytes
+	// than it requested. A run reproducing them is correct and reports no short
+	// read, so without this the report could not distinguish "the workload had no
+	// partial transfers" from "the workload had 32 and the replay matched them".
+	TracePartialReads         int64  `json:"trace_partial_reads,omitempty"`
+	PrepareMode               string `json:"prepare_mode,omitempty"`
+	PrepareScope              string `json:"prepare_scope,omitempty"`
+	FillMode                  string `json:"fill_mode,omitempty"`
+	FillSeed                  int64  `json:"fill_seed,omitempty"`
+	PrepareTouchedSameData    bool   `json:"prepare_touched_same_data,omitempty"`
+	PrepareVerified           int    `json:"prepare_verified,omitempty"`
+	PrepareCreated            int    `json:"prepare_created,omitempty"`
+	PrepareCopied             int    `json:"prepare_copied,omitempty"`
+	PrepareSkippedSizeUnknown int    `json:"prepare_skipped_size_unknown,omitempty"`
+	PrepareDerivedSizeFromOps int    `json:"prepare_derived_size_from_ops,omitempty"`
 	// ReplayEquivalence is "syscall-level" for a faithful op-for-op replay, or
 	// "object-level" when write ops were coalesced into a single PUT because
 	// the backend cannot replay offset writes directly (see pkg/replay

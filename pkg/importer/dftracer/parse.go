@@ -35,10 +35,12 @@ const (
 		"mmap page-fault I/O not captured; ops on file descriptors opened before tracing are skipped; " +
 		"cross-thread fd sharing not modeled (fd opened by one thread is unresolved when accessed by another); " +
 		"stat/fstat events are not represented, so a workload's metadata operations are absent from the trace; " +
-		"a READ/WRITE op records the bytes the source actually transferred, not the byte count it " +
-		"requested, because the trace IR has one length field per transfer: where the source read or " +
-		"wrote short, replay issues a smaller request than the application did and so does not " +
-		"reproduce the source request shape for those ops (see the lossy counts in notes); " +
+		"a READ op records the requested byte count (len) alongside the received count (ret) when the " +
+		"source reports args.count, so a short read replays as the request the application made; the " +
+		"hashed 2.x form omits args.count, and there a short read is indistinguishable from a full read " +
+		"of the same size and replays as the smaller request (see the lossy counts in notes); a WRITE " +
+		"op records only the bytes that landed, so a source short write replays as a full write of that " +
+		"smaller size; " +
 		"a read that returned 0 (EOF) is dropped entirely, so replay performs one fewer read per " +
 		"sequential read-to-EOF loop than the application did; " +
 		"reads are replayed positionally, so the source's file-cursor semantics are not reproduced; " +
@@ -387,12 +389,21 @@ func (p *parser) doRW(stream, t int64, dur *int64, a *dfArgs, kind trace.OpKind,
 		p.b.Skip("append_write_unmodeled")
 		return
 	}
-	// args.count is the byte count the application requested; the trace IR has
-	// only one length per transfer op and it holds what actually moved. Where the
-	// two differ the request shape is lost, and a consumer can only know that if
-	// it is recorded.
-	if requested, ok := rawInt(a.Count); ok && requested > n {
-		p.b.Note(importer.LossyNote)
+	// args.count is the byte count the application requested. When present, a
+	// short read records both counts and replays the request the source made.
+	// The hashed 2.x form omits it entirely, so there a short read is
+	// indistinguishable from a full read of the same size — a limit of the
+	// capture, not of the format, and recorded as such.
+	//
+	// Writes keep the transferred count: a source short write is backend state,
+	// not a property of the target, so it is not asked of a replay backend.
+	requested := n
+	if kind == trace.OpRead {
+		if c, ok := rawInt(a.Count); ok && c >= n {
+			requested = c
+		} else if !ok {
+			p.b.Note(importer.LossyRequestedLenUnobservable)
+		}
 	}
 
 	var off int64
@@ -404,7 +415,11 @@ func (p *parser) doRW(stream, t int64, dur *int64, a *dfArgs, kind trace.OpKind,
 		off = e.Cursor
 		p.fdt.Advance(stream, fdKey, n)
 	}
-	p.b.Add(trace.Op{T: t, S: stream, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(n), Dur: dur})
+	op := trace.Op{T: t, S: stream, Op: kind, H: trace.Ptr(e.Handle), Off: trace.Ptr(off), Len: trace.Ptr(requested), Dur: dur}
+	if requested != n {
+		op.Ret = trace.Ptr(n)
+	}
+	p.b.Add(op)
 }
 
 func (p *parser) doClose(stream, t int64, dur *int64, a *dfArgs) {
