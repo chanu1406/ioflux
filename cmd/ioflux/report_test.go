@@ -189,7 +189,7 @@ func TestReportCmd_BadJSON(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit=%d, want 1", code)
 	}
-	if !strings.Contains(stderr, "parse results.json") {
+	if !strings.Contains(stderr, "parse") || !strings.Contains(stderr, "bad.json") {
 		t.Errorf("stderr should mention parse error; got %q", stderr)
 	}
 }
@@ -761,6 +761,153 @@ func TestReportCmd_SingleAndComparisonAgreeOnInvalidity(t *testing.T) {
 	}
 	if code, _, _ := runReportCLI([]string{pA, pB}); code != 1 {
 		t.Errorf("comparison exit=%d, want 1 — it must not accept a run the single report rejects", code)
+	}
+}
+
+// makeTestTrialSet builds a trial set of n trials whose durations are given, so
+// a test can control the distribution exactly.
+func makeTestTrialSet(durations ...int64) *results.TrialSet {
+	trials := make([]*results.Results, 0, len(durations))
+	for _, d := range durations {
+		r := makeTestResults()
+		r.DurationNS = d
+		trials = append(trials, r)
+	}
+	return results.BuildTrialSet(trials, 0)
+}
+
+func writeJSONFile(t *testing.T, dir, name string, v any) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestReportCmd_PrintsTrialSet(t *testing.T) {
+	ts := makeTestTrialSet(100, 110, 120, 130, 140, 150)
+	p := writeJSONFile(t, t.TempDir(), "trials.json", ts)
+
+	code, out, stderr := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	for _, want := range []string{"Trials:", "6 measured", "median:", "CV", "95% CI", "Stability:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("trial-set report missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// Below six trials no interval exists, and the report must say so rather than
+// print a narrower one computed by assuming a distribution.
+func TestReportCmd_TrialSetStatesMissingInterval(t *testing.T) {
+	ts := makeTestTrialSet(100, 110, 120)
+	p := writeJSONFile(t, t.TempDir(), "trials.json", ts)
+
+	code, out, _ := runReportCLI([]string{p})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	if !strings.Contains(out, "unavailable") || !strings.Contains(out, "too few") {
+		t.Errorf("report should state why no interval exists; got:\n%s", out)
+	}
+}
+
+func TestReportCmd_TrialComparisonRefusesUnstableSets(t *testing.T) {
+	dir := t.TempDir()
+	a := writeJSONFile(t, dir, "a.json", makeTestTrialSet(100, 100, 100, 100, 100, 100))
+	// Durations spanning 50..900 are far outside the default 5% policy.
+	b := writeJSONFile(t, dir, "b.json", makeTestTrialSet(50, 300, 100, 900, 200, 600))
+
+	code, out, stderr := runReportCLI([]string{a, b})
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "Eligibility: INCOMPARABLE") {
+		t.Errorf("output should state the verdict; got:\n%s", out)
+	}
+	if !strings.Contains(out, "policy allows 5.0%") {
+		t.Errorf("output should name the policy that refused it; got:\n%s", out)
+	}
+	// No difference may be printed for a refused comparison.
+	if strings.Contains(out, "Difference:") {
+		t.Errorf("refused comparison must not print a difference; got:\n%s", out)
+	}
+}
+
+func TestReportCmd_TrialComparisonReportsSeparation(t *testing.T) {
+	dir := t.TempDir()
+	a := writeJSONFile(t, dir, "a.json", makeTestTrialSet(100, 100, 100, 100, 100, 100))
+	b := writeJSONFile(t, dir, "b.json", makeTestTrialSet(200, 200, 200, 200, 200, 200))
+
+	code, out, stderr := runReportCLI([]string{a, b})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(out, "Eligibility: COMPARABLE") {
+		t.Errorf("stable identical-config sets should compare; got:\n%s", out)
+	}
+	if !strings.Contains(out, "+100.0%") {
+		t.Errorf("output should report the relative difference; got:\n%s", out)
+	}
+	if !strings.Contains(out, "do not overlap") {
+		t.Errorf("clearly separated medians should be reported as such; got:\n%s", out)
+	}
+}
+
+// Overlapping intervals must never be phrased as evidence of no difference.
+func TestReportCmd_TrialComparisonOverlapWordedCarefully(t *testing.T) {
+	dir := t.TempDir()
+	a := writeJSONFile(t, dir, "a.json", makeTestTrialSet(100, 101, 99, 100, 101, 99))
+	b := writeJSONFile(t, dir, "b.json", makeTestTrialSet(100, 101, 99, 100, 101, 99))
+
+	code, out, _ := runReportCLI([]string{a, b})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0", code)
+	}
+	if !strings.Contains(out, "not the same as showing there is none") {
+		t.Errorf("overlap must not be reported as absence of a difference; got:\n%s", out)
+	}
+}
+
+// The policy is a flag so a fixture can declare its own; the report must state
+// the one it applied.
+func TestReportCmd_TrialComparisonHonoursPolicyFlags(t *testing.T) {
+	dir := t.TempDir()
+	a := writeJSONFile(t, dir, "a.json", makeTestTrialSet(100, 120, 90, 110, 95, 115))
+	b := writeJSONFile(t, dir, "b.json", makeTestTrialSet(100, 120, 90, 110, 95, 115))
+
+	if code, _, _ := runReportCLI([]string{a, b}); code != 1 {
+		t.Fatalf("exit=%d, want 1 under the default 5%% policy", code)
+	}
+	code, out, _ := runReportCLI([]string{"--max-cv", "50", a, b})
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0 under a relaxed policy; got:\n%s", code, out)
+	}
+	if !strings.Contains(out, "CV at most 50.0%") {
+		t.Errorf("report should state the policy it applied; got:\n%s", out)
+	}
+}
+
+// Reducing a trial set to one number is the thing repeated trials exist to
+// prevent, so the mismatch is refused rather than silently resolved.
+func TestReportCmd_RefusesTrialSetAgainstSingleRun(t *testing.T) {
+	dir := t.TempDir()
+	a := writeJSONFile(t, dir, "a.json", makeTestTrialSet(100, 100, 100, 100, 100, 100))
+	b := writeJSONFile(t, dir, "b.json", makeTestResults())
+
+	code, _, stderr := runReportCLI([]string{a, b})
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2", code)
+	}
+	if !strings.Contains(stderr, "cannot compare a trial set against a single run") {
+		t.Errorf("stderr should explain the mismatch; got %q", stderr)
 	}
 }
 

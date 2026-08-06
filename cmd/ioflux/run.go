@@ -44,7 +44,21 @@ Flags:
                         Written atomically via a temporary file in the same directory,
                         so a failed write leaves the previous results intact; this
                         needs write access to the directory, not only to the file.
-  --csv <path>          Append a CSV row to this file (optional; header written once)
+  --csv <path>          Append a CSV row to this file (optional; header written once).
+                        With --trials, one row per measured trial.
+
+Repeated trials:
+  --trials <n>          Number of measured trials (default 1). Above 1, -o receives a
+                        trial set — every trial plus the distribution over them
+                        (median, coefficient of variation, 95% interval on the median)
+                        — instead of a single result. One run cannot be told apart
+                        from noise, so a comparison of two trial sets is what supports
+                        a regression decision.
+  --warmup <n>          Unmeasured trials to run first (default 0). They change the
+                        machine's state and are discarded, not recorded.
+
+                        Each trial re-runs PREPARE, so --cache-mode cold evicts before
+                        every trial rather than only the first.
 
 S3 flags:
   --endpoint <url>                 S3-compatible endpoint override (optional)
@@ -85,7 +99,7 @@ Exit codes:
   0   replay completed; results.json written
   1   replay rejected before dispatch (bad trace, caps mismatch, a target outside
       --target-root) or completed with op errors (including a latency sample outside
-      the histogram's trackable range)
+      the histogram's trackable range). With --trials, any trial doing so.
   2   usage error or I/O failure
 `
 
@@ -115,6 +129,8 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		allowDirect      bool
 		directFallback   bool
 		directAlign      int64
+		trials           int
+		warmup           int
 		s3Cfg            s3engine.Config
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
@@ -148,6 +164,8 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 
 	var cacheMode string
 	fs.StringVar(&cacheMode, "cache-mode", "cold", "cache state: cold | warm (default cold)")
+	fs.IntVar(&trials, "trials", 1, "number of measured trials to run")
+	fs.IntVar(&warmup, "warmup", 0, "number of unmeasured warmup trials to run first")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -186,6 +204,14 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	}
 	if fillSeed == 0 {
 		fillSeed = payload.DefaultSeed
+	}
+	if trials < 1 {
+		fmt.Fprintf(stderr, "ioflux run: --trials must be >= 1, got %d\n", trials)
+		return 2
+	}
+	if warmup < 0 {
+		fmt.Fprintf(stderr, "ioflux run: --warmup must be >= 0, got %d\n", warmup)
+		return 2
 	}
 	// The containment root is not part of the worker protocol, so a
 	// coordinator-side --target-root would apply to nothing on a remote worker.
@@ -256,10 +282,121 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		FillSeed:         fillSeed,
 	}
 
-	workers, err := buildWorkers(hosts)
+	// Preflight the worker set so an unreachable host fails immediately as a
+	// usage/IO error, rather than after the first trial has already run.
+	probe, err := buildWorkers(hosts)
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
 		return 2
+	}
+	closeWorkers(probe)
+
+	// Warmups change the machine's state before measurement; they are run and
+	// discarded. Each trial gets a fresh worker set so no state carries between
+	// them, and re-runs PREPARE, which re-applies the cache recipe — the reason
+	// a repeated cold-recipe trial is cold rather than warm after the first.
+	measured := make([]*results.Results, 0, trials)
+	for i := 0; i < warmup+trials; i++ {
+		if warmup+trials > 1 {
+			label := fmt.Sprintf("trial %d/%d", i-warmup+1, trials)
+			if i < warmup {
+				label = fmt.Sprintf("warmup %d/%d", i+1, warmup)
+			}
+			fmt.Fprintf(stderr, "ioflux run: %s\n", label)
+		}
+		res, err := runOnce(context.Background(), plan, hosts, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+			return 1
+		}
+		if i >= warmup {
+			measured = append(measured, res)
+		}
+	}
+
+	// A single measured trial stays a plain result; repeated trials produce a
+	// trial set, which carries the distribution a decision actually needs.
+	var trialSet *results.TrialSet
+	var payload any = measured[0]
+	if trials > 1 {
+		trialSet = results.BuildTrialSet(measured, warmup)
+		payload = trialSet
+	}
+
+	// Write output. The file path goes through an atomic write so a failure
+	// leaves the previous results intact rather than a truncated file, and
+	// "wrote ..." is printed only once the new results are durable.
+	if outPath == "-" {
+		if err := results.WriteJSON(stdout, payload); err != nil {
+			fmt.Fprintf(stderr, "ioflux run: write results: %v\n", err)
+			return 2
+		}
+	} else {
+		if err := results.WriteJSONFile(outPath, payload); err != nil {
+			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
+			return 2
+		}
+		fmt.Fprintf(stdout, "wrote %s\n", outPath)
+	}
+
+	if csvPath != "" {
+		for _, res := range measured {
+			if err := results.AppendCSV(csvPath, res); err != nil {
+				fmt.Fprintf(stderr, "ioflux run: write csv: %v\n", err)
+				return 2
+			}
+		}
+	}
+
+	invalid := false
+	for i, res := range measured {
+		if res.Fidelity.LowFidelity {
+			fmt.Fprintf(stderr, "ioflux run: warning: %slow-fidelity replay: %s\n",
+				trialPrefix(i, trials), res.Fidelity.LowFidelityReason)
+		}
+		for _, reason := range res.ExecutionInvalidReasons() {
+			fmt.Fprintf(stderr, "ioflux run: %s%s\n", trialPrefix(i, trials), reason)
+			invalid = true
+		}
+	}
+	if trialSet != nil {
+		printTrialRunSummary(stderr, trialSet)
+	}
+	if invalid {
+		fmt.Fprintf(stderr, "ioflux run: see %s for per-operation detail\n", outPath)
+		return 1
+	}
+	return 0
+}
+
+// trialPrefix labels a message with the trial it came from, and labels nothing
+// when there was only one.
+func trialPrefix(i, trials int) string {
+	if trials <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("trial %d: ", i+1)
+}
+
+// printTrialRunSummary reports the measured distribution at the end of a
+// multi-trial run, so the headline numbers are visible without a second command.
+func printTrialRunSummary(w io.Writer, ts *results.TrialSet) {
+	s := ts.Summary
+	fmt.Fprintf(w, "ioflux run: %d valid trial(s), %d failed\n", s.ValidTrials, s.FailedTrials)
+	if s.ValidTrials == 0 {
+		return
+	}
+	fmt.Fprintf(w, "ioflux run: duration median %s   CV %.1f%%   min %s   max %s\n",
+		fmtDuration(int64(s.DurationNS.Median)), s.DurationNS.CVPercent,
+		fmtDuration(int64(s.DurationNS.Min)), fmtDuration(int64(s.DurationNS.Max)))
+}
+
+// runOnce executes one complete replay — its own workers, its own PREPARE and
+// cache recipe, its own RUN — and returns its results.
+func runOnce(ctx context.Context, plan cluster.Plan, hosts string, stderr io.Writer) (*results.Results, error) {
+	workers, err := buildWorkers(hosts)
+	if err != nil {
+		return nil, err
 	}
 	defer closeWorkers(workers)
 
@@ -278,51 +415,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	res, err := coord.Run(context.Background(), plan, workers)
-	if err != nil {
-		fmt.Fprintf(stderr, "ioflux run: %v\n", err)
-		return 1
-	}
-
-	// Write output. The file path goes through an atomic write so a failure
-	// leaves the previous results intact rather than a truncated file, and
-	// "wrote ..." is printed only once the new results are durable.
-	if outPath == "-" {
-		if err := results.WriteJSON(stdout, res); err != nil {
-			fmt.Fprintf(stderr, "ioflux run: write results: %v\n", err)
-			return 2
-		}
-	} else {
-		if err := results.WriteJSONFile(outPath, res); err != nil {
-			fmt.Fprintf(stderr, "ioflux run: %v\n", err)
-			return 2
-		}
-		fmt.Fprintf(stdout, "wrote %s\n", outPath)
-	}
-
-	if csvPath != "" {
-		if err := results.AppendCSV(csvPath, res); err != nil {
-			fmt.Fprintf(stderr, "ioflux run: write csv: %v\n", err)
-			return 2
-		}
-	}
-
-	if res.Fidelity.LowFidelity {
-		fmt.Fprintf(stderr, "ioflux run: warning: low-fidelity replay: %s\n", res.Fidelity.LowFidelityReason)
-	}
-	invalid := false
-	if res.Errors > 0 {
-		fmt.Fprintf(stderr, "ioflux run: %d op(s) failed; see results.errors\n", res.Errors)
-		invalid = true
-	}
-	if res.HistogramOverflows > 0 {
-		fmt.Fprintf(stderr, "ioflux run: %d latency sample(s) exceeded the histogram's trackable range and were excluded from every percentile; see results.histogram_overflows\n", res.HistogramOverflows)
-		invalid = true
-	}
-	if invalid {
-		return 1
-	}
-	return 0
+	return coord.Run(ctx, plan, workers)
 }
 
 // buildWorkers returns the workers for a run. An empty hosts string yields a

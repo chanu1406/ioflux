@@ -311,18 +311,20 @@ func Build(plan PlanInfo, runEnv RunEnv, rec *metrics.Recorder, durationNS int64
 	return r
 }
 
-// WriteJSON writes r as indented JSON to w.
-func WriteJSON(w io.Writer, r *Results) error {
+// WriteJSON writes v as indented JSON to w. It accepts any result artifact —
+// a single *Results or a *TrialSet — because both are written the same way and
+// read back by the same command.
+func WriteJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(r)
+	return enc.Encode(v)
 }
 
 // resultsFileMode is the permission the results file is given, matching what a
 // plain create under a typical umask produced before writes became atomic.
 const resultsFileMode = 0o644
 
-// WriteJSONFile writes r to path atomically: the JSON goes to a temporary file
+// WriteJSONFile writes v to path atomically: the JSON goes to a temporary file
 // in the same directory, is flushed to stable storage, and is renamed over path
 // only once it is complete. Either the caller sees the new results or the
 // previous ones — never a half-written file, and never a truncated one left
@@ -336,7 +338,7 @@ const resultsFileMode = 0o644
 // The temporary file shares path's directory so the rename stays within one
 // filesystem, where it is atomic. Callers writing to stdout should use
 // WriteJSON; a stream cannot be written atomically.
-func WriteJSONFile(path string, r *Results) error {
+func WriteJSONFile(path string, v any) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -352,7 +354,7 @@ func WriteJSONFile(path string, r *Results) error {
 		}
 	}()
 
-	if err := WriteJSON(tmp, r); err != nil {
+	if err := WriteJSON(tmp, v); err != nil {
 		return fmt.Errorf("results: write %s: %w", tmpName, err)
 	}
 	// Durability before visibility: flush the complete contents, then check
@@ -386,6 +388,16 @@ func syncDir(dir string) {
 	}
 	defer d.Close()
 	_ = d.Sync()
+}
+
+// Throughput returns the run's completed operations per second and GiB per
+// second, or (0, 0) when it recorded no duration.
+func (r *Results) Throughput() (opsPerSec, gibPerSec float64) {
+	if r.DurationNS <= 0 {
+		return 0, 0
+	}
+	secs := float64(r.DurationNS) / 1e9
+	return float64(r.OpsCompleted) / secs, float64(r.BytesMoved) / float64(1<<30) / secs
 }
 
 // PerOpMap returns a map from op type string to PerOpStats for quick lookup.

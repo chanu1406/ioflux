@@ -64,6 +64,148 @@ func TestRunCmd_BasicSmoke(t *testing.T) {
 	}
 }
 
+// genSmallTrace writes a tiny deterministic trace and returns its path.
+func genSmallTrace(t *testing.T, dir string) string {
+	t.Helper()
+	tracePath := filepath.Join(dir, "trace.ioflux")
+	code, _, stderr := runGenCLI([]string{
+		"training-read",
+		"--shards", "2",
+		"--shard-size", "64KiB",
+		"--record-size", "8KiB",
+		"--dataloader-workers", "1",
+		"--shuffle=false",
+		"--seed", "1",
+		"-o", tracePath,
+	})
+	if code != 0 {
+		t.Fatalf("runGen exit=%d, stderr=%s", code, stderr)
+	}
+	return tracePath
+}
+
+// TestRunCmd_TrialsWritesTrialSet pins that repeated trials produce a
+// distribution rather than one number, and that each trial is retained.
+func TestRunCmd_TrialsWritesTrialSet(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := genSmallTrace(t, dir)
+	outPath := filepath.Join(dir, "trials.json")
+
+	code, stdout, stderr := runRunCLI([]string{
+		"--trace", tracePath, "--engine", "mem", "--trials", "4", "--warmup", "1", "-o", outPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stdout=%s stderr=%s", code, stdout, stderr)
+	}
+
+	var ts results.TrialSet
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &ts); err != nil {
+		t.Fatalf("output is not a trial set: %v", err)
+	}
+	if len(ts.Trials) != 4 {
+		t.Errorf("retained %d trial(s), want 4", len(ts.Trials))
+	}
+	if ts.Summary.ValidTrials != 4 || ts.Summary.FailedTrials != 0 {
+		t.Errorf("summary = %d valid / %d failed, want 4/0",
+			ts.Summary.ValidTrials, ts.Summary.FailedTrials)
+	}
+	// The warmup is recorded but not retained: its purpose was to change the
+	// machine's state, not to be evidence about it.
+	if ts.WarmupTrials != 1 {
+		t.Errorf("warmup trials = %d, want 1", ts.WarmupTrials)
+	}
+	if ts.Summary.DurationNS.Median <= 0 {
+		t.Errorf("median duration = %v, want positive", ts.Summary.DurationNS.Median)
+	}
+	// Every trial replayed the same trace, so their digests must agree.
+	for i, tr := range ts.Trials {
+		if tr.Plan.TraceDigest != ts.Trials[0].Plan.TraceDigest {
+			t.Errorf("trial %d replayed a different trace digest", i+1)
+		}
+	}
+}
+
+// A single trial keeps producing a plain result, so existing callers and saved
+// artifacts are unaffected by the flag existing.
+func TestRunCmd_SingleTrialWritesPlainResults(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := genSmallTrace(t, dir)
+	outPath := filepath.Join(dir, "results.json")
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath, "--engine", "mem", "--trials", "1", "-o", outPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stderr=%s", code, stderr)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"trials"`)) {
+		t.Errorf("single-trial output should be a plain result, got a trial set:\n%s", data)
+	}
+	var res results.Results
+	if err := json.Unmarshal(data, &res); err != nil {
+		t.Fatalf("output is not a results file: %v", err)
+	}
+	if res.Plan.TraceDigest == "" {
+		t.Error("single-trial result missing trace digest")
+	}
+}
+
+func TestRunCmd_RejectsInvalidTrialCounts(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := genSmallTrace(t, dir)
+	outPath := filepath.Join(dir, "out.json")
+
+	for _, args := range [][]string{
+		{"--trials", "0"},
+		{"--trials", "-1"},
+		{"--warmup", "-1"},
+	} {
+		full := append([]string{"--trace", tracePath, "--engine", "mem", "-o", outPath}, args...)
+		if code, _, stderr := runRunCLI(full); code != 2 {
+			t.Errorf("%v: exit=%d, want 2; stderr=%s", args, code, stderr)
+		}
+	}
+}
+
+// Each trial re-runs PREPARE, which re-applies the cache recipe. Without that a
+// repeated cold-recipe measurement would be cold once and warm thereafter.
+func TestRunCmd_TrialsReapplyCacheRecipe(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := genSmallTrace(t, dir)
+	outPath := filepath.Join(dir, "trials.json")
+
+	code, _, stderr := runRunCLI([]string{
+		"--trace", tracePath, "--engine", "mem", "--cache-mode", "cold",
+		"--trials", "3", "-o", outPath,
+	})
+	if code != 0 {
+		t.Fatalf("runRun exit=%d want 0; stderr=%s", code, stderr)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ts results.TrialSet
+	if err := json.Unmarshal(data, &ts); err != nil {
+		t.Fatal(err)
+	}
+	for i, tr := range ts.Trials {
+		if tr.RunEnv.CacheMode != "cold" {
+			t.Errorf("trial %d recorded cache mode %q, want cold", i+1, tr.RunEnv.CacheMode)
+		}
+	}
+}
+
 func TestRunCmd_LocalEngine(t *testing.T) {
 	dir := t.TempDir()
 	targetPath := filepath.Join(dir, "shard.dat")
@@ -130,7 +272,7 @@ func TestRunCmd_ShortReadWritesInvalidResultAndExitsOne(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("runRun exit=%d want 1; stdout=%s stderr=%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "1 op(s) failed") {
+	if !strings.Contains(stderr, "1 operation failure(s)") {
 		t.Fatalf("stderr should identify the invalid execution, got %q", stderr)
 	}
 	got, err := os.ReadFile(resultsPath)

@@ -15,11 +15,21 @@ const reportUsage = `Usage:
   ioflux report <results.json>
   ioflux report <a.json> <b.json>
 
-Pretty-print a saved run report. Pass - to read from stdin.
+Pretty-print a saved run report or trial set. Pass - to read from stdin.
 
-Given two reports, check whether they may be compared and, if so, print a
-side-by-side comparison of their headline scalars (throughput, CPU, duration,
-fidelity) and each side's dominant data-op latency.
+Given two files, check whether they may be compared and, if so, print the
+comparison. Two single runs are compared on their headline scalars; two trial
+sets are compared statistically — median, coefficient of variation, and a 95%
+interval on each median — under a policy fixed by the flags below.
+
+Flags:
+  --min-trials <n>   Minimum valid trials per side of a trial-set comparison
+                     (default 6, the point below which no interval exists).
+  --max-cv <pct>     Maximum duration coefficient of variation per side
+                     (default 5). A spread wider than the difference being
+                     looked for cannot support a conclusion about it.
+
+Both defaults are floors, not universal values; a fixture should declare its own.
 
 The comparison is gated. A run that did not execute validly cannot be either
 side of a comparison, so the delta is refused rather than printed. Differences
@@ -37,28 +47,52 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, reportUsage) }
+	defaults := results.DefaultTrialPolicy()
+	minTrials := fs.Int("min-trials", defaults.MinValidTrials,
+		"minimum valid trials each side of a trial-set comparison must have")
+	maxCV := fs.Float64("max-cv", defaults.MaxCVPercent,
+		"maximum duration coefficient of variation (percent) each side may have")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	policy := results.TrialPolicy{MinValidTrials: *minTrials, MaxCVPercent: *maxCV}
+
 	switch fs.NArg() {
 	case 1:
-		res, code := loadResults(fs.Arg(0), stderr)
+		art, code := loadArtifact(fs.Arg(0), stderr)
 		if code != 0 {
 			return code
 		}
-		printRunReport(stdout, res)
+		if art.trials != nil {
+			printTrialSetReport(stdout, art.trials)
+			return 0
+		}
+		printRunReport(stdout, art.single)
 		return 0
 	case 2:
-		a, code := loadResults(fs.Arg(0), stderr)
+		a, code := loadArtifact(fs.Arg(0), stderr)
 		if code != 0 {
 			return code
 		}
-		b, code := loadResults(fs.Arg(1), stderr)
+		b, code := loadArtifact(fs.Arg(1), stderr)
 		if code != 0 {
 			return code
 		}
-		if !printComparison(stdout, a, b) {
+		// Comparing a trial set against a single run would silently reduce the
+		// set to one number, which is the thing repeated trials exist to prevent.
+		if (a.trials == nil) != (b.trials == nil) {
+			fmt.Fprintln(stderr, "ioflux report: cannot compare a trial set against a single run — "+
+				"re-run the single side with --trials so both carry a distribution")
+			return 2
+		}
+		if a.trials != nil {
+			if !printTrialComparison(stdout, a.trials, b.trials, policy) {
+				return 1
+			}
+			return 0
+		}
+		if !printComparison(stdout, a.single, b.single) {
 			return 1
 		}
 		return 0
@@ -68,10 +102,18 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// loadResults reads and parses a results.json file, or stdin if path is "-".
-// On error it writes a message to stderr and returns the exit code to use (2
-// for an I/O failure, 1 for a parse error); the returned code is 0 on success.
-func loadResults(path string, stderr io.Writer) (*results.Results, int) {
+// artifact is either a single run's results or a set of trials; `ioflux report`
+// accepts both and one file is exactly one of them.
+type artifact struct {
+	single *results.Results
+	trials *results.TrialSet
+}
+
+// loadArtifact reads a results file and determines which kind it is. A trial
+// set is identified by carrying a trials array: a single result has no such
+// field, so the two are distinguishable without a discriminator that older
+// files would lack.
+func loadArtifact(path string, stderr io.Writer) (artifact, int) {
 	var data []byte
 	var err error
 	if path == "-" {
@@ -81,15 +123,35 @@ func loadResults(path string, stderr io.Writer) (*results.Results, int) {
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "ioflux report: %v\n", err)
-		return nil, 2
+		return artifact{}, 2
+	}
+
+	var probe struct {
+		Trials []json.RawMessage `json:"trials"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		fmt.Fprintf(stderr, "ioflux report: parse %s: %v\n", path, err)
+		return artifact{}, 1
+	}
+	if probe.Trials != nil {
+		var ts results.TrialSet
+		if err := json.Unmarshal(data, &ts); err != nil {
+			fmt.Fprintf(stderr, "ioflux report: parse trial set: %v\n", err)
+			return artifact{}, 1
+		}
+		if len(ts.Trials) == 0 {
+			fmt.Fprintf(stderr, "ioflux report: %s is a trial set containing no trials\n", path)
+			return artifact{}, 1
+		}
+		return artifact{trials: &ts}, 0
 	}
 
 	var res results.Results
 	if err := json.Unmarshal(data, &res); err != nil {
 		fmt.Fprintf(stderr, "ioflux report: parse results.json: %v\n", err)
-		return nil, 1
+		return artifact{}, 1
 	}
-	return &res, 0
+	return artifact{single: &res}, 0
 }
 
 func printRunReport(w io.Writer, res *results.Results) {
@@ -287,15 +349,8 @@ func printRunReport(w io.Writer, res *results.Results) {
 	}
 }
 
-// throughput returns ops/s and GiB/s for a completed run, or (0, 0) if the
-// run has no recorded duration.
-func throughput(res *results.Results) (opsPerSec, gibPerSec float64) {
-	if res.DurationNS <= 0 {
-		return 0, 0
-	}
-	secs := float64(res.DurationNS) / 1e9
-	return float64(res.OpsCompleted) / secs, float64(res.BytesMoved) / float64(1<<30) / secs
-}
+// throughput returns ops/s and GiB/s for a completed run.
+func throughput(res *results.Results) (opsPerSec, gibPerSec float64) { return res.Throughput() }
 
 // printComparison prints the eligibility verdict for two run reports and, when
 // the verdict permits it, a side-by-side delta of their headline scalars
@@ -365,6 +420,136 @@ func printComparison(w io.Writer, a, b *results.Results) bool {
 	printDominantOpLatency(w, "A", a)
 	printDominantOpLatency(w, "B", b)
 	return true
+}
+
+// printTrialSetReport prints one trial set: what was replayed, the distribution
+// over its trials, and any trial that did not execute validly.
+func printTrialSetReport(w io.Writer, ts *results.TrialSet) {
+	rep := ts.Representative()
+	s := ts.Summary
+
+	fmt.Fprintf(w, "Trace:     %s\n", describeSide(rep))
+	fmt.Fprintf(w, "Engine:    %s   mode: %s   cache: %s\n",
+		rep.Plan.Engine, rep.Plan.Mode, orDash(rep.RunEnv.CacheMode))
+	fmt.Fprintf(w, "Trials:    %d measured", s.Trials)
+	if ts.WarmupTrials > 0 {
+		fmt.Fprintf(w, ", %d warmup (discarded)", ts.WarmupTrials)
+	}
+	fmt.Fprintln(w)
+
+	if s.FailedTrials > 0 {
+		fmt.Fprintf(w, "Execution: INVALID — %d of %d trial(s) failed: trial %v\n",
+			s.FailedTrials, s.Trials, ts.FailedTrialIndexes())
+	} else {
+		fmt.Fprintln(w, "Execution: no detected operation failures")
+	}
+
+	if s.ValidTrials == 0 {
+		fmt.Fprintln(w, "\nNo valid trials — nothing to summarize.")
+		return
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Duration over %d valid trial(s):\n", s.ValidTrials)
+	printMetricSummary(w, s.DurationNS, func(v float64) string { return fmtDuration(int64(v)) })
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Throughput over %d valid trial(s):\n", s.ValidTrials)
+	printMetricSummary(w, s.GiBPerSec, func(v float64) string { return fmt.Sprintf("%.3f GiB/s", v) })
+
+	fmt.Fprintln(w)
+	printStabilityNote(w, s.DurationNS)
+}
+
+// printMetricSummary renders one metric's distribution, formatting values with
+// fmtVal so durations and rates read naturally.
+func printMetricSummary(w io.Writer, m results.MetricSummary, fmtVal func(float64) string) {
+	fmt.Fprintf(w, "  median:  %s\n", fmtVal(m.Median))
+	fmt.Fprintf(w, "  mean:    %s   stddev %s   CV %.1f%%\n",
+		fmtVal(m.Mean), fmtVal(m.StdDev), m.CVPercent)
+	fmt.Fprintf(w, "  range:   %s … %s\n", fmtVal(m.Min), fmtVal(m.Max))
+	if m.CI95Available {
+		fmt.Fprintf(w, "  95%% CI:  %s … %s (on the median)\n", fmtVal(m.CI95Lo), fmtVal(m.CI95Hi))
+	} else {
+		fmt.Fprintf(w, "  95%% CI:  unavailable — %d trial(s) is too few to bound the median\n", m.N)
+	}
+}
+
+// printStabilityNote states what the observed spread does to a comparison,
+// because a coefficient of variation is only meaningful against the size of the
+// difference someone intends to detect.
+func printStabilityNote(w io.Writer, m results.MetricSummary) {
+	if m.N < 2 {
+		return
+	}
+	fmt.Fprintf(w, "Stability: run-to-run spread is %.1f%%; a difference smaller than that "+
+		"cannot be distinguished from noise by these trials.\n", m.CVPercent)
+}
+
+// printTrialComparison prints the gated statistical comparison of two trial
+// sets, returning false when the comparison was refused.
+func printTrialComparison(w io.Writer, a, b *results.TrialSet, policy results.TrialPolicy) bool {
+	tc := results.CompareTrialSets(a, b, policy)
+
+	fmt.Fprintf(w, "Comparing two trial sets:\n")
+	fmt.Fprintf(w, "  A: %s  (%d valid trial(s))\n", describeSide(a.Representative()), tc.A.ValidTrials)
+	fmt.Fprintf(w, "  B: %s  (%d valid trial(s))\n", describeSide(b.Representative()), tc.B.ValidTrials)
+	fmt.Fprintf(w, "  policy: at least %d valid trial(s) per side, CV at most %.1f%%\n",
+		policy.MinValidTrials, policy.MaxCVPercent)
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Eligibility: %s\n", strings.ToUpper(string(tc.Eligibility.Verdict)))
+
+	if !tc.Eligibility.Comparable() {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Refusing to report a difference:\n")
+		for _, reason := range tc.Eligibility.Blocking {
+			fmt.Fprintf(w, "  ! %s\n", reason)
+		}
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Inspect each set on its own with `ioflux report <file>`.\n")
+		return false
+	}
+
+	printComparisonCaveats(w, tc.Eligibility)
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "duration", "A", "B")
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "  median",
+		fmtDuration(int64(tc.A.DurationNS.Median)), fmtDuration(int64(tc.B.DurationNS.Median)))
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "  CV",
+		fmt.Sprintf("%.1f%%", tc.A.DurationNS.CVPercent), fmt.Sprintf("%.1f%%", tc.B.DurationNS.CVPercent))
+	fmt.Fprintf(w, "%-14s %18s %18s\n", "  95% CI",
+		ciLabel(tc.A.DurationNS), ciLabel(tc.B.DurationNS))
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Difference:  %s (%+.1f%%) in median duration\n",
+		fmtSignedDuration(int64(tc.DeltaMedianNS)), tc.DeltaPercent)
+	fmt.Fprintf(w, "             %s\n", separationSentence(tc))
+	return true
+}
+
+// ciLabel renders a metric's interval, or says it has none.
+func ciLabel(m results.MetricSummary) string {
+	if !m.CI95Available {
+		return "unavailable"
+	}
+	return fmt.Sprintf("%s … %s", fmtDuration(int64(m.CI95Lo)), fmtDuration(int64(m.CI95Hi)))
+}
+
+// separationSentence states what the intervals do and do not establish. The
+// asymmetry is deliberate: disjoint intervals are evidence of a difference,
+// while overlapping ones are not evidence of its absence.
+func separationSentence(tc results.TrialComparison) string {
+	switch {
+	case !tc.SeparationKnown:
+		return "too few trials to bound either median, so this difference is not established."
+	case tc.Separated:
+		return "the two intervals do not overlap, so the difference is unlikely to be noise."
+	default:
+		return "the two intervals overlap, so these trials do not establish a difference — " +
+			"which is not the same as showing there is none."
+	}
 }
 
 // printComparisonCaveats renders the differences that change what the delta

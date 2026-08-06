@@ -80,7 +80,7 @@ Run `bin/ioflux <command> -h` for all available options.
 | `ioflux validate` | Validate a `.ioflux` trace and its invariants. |
 | `ioflux run` | Replay a trace against the `mem`, `local`, or `s3` engine. |
 | `ioflux worker` | Start a worker for distributed replay. |
-| `ioflux report` | Print one report, or compare two reports if they are comparable. |
+| `ioflux report` | Print one report or trial set, or compare two if they are comparable. |
 
 ## Importing a real trace
 
@@ -117,14 +117,46 @@ metadata.
 
 ## Comparing two runs
 
-Replay the same trace before and after a change, then compare the two results:
+Replay the same trace before and after a change, then compare the two results.
+One run of each is not enough to tell a real difference from noise, so measure
+each side repeatedly:
 
 ```bash
+bin/ioflux run --trace workload.ioflux --engine local --trials 10 --warmup 2 \
+  --target-root ./ioflux-data --target-map map.yaml -o before.json
+
+# ...make the change...
+
+bin/ioflux run --trace workload.ioflux --engine local --trials 10 --warmup 2 \
+  --target-root ./ioflux-data --target-map map.yaml -o after.json
+
 bin/ioflux report before.json after.json
 ```
 
-A delta between two runs is only meaningful if the runs were comparable, so the
-comparison is checked before it is printed. Every result records what produced
+With `--trials`, the output file holds every trial plus the distribution over
+them — median, coefficient of variation, and a 95% interval on the median. The
+interval is computed from order statistics rather than assuming a normal
+distribution, and below six trials none is reported at all, because no interval
+of that confidence exists for a smaller sample.
+
+Comparing two trial sets reports the difference in median duration and whether
+the two intervals overlap. Non-overlapping intervals are evidence of a real
+difference; overlapping ones mean these trials did not establish one, which is
+not the same as showing there is none.
+
+Two policy limits must be met before a difference is reported at all, both
+adjustable and both floors rather than universal values:
+
+```bash
+bin/ioflux report --min-trials 10 --max-cv 5 before.json after.json
+```
+
+`--max-cv` is the important one. If a configuration's own run-to-run spread is
+wider than the difference being looked for, no number of trials makes the
+comparison mean anything, and the comparison is refused rather than printed.
+
+A delta between two runs is also only meaningful if the runs were comparable at
+all, so the comparison is checked before it is printed. Every result records what produced
 it — a digest of the trace bytes, the engine and its configuration, the cache
 recipe, the containment root, the host, and the ioflux build — and the
 comparison reports one of three outcomes:
@@ -137,9 +169,10 @@ comparison reports one of three outcomes:
   usually dominates a read workload's timing, and so on. The delta is still
   printed.
 - **incomparable** — at least one run is not a valid measurement, because
-  operations failed or latency samples fell outside the histogram's range. No
-  delta is printed and the command exits `1`, so a comparison in CI fails rather
-  than reporting a speedup that a broken run produced.
+  operations failed, latency samples fell outside the histogram's range, or a
+  trial set was too small or too unstable for its policy. No delta is printed
+  and the command exits `1`, so a comparison in CI fails rather than reporting a
+  speedup that a broken or noisy run produced.
 
 Trace identity comes from the digest rather than the file name, so the same
 bytes under a different path still compare as one workload. Results written
