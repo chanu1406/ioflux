@@ -40,6 +40,10 @@ type PairedExperiment struct {
 	Paired      PairedSummary `json:"paired"`
 	Eligibility Eligibility   `json:"eligibility"`
 	Policy      TrialPolicy   `json:"policy"`
+	// Regression is the decision the policy's threshold produced. It is always
+	// present; when no threshold was declared its verdict is not_assessed, so a
+	// reader can tell "within budget" from "nobody set a budget".
+	Regression RegressionGate `json:"regression"`
 }
 
 // PairedSummary describes the within-pair differences.
@@ -114,6 +118,9 @@ func BuildPaired(
 	}
 
 	pe.Paired = pairedSummary(baseline, treatment)
+	// Decided last: the gate reads the eligibility verdict and the differenced
+	// pairs, so both must already be final.
+	pe.Regression = EvaluateRegression(pe, policy.MaxDurationRegressionPercent)
 	return pe
 }
 

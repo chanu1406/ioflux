@@ -609,6 +609,10 @@ func printPairedReport(w io.Writer, pe *results.PairedExperiment) bool {
 	fmt.Fprintf(w, "Pairs:     %d measured, interleaved (seed %d)\n", len(pe.PairOrder), pe.Seed)
 	fmt.Fprintf(w, "Policy:    at least %d valid trial(s) per arm, CV at most %.1f%%\n",
 		pe.Policy.MinValidTrials, pe.Policy.MaxCVPercent)
+	if pe.Policy.MaxDurationRegressionPercent > 0 {
+		fmt.Fprintf(w, "           duration regression threshold %g%%\n",
+			pe.Policy.MaxDurationRegressionPercent)
+	}
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "Eligibility: %s\n", strings.ToUpper(string(pe.Eligibility.Verdict)))
@@ -643,6 +647,13 @@ func printPairedReport(w io.Writer, pe *results.PairedExperiment) bool {
 		fmt.Fprintf(w, "  95%% CI:  unavailable — %d pair(s) is too few to bound the difference\n", p.Pairs)
 	}
 	fmt.Fprintf(w, "  %s\n", pairedVerdictSentence(p))
+
+	if g := pe.Regression; g.Assessed() {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Regression gate: %s (threshold %g%%)\n",
+			strings.ToUpper(string(g.Verdict)), g.ThresholdPercent)
+		fmt.Fprintf(w, "  %s\n", g.Reason)
+	}
 	return true
 }
 

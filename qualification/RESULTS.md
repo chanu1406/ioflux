@@ -10,7 +10,10 @@ reports its residual, and two dimensions came out **negative**.
 
 §1–§14 are that first comparison. **§15 is the FIXTURE.md §10 controlled
 regression**, run later against schema v2 (`qualification/qual10.sh`); it
-supersedes §4 and restates §14's requested-length row.
+supersedes §4 and restates §14's requested-length row. **§16 tests whether the
+regression machinery itself works**, against controls with known answers —
+because §15's null result means nothing unless the tool can be shown to detect
+an effect that is really there.
 
 ---
 
@@ -695,8 +698,10 @@ Named rather than passed over, as §11:
   with no effect to detect, the design's *power* is untested. These 10 pairs
   bound the effect at roughly ±3.5 ms (±3.8%); whether the machinery would
   detect a genuine 7% regression is **not established by this run** — it would
-  need a treatment with a known-nonzero effect. That is the single most
-  important thing §10 set out to test and it remains open.
+  need a treatment with a known-nonzero effect. **Partly closed in §16:** a
+  known-nonzero treatment is now detected and a known-zero one is not
+  falsely flagged. The minimum detectable effect between those two is still
+  unmeasured (§16.4).
 - **Whether the fixture's prediction is wrong in general.** This measures one
   host, one NVMe device, one filesystem, at ~3 GB/s with 4 concurrent streams
   and no application compute. On a device where per-op cost is a larger share of
@@ -712,3 +717,185 @@ Named rather than passed over, as §11:
   account for a −1.6% difference, but that is an argument, not a measurement.
 - **Anything about warm-cache behaviour**, or about request size under memory
   pressure — the cold recipe and FIXTURE.md §4's caveat both still apply.
+
+---
+
+# 16. Does the regression machinery actually work?
+
+§15 measured a treatment and found no effect. That is only trustworthy if the
+machinery can be shown to detect an effect when one exists, and to stay quiet
+when one does not — otherwise "no regression found" and "cannot find a
+regression" are the same output. §15.8 left this open. This closes it.
+
+Two things were built and then tested against known ground truth:
+
+1. **A regression gate** (plan.md §11.3). Until now the tool reported an effect
+   size and a confidence interval and left the decision to a human — FIXTURE.md
+   §10's 7% threshold lived in prose in §15.5, not in the tool. A declared
+   `max_duration_regression_percent` now produces a verdict.
+2. **Four controls** with known answers, run on the qual-01 fixture.
+
+## 16.1 The gate decides against the interval, not the median
+
+The gate compares the **whole 95% interval** on the paired difference to the
+threshold. Comparing the median instead would make the verdict flip on
+run-to-run noise whenever the true effect sits near the threshold — which is
+where decisions actually get made, and where a flapping gate teaches a team to
+stop believing it. That yields three outcomes, not two:
+
+| Verdict | Condition | Exit |
+|---|---|---|
+| `pass` | whole interval within the threshold | 0 |
+| `regression` | whole interval beyond it | 3 |
+| `inconclusive` | interval spans it | 4 |
+| `not_assessed` | no threshold, or evidence refused | 0 / 1 |
+
+`inconclusive` is the case a two-outcome gate must guess at, and either guess is
+a known failure mode: call it a pass and a real regression ships on a noisy day;
+call it a failure and people learn to re-run until green. Naming it keeps both
+visible. There is no default threshold — §11.3 is explicit that thresholds are
+calibrated per fixture, so omitting one reports the difference and decides
+nothing.
+
+## 16.2 Four controls, four known answers
+
+Reproduce with `qualification/controls.sh` (after `qualify.sh`, ≈30 s). All on
+the qual-01 dataset, 10 interleaved pairs, 2 warmup rounds, seed 42,
+`max_cv_percent: 5`. Numbers below are from one run; §16.3 explains why they
+move between runs and what is asserted instead.
+
+| Control | Arms | True effect | Verdict | Exit |
+|---|---|---|---|---|
+| **Null** | identical trace, copied to a second filename | **exactly zero** | **pass** | 0 |
+| **Positive** | `max_inflight` 4 → 2 | **large, real** | **regression** | 3 |
+| **Refusal** | warm vs cold page cache | large, but arm A unstable | **not_assessed** | 1 |
+| **Tight budget** | null control at a 0.01% threshold | zero, budget < precision | **inconclusive** | 4 |
+
+### Null control — no false positive
+
+Two arms whose traces are byte-identical copies. `trace` differs, so the
+experiment has a declared treatment variable and the machinery runs in full,
+while the true effect is exactly zero by construction.
+
+| | baseline | treatment |
+|---|---|---|
+| median | 156.8 ms | 156.0 ms |
+| CV | 2.96% | 2.24% |
+
+Paired difference **−0.18%**, 95% interval **−4.2% … +0.3%** → **PASS** at a 7%
+threshold, exit 0. The gate did not manufacture a regression from a workload
+that has none. It also did not claim the arms were *equal*: the interval is
+several percent wide, which is this fixture's real precision at 10 pairs.
+
+### Positive control — a real regression is caught
+
+Capping in-flight operations from 4 to 2:
+
+| | baseline | treatment |
+|---|---|---|
+| median | 154.9 ms | 246.6 ms |
+| CV | 1.93% | 3.46% |
+
+Paired difference **+58.1%**, 95% interval **+48.7% … +62.4%** → **REGRESSION**,
+exit 3. The machinery detects a real effect, states its size, and blocks.
+
+**Stated plainly, because it limits the claim:** `max_inflight` is a
+load-generator setting, not a storage property, and the tool said so itself —
+the run came back `COMPARABLE-WITH-CAVEATS` with `fidelity: A=ok B=low
+[backend_backlog]`, i.e. the treatment arm's timing includes the replay
+throttling itself. So this control proves the **decision machinery** works end
+to end. It does **not** prove the tool can attribute a regression to a backend.
+A storage-side positive control is what §16.4 says is still missing.
+
+### Refusal control — ineligible evidence gets no verdict
+
+Warm page cache versus cold. The warm arm runs in ~9 ms, where scheduling jitter
+is a large fraction of the total, so its CV lands well past the 5% policy
+(13.6% on this run, 20.9% on another).
+
+The apparent effect was **+1585%** — and the gate returned **`not_assessed`**,
+exit 1, with `"the comparison was refused as incomparable, so no threshold
+decision is possible"`. A 16× apparent slowdown was **not** converted into a
+regression verdict, because the evidence could not support one.
+
+This is the property that matters most for a release gate: a refusal must never
+become an approval, and a spectacular number must not buy its way past the
+stability check. It is unit-tested and confirmed here on real data.
+
+### Tight-budget control — the honest third answer
+
+The null control against a **0.01%** threshold — a budget far narrower than the
+fixture can resolve. The interval **−1.9% … +2.2%** spans it, so the gate returns
+**INCONCLUSIVE**, exit 4: these pairs are consistent both with passing and with
+exceeding the budget.
+
+The lesson generalizes, and it was learned the hard way here. An earlier version
+of this control used a **1%** threshold; one run returned inconclusive and a
+later one returned **pass**, because that run happened to be precise enough
+(interval −4.3% … +0.4%) to fit inside 1%. Near-threshold verdicts depend on the
+precision that run achieved. **A threshold narrower than the measurement's own
+precision cannot reliably pass** — and the tool says which case it is rather
+than rounding to a verdict.
+
+## 16.3 The host is not quiet, and that shaped the design
+
+Two things were observed while running these controls, both of which changed how
+the controls are written.
+
+**Absolute performance drifts between sessions.** Between §15 and §16 — same
+host, same dataset, same command — the baseline median moved from **~91 ms to
+~156 ms**, a 71% shift, and stayed there. Within any single experiment the CV
+stayed near 2%.
+
+That is the entire argument for interleaved pairing in one data point. Run
+sequentially across that shift, the second arm would have carried a 71%
+"regression" belonging to the machine. Every conclusion in §15 and §16 survives
+it because the arms alternate and each pair is differenced. It is also a
+caution: **absolute throughput numbers from this fixture are not comparable
+across sessions**, only differences measured within one.
+
+**Transients hit mid-run.** One `poscontrol` run came back **INCOMPARABLE**:
+baseline CV 27.2% (min 155.7 ms, max 308.2 ms) and treatment CV 37.2% (min
+239.7 ms, max 557.9 ms). A spike of 2–3× landed inside the trial sequence. An
+earlier `max_inflight` sweep showed the same ~5× inflation for about three
+seconds before recovering. The host was idle throughout and the cause was not
+identified; it is left unexplained rather than guessed at.
+
+The gate did the right thing: it refused. But it means a control script cannot
+assert *which* verdict a run produces without occasionally failing on an honest
+result — which is the same error as tuning a threshold until the answer is the
+expected one. So `controls.sh` asserts only the ways the gate could **mislead**:
+
+| Control | Invariant asserted | Acceptable outcomes |
+|---|---|---|
+| Null, tight-budget | must **never** report a regression | pass, inconclusive, refused |
+| Positive | must **never** certify a real regression as passing | regression, inconclusive, refused |
+| Refusal | unstable evidence must **never** become an approval | refused, inconclusive |
+
+Detecting the regression (exit 3) is what a quiet host produces and what §16.2
+records; being refused on a noisy one is the CV gate working, not failing.
+
+## 16.4 What is still not established
+
+- **Backend attribution.** The positive control moved a load-generator setting.
+  No control yet demonstrates the tool detecting a regression *in the storage
+  system*, which is the product's actual claim. A cache-state control was the
+  natural candidate and it was refused for instability — so this is open, and it
+  is the most important remaining gap.
+- **Minimum detectable effect.** The controls used effects of 0% and 58%. Where
+  the boundary between them lies is not measured; the intervals in §16.2 are a
+  few percent wide at 10 pairs, but that is an observation about precision, not
+  a measured detection limit. A ladder of known small effects would settle it,
+  and §16.3 says such a ladder needs a quieter host than this one.
+- **False-positive rate.** One null control returned pass. One run is not a
+  rate. Repeating it many times would estimate how often noise alone clears a
+  given threshold; that has not been done.
+- **Whether 7% is the right threshold for qual-01.** The intervals in §16.2 are
+  a few percent wide at 10 pairs, so a 7% budget is plausibly resolvable here —
+  but §16.3 shows that depends on the host being quiet, and the tight-budget
+  control shows what happens when the budget is narrower than the precision.
+- The gate covers **duration only**. plan.md §11.3 also lists a p99-latency
+  threshold; it is deliberately not implemented, because FIXTURE.md §9 and
+  plan.md §11.2 both state that a p99 *operation* latency is not the p99 of
+  trial outcomes, so gating on it would encourage exactly the inference those
+  sections warn against.

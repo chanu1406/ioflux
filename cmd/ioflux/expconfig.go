@@ -38,6 +38,11 @@ type expConfig struct {
 type expPolicy struct {
 	MinTrials    *int     `yaml:"min_trials"`
 	MaxCVPercent *float64 `yaml:"max_cv_percent"`
+	// MaxDurationRegressionPercent turns the reported difference into a pass/fail
+	// decision. Absent leaves the gate off rather than applying a built-in
+	// number: plan.md §11.3 is explicit that thresholds are calibrated per
+	// fixture, so a default here would be a decision made on the team's behalf.
+	MaxDurationRegressionPercent *float64 `yaml:"max_duration_regression_percent"`
 }
 
 // armConfig overrides individual replay settings. Every field is a pointer so
@@ -153,6 +158,9 @@ func (c *expConfig) policy() results.TrialPolicy {
 	}
 	if c.Policy.MaxCVPercent != nil {
 		p.MaxCVPercent = *c.Policy.MaxCVPercent
+	}
+	if c.Policy.MaxDurationRegressionPercent != nil {
+		p.MaxDurationRegressionPercent = *c.Policy.MaxDurationRegressionPercent
 	}
 	return p
 }

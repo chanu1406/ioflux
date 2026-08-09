@@ -14,6 +14,11 @@ type TrialPolicy struct {
 	MinValidTrials int `json:"min_valid_trials"`
 	// MaxCVPercent is the widest run-to-run spread a conclusion may rest on.
 	MaxCVPercent float64 `json:"max_cv_percent"`
+	// MaxDurationRegressionPercent is the largest increase in the primary metric
+	// that still passes. Zero leaves the gate off: the difference is reported and
+	// no pass/fail decision is made, which is the right default for a tool whose
+	// thresholds must be calibrated per fixture (§11.3) rather than inherited.
+	MaxDurationRegressionPercent float64 `json:"max_duration_regression_percent,omitempty"`
 }
 
 // DefaultTrialPolicy returns the built-in floor.

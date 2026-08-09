@@ -207,6 +207,50 @@ Because the treatment is declared, it is not also reported as uncontrolled
 drift; only differences nobody chose are. S3 credentials are not config fields —
 a config file travels with its results, so credentials come from the environment.
 
+### Turning the difference into a decision
+
+Reporting an effect size is not the same as deciding whether to ship. Add a
+threshold and the experiment renders a verdict:
+
+```yaml
+policy:
+  min_trials: 10
+  max_cv_percent: 5
+  max_duration_regression_percent: 7   # a 7% slowdown is the most that passes
+```
+
+```
+Regression gate: REGRESSION (threshold 7.0%)
+  the whole 95% interval (+56.0% … +65.2%) lies beyond the 7.0% threshold
+```
+
+The verdict is judged against the **whole 95% interval**, not the median. A gate
+that compared the median to the threshold would flip on run-to-run noise
+whenever the true effect sat near the threshold — which is exactly where the
+decision matters, and exactly where a flapping gate teaches people to ignore it.
+That produces three outcomes rather than two:
+
+| Verdict | Meaning | Exit |
+|---|---|---|
+| `pass` | the whole interval is within the threshold | 0 |
+| `regression` | the whole interval is beyond it | 3 |
+| `inconclusive` | the interval spans it — these trials decide nothing | 4 |
+| `not_assessed` | no threshold declared, or the evidence was refused | 0 / 1 |
+
+`inconclusive` is the outcome a two-way gate has to guess at, and guessing is
+how a real regression ships on a noisy day. The remedy is more pairs or a
+quieter host — not re-running until it comes back green. If your threshold is
+narrower than your measurement's own precision, every run will land here; that
+is the tool telling you the budget is tighter than the evidence can support.
+
+Evidence the tool refuses as incomparable never acquires a verdict. A comparison
+that was rejected for instability cannot become a release approval by being
+measured against a number.
+
+There is no default threshold. Thresholds are calibrated to a fixture and to the
+cost of the decision, so omitting one reports the difference and decides nothing
+rather than applying a number nobody chose.
+
 ### Changing the workload itself
 
 Some treatments are a change to the workload rather than to a setting — reading

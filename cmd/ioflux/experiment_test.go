@@ -312,3 +312,115 @@ treatment:
 		t.Errorf("stderr should explain the refusal; got %q", stderr)
 	}
 }
+
+// The regression gate's exit codes are the contract CI depends on, so they are
+// pinned here rather than left to the printed text. Each verdict gets its own
+// code: a team that blocks a release on a regression usually wants to retry on
+// undecided evidence, and one code for both takes that choice away.
+
+// No declared threshold means the difference is reported and nothing is decided.
+// The absence of a gate must not read as a passing one.
+func TestExperimentCmd_NoThresholdDecidesNothing(t *testing.T) {
+	code, stdout, stderr, pe := runTestExperiment(t, `
+trials: 6
+seed: 3
+policy:
+  min_trials: 6
+  max_cv_percent: 500
+run:
+  trace: TRACE
+  engine: mem
+  max_inflight: 8
+treatment:
+  max_inflight: 1
+`)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0 when no threshold is declared; stderr=%s", code, stderr)
+	}
+	if pe.Regression.Verdict != results.RegressionNotAssessed {
+		t.Errorf("verdict = %q, want not_assessed", pe.Regression.Verdict)
+	}
+	if pe.Regression.Regressed() {
+		t.Error("Regressed() true with no threshold declared")
+	}
+	if strings.Contains(stdout, "Regression gate:") {
+		t.Errorf("no gate line should print when none was declared; got:\n%s", stdout)
+	}
+}
+
+// A threshold wide enough to contain any real interval must pass and exit 0.
+func TestExperimentCmd_GatePassExitsZero(t *testing.T) {
+	code, stdout, stderr, pe := runTestExperiment(t, `
+trials: 6
+seed: 3
+policy:
+  min_trials: 6
+  max_cv_percent: 500
+  max_duration_regression_percent: 100000
+run:
+  trace: TRACE
+  engine: mem
+  max_inflight: 8
+treatment:
+  max_inflight: 1
+`)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0 for a passing gate; stderr=%s", code, stderr)
+	}
+	if pe.Regression.Verdict != results.RegressionPass {
+		t.Fatalf("verdict = %q, want pass", pe.Regression.Verdict)
+	}
+	if !strings.Contains(stdout, "Regression gate: PASS") {
+		t.Errorf("output should state the verdict; got:\n%s", stdout)
+	}
+}
+
+// Evidence the tool already refused must not acquire a verdict by being measured
+// against a threshold. This is the property that keeps a refusal from silently
+// becoming a release approval.
+func TestExperimentCmd_RefusedEvidenceGetsNoVerdict(t *testing.T) {
+	code, stdout, _, pe := runTestExperiment(t, `
+trials: 6
+seed: 1
+policy:
+  min_trials: 6
+  max_cv_percent: 0.0001
+  max_duration_regression_percent: 7
+run:
+  trace: TRACE
+  engine: mem
+  max_inflight: 8
+treatment:
+  max_inflight: 1
+`)
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1 for refused evidence", code)
+	}
+	if pe.Regression.Verdict != results.RegressionNotAssessed {
+		t.Errorf("verdict = %q, want not_assessed for refused evidence", pe.Regression.Verdict)
+	}
+	if strings.Contains(stdout, "Regression gate:") {
+		t.Errorf("a refused experiment must not print a gate verdict; got:\n%s", stdout)
+	}
+}
+
+// The exit-code mapping is the CI contract, pinned directly rather than through
+// a replay: forcing a real regression of a known size on a shared machine makes
+// the test measure the host's mood, and a gate test that flakes is worse than
+// none. The verdict logic itself is covered in pkg/results.
+func TestRegressionExitCodes(t *testing.T) {
+	cases := []struct {
+		verdict results.RegressionVerdict
+		want    int
+	}{
+		{results.RegressionPass, 0},
+		{results.RegressionNotAssessed, 0},
+		{results.RegressionFail, 3},
+		{results.RegressionInconclusive, 4},
+	}
+	for _, tc := range cases {
+		if got := regressionExitCode(tc.verdict); got != tc.want {
+			t.Errorf("regressionExitCode(%q) = %d, want %d", tc.verdict, got, tc.want)
+		}
+	}
+}

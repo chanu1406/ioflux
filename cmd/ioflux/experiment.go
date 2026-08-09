@@ -34,6 +34,7 @@ Config:
   policy:
     min_trials: 10
     max_cv_percent: 5
+    max_duration_regression_percent: 7   # optional; omit to report without deciding
   run:                    # shared by both arms
     trace: workload.ioflux
     engine: local
@@ -51,10 +52,20 @@ as having no treatment rather than as a clean result.
 S3 credentials are not config fields. A config file travels with its results;
 credentials come from the environment instead.
 
+max_duration_regression_percent turns the measured difference into a decision.
+It is judged against the whole 95% interval, not the median, so the verdict does
+not flip on noise when the true effect sits near the threshold. That yields
+three outcomes: the interval lies within the threshold (pass), beyond it
+(regression), or across it (inconclusive — these pairs decide nothing, and more
+of them is the remedy, not a re-run until it passes). There is no default
+threshold; without one the difference is reported and no decision is made.
+
 Exit codes:
-  0   experiment completed and a difference was reported
+  0   experiment completed; no regression (gate passed, or none declared)
   1   a replay failed, or the comparison was refused as incomparable
   2   usage error or I/O failure
+  3   the regression gate found a regression
+  4   the regression gate could not decide
 `
 
 // runExperiment is the entry point for the `experiment` subcommand.
@@ -171,7 +182,29 @@ func runExperiment(args []string, stdout, stderr io.Writer) int {
 	if !printPairedReport(stdout, pe) {
 		return 1
 	}
-	return 0
+	return regressionExitCode(pe.Regression.Verdict)
+}
+
+// regressionExitCode maps a gate verdict to the process exit status.
+//
+// A declared threshold is meant to gate something, so its verdict has to reach
+// the caller as an exit status rather than only as printed text. "Inconclusive"
+// gets its own code instead of being folded into either neighbour: a team that
+// would block a release on a regression usually wants to retry on undecided
+// evidence, and one code for both takes that choice away.
+//
+// An unassessed gate is 0 because the experiment itself succeeded — the caller
+// asked for no decision and got none. Callers that require a decision should
+// declare a threshold rather than read 0 as a pass.
+func regressionExitCode(v results.RegressionVerdict) int {
+	switch v {
+	case results.RegressionFail:
+		return 3
+	case results.RegressionInconclusive:
+		return 4
+	default:
+		return 0
+	}
 }
 
 // orderedArms draws the order the two arms run in for one round. Alternating
