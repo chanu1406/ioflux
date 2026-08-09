@@ -75,7 +75,8 @@ func alignedReadAt(f *os.File, buf []byte, off, length, align int64) (int, error
 	alignedLen := alignedEnd - alignedOff
 
 	staging := makeAlignedBuf(alignedLen, align)
-	n, err := f.ReadAt(staging, alignedOff)
+	// Single-shot, as in the buffered path: one trace op is one read syscall.
+	n, err := readAtOnce(f, staging, alignedOff)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, fmt.Errorf("localfile: direct read at %d: %w", alignedOff, err)
 	}

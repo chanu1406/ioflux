@@ -8,6 +8,10 @@ This is the first time anyone has checked whether an IOFlux replay reproduces th
 workload it claims to replay. Nothing below was tuned to agree; every comparison
 reports its residual, and two dimensions came out **negative**.
 
+§1–§14 are that first comparison. **§15 is the FIXTURE.md §10 controlled
+regression**, run later against schema v2 (`qualification/qual10.sh`); it
+supersedes §4 and restates §14's requested-length row.
+
 ---
 
 ## 1. Headline
@@ -128,6 +132,11 @@ obtainability — both already documented in IOFlux's own importer:
 | PyTorch-native profiler | Out of scope: this fixture has no PyTorch, deliberately (FIXTURE.md §1). |
 
 ## 4. Finding 1 — source requested lengths are lost (MISMATCH)
+
+> **Superseded — see §15.2.** Trace schema v2 added the requested-length field
+> this section calls for. Re-running the fixture against it, all 1,056 reads now
+> agree with the oracle on requested *and* returned length. The section is kept
+> as the record of how the gap was found; its verdict is no longer current.
 
 This is the finding the fixture was designed to expose, and it reproduced.
 
@@ -369,7 +378,7 @@ Against §10.2's qualification goal:
 | Relevant source ops accounted for vs declared oracle: 100% | **met** (1,184/1,184) |
 | Unexplained drops: 0 | **met** (32 drops, all declared and explained) |
 | Required per-lane / dependency order agreement: exact | **met** |
-| Requested byte agreement within declared bound | **NOT met** — 32 of 1,056 reads |
+| Requested byte agreement within declared bound | **NOT met** — 32 of 1,056 reads (**now met** under schema v2 — §15.2) |
 | Returned byte agreement within declared bound | **met** (exact) |
 | Outstanding-I/O waveform within declared bound | **partly** — peak exact; no bound declared for the mean, and single-trial data cannot support one |
 | Replay timing within supported envelope | **not assessed** — no envelope declared for this fixture |
@@ -379,3 +388,327 @@ So: the premise holds for the narrow claim, and the machinery works well enough
 to find its own limits. The blocking gap is a schema one — the trace IR cannot
 represent a requested length — and it is Phase 1 work, now documented rather than
 silent.
+
+---
+
+# 15. The §10 controlled regression: 256 KiB vs 64 KiB reads
+
+FIXTURE.md §10 predeclared a treatment and a threshold before any result
+existed. This is the first time it has been run. Reproduce with
+`qualification/qual10.sh` (after `qualify.sh`, ≈5 s). Machine-readable evidence:
+`$IOFLUX_QUAL_WORK/evidence/qual10*.json` (§15.7 lists which run is which).
+
+**Headline: the predeclared expectation did not hold.** The tool found no
+regression — not a small one, not one below threshold. The measured paired
+difference is −1.6% (treatment *faster*) with a 95% interval spanning zero,
+against a predicted ≥ +7% slowdown. The comparison was eligible, so this is a
+result about the workload, not a refusal to measure.
+
+## 15.1 Baseline re-established first
+
+`qualify.sh` was re-run before anything else, because §10's comparison is only
+worth running on a fixture that still reconciles. It does, and on two dimensions
+it now reconciles *better* than §1 recorded:
+
+| §10.1 dimension | §1 verdict | Now |
+|---|---|---|
+| Source **requested** lengths | MISMATCH (32 of 1,056) | **match** (0 of 1,056) |
+| Source **returned** lengths | match | **match** (now scored separately) |
+| Import adequacy vs oracle | match | **match**, requested dimension now included |
+| Replay executed what the trace said | match | **match** (1,152 of 1,152, after §15.6) |
+| Syscall form | MISMATCH | **MISMATCH** — unchanged, see §5 |
+
+The import no longer reports `short_transfer_requested_len_dropped`. What it
+reports instead, on this fixture:
+
+```
+imported 1152 op(s) across 4 stream(s), 32 target(s) via strace
+skipped 86 op(s):
+  eof_read                 32
+  unparsed_line            54
+```
+
+No `imported with loss` block at all — the loss it used to declare no longer
+occurs. The two skip counts:
+
+- **`eof_read` 32** — unchanged and still declared (§6).
+- **`unparsed_line` 54** — *not* dropped operations. These are orphan
+  `<... resumed>` halves whose `<unfinished ...>` partner was an interpreter
+  syscall (`/proc/<pid>/stat`, `/dev/null`) that `qualify.sh`'s dataset-scope
+  grep removed while the filter's `resumed>` clause kept the tail. The count
+  varies run to run (53, then 54) because it tracks interpreter activity, not
+  fixture activity. That they consume no dataset operation is established
+  independently, not asserted: capture-vs-oracle remains 1,184 of 1,184.
+
+## 15.2 Finding 1 is resolved (schema v2)
+
+The 32 discriminating reads now carry both counts:
+
+```json
+{"op":"READ","off":8388608,"len":262144,"ret":111392,...}
+```
+
+| | §4 (v1) | Now (v2) |
+|---|---|---|
+| `len` == source **requested** | 1,024 / 1,056 | **1,056 / 1,056** |
+| `ret` == source **returned** | — (no field) | **1,056 / 1,056** |
+| Replay's actual request, observed by strace | `pread64(…, 111392, …)` | **`pread64(…, 262144, …)` → 111392** |
+
+Replay now issues the request the application actually made and requires the
+short return the source got. §14's "requested byte agreement: NOT met" is met.
+
+## 15.3 The transformation and its verification
+
+```
+ioflux transform split-reads --block 64KiB -o qual01-64k.ioflux qual01.ioflux
+  1152 op(s) -> 4256 op(s); 259.40 MiB unchanged
+```
+
+Verified against the source trace rather than taken on trust — every property
+§10 requires be identical, checked element-wise across all 32 targets:
+
+| Property | Source | Treatment | |
+|---|---|---|---|
+| Total bytes | 272,000,000 | 272,000,000 | **identical** |
+| Targets | 32 | 32 | **identical** (same ids, same names) |
+| Extent covered, per target | `[0, 8500000)` | `[0, 8500000)` | **identical**, all 32 |
+| Bytes transferred, per target | 8,500,000 | 8,500,000 | **identical**, all 32 |
+| Per-stream OPEN/STAT/CLOSE order | — | — | **identical** |
+| READ operations | 1,056 | 4,160 | 3.94× |
+| All operations | 1,152 | 4,256 | — |
+| Read sizes | 1,056 × 256 KiB | 4,128 × 64 KiB + 32 × 45,856 B | — |
+| **Device bytes read, cold** | **272,105,472** | **272,105,472** | **identical** |
+
+The header carries the ledger, and its `source_digest` is exactly
+`sha256sum qual01.ioflux`:
+
+```json
+"transformations": [{"kind":"split-reads","params":{"block":"65536"},
+  "source_digest":"sha256:f1c3f143c5bf04dd95854296210a59d53216e41f3f8ef5ff83a93ffec7670abd",
+  "applied_utc":"2026-08-09T03:59:12Z", "note":"…divided into requests of at
+  most that size over identical extents"}]
+```
+
+The experiment's own output resolves that digest and reports the arms as
+related-by-declared-transformation rather than as two unrelated traces.
+
+**One declared deviation from a literal 64 KiB reader, stated because it is not
+nothing.** The 32 tail reads request **45,856 bytes**, not 65,536. A real reader
+with a 64 KiB block would ask for 65,536 at offset 8,454,144 and receive 45,856
+— a short read. `split-reads` instead divides the extent actually transferred
+and emits full reads, so the trace's partial-read count goes 32 → **0**. This is
+deliberate and documented (`pkg/transform/splitreads.go:25`), and it does not
+affect extents, targets, or total bytes — but it means the treatment arm is not
+byte-for-byte the request stream a 64 KiB reader would issue, and it converts a
+short read into a full read of a smaller size, which is the shape §4 was about.
+The stated reason ("asking for bytes the file does not have would make the
+transformation demand a failure") is weaker now than when it was written: with
+`ret` in schema v2 the trace can record an expected short return, so the
+faithful split is representable and would not demand a failure. Left unchanged
+here — changing the treatment after seeing the result is exactly what §10's
+predeclaration exists to prevent. Flagged for the transform's own follow-up.
+
+Affected: 32 of 4,160 reads (0.8%), 1,467,392 of 272,000,000 bytes (0.5%),
+request shape only.
+
+## 15.4 What was measured
+
+Both arms read the **same dataset directory** under `--target-root` confinement,
+`prepare: assume-existing`, `cache_mode: cold`, `max_inflight: 4`, 2 warmup
+rounds discarded, 10 measured pairs interleaved with within-pair order drawn
+from seed 42 (`baseline, baseline, treatment, treatment, treatment, baseline,
+baseline, treatment, treatment, treatment`).
+
+| duration (cold, wall-clock) | baseline (256 KiB) | treatment (64 KiB) |
+|---|---|---|
+| **median** | **91.4 ms** | **89.9 ms** |
+| **CV** | **2.19%** | **1.75%** |
+| mean | 91.6 ms | 90.5 ms |
+| min … max | 88.9 … 94.8 ms | 88.9 … 92.7 ms |
+| 95% CI of the median | 89.1 … 94.1 ms | 89.0 … 92.5 ms |
+| throughput (median) | 2.773 GiB/s | 2.818 GiB/s |
+| ops completed | 1,152 | 4,256 |
+| bytes moved | 272,000,000 | 272,000,000 |
+| valid trials / failed | 10 / 0 | 10 / 0 |
+
+**Paired difference (treatment − baseline), 10 pairs:**
+
+| | |
+|---|---|
+| median | **−1.45 ms (−1.6%)** |
+| 95% CI | **−3.50 ms … +1.69 ms** |
+| excludes zero | **no** |
+
+**Eligibility: COMPARABLE.** Both arms cleared the policy — ≥ 10 valid trials
+(10 and 10) and CV ≤ 5% (2.19% and 1.75%) — and the only thing differing between
+the resolved configurations is the declared treatment variable (`trace`). The
+comparison was not refused, so the numbers above are the result.
+
+**The CV gate was not the binding constraint.** It was expected to be: the
+replay path's trial-to-trial stability had never been measured, and only the
+live phase (88/90/89/88 ms) suggested ~1% was achievable. Measured over 10
+interleaved trials the replay path holds **1.75–2.19%** CV, comfortably inside
+the 5% the fixture demanded. That is a new fact about this host and this path,
+and it is what makes the null result interpretable rather than a measurement
+failure.
+
+## 15.5 Was the predeclared 7% expectation met? No.
+
+| | |
+|---|---|
+| Predicted | cold-recipe throughput regression **≥ +7%** |
+| Measured | **−1.6%** (treatment faster), 95% CI −3.8% … +1.8% |
+| Verdict | **not met** — and the interval excludes +7% by a wide margin |
+
+The interval includes zero, so these pairs do not establish a difference in
+*either* direction. What they do establish is an upper bound: a +7% regression
+is inconsistent with this data. The prediction is not merely unconfirmed; the
+effect it predicted is outside what was observed.
+
+Per FIXTURE.md's own instruction, the prediction has not been edited. Nothing
+was retuned — threshold, trial count, and seed are as specified in §10, and the
+reported run was not selected from a set: both runs performed are in §15.7.
+
+**Why the mechanism did not bite**, from the run's own instrumentation rather
+than speculation. §10 predicted per-op overhead and reduced readahead
+effectiveness. Both were real and both were absorbed:
+
+| | baseline | treatment | |
+|---|---|---|---|
+| READ operations | 1,056 | 4,160 | **3.94×** |
+| Mean READ latency | 331.8 µs | 83.1 µs | **0.250×** |
+| Product (total read service time) | — | — | **≈ 1.00** |
+| CPU sys (median) | 129.6 ms | 122.4 ms | unchanged |
+| CPU user (median) | 13.2 ms | 16.5 ms | +3.3 ms |
+| Device bytes | 272,105,472 | 272,105,472 | **identical** |
+
+Per-operation latency fell by almost exactly the factor the operation count
+rose. The workload moves 272 MB in ~90 ms — **~3.0 GB/s**, at this NVMe device's
+streaming rate — so wall-clock is bounded by device bandwidth, and the 3,104
+extra syscalls cost user-space time (+3.3 ms) that is spread across 4 concurrent
+streams on 28 CPUs and never reaches the critical path. Kernel time did not rise
+at all: it is dominated by moving 272 MB, not by syscall entry. Readahead
+effectiveness is unchanged in the only way this fixture can observe it — device
+bytes are identical to the byte, so the smaller requests did not cause the block
+layer to fetch more.
+
+This is a claim about *this* fixture on *this* host: a bandwidth-bound
+sequential read of a page-cache-evicted dataset on local NVMe. It is not a claim
+that request size never matters.
+
+## 15.6 A bug found and fixed: one trace op became two syscalls
+
+Found because the re-run baseline did **not** reproduce §7, which is the whole
+reason §7 exists. Reported plainly rather than worked around:
+
+`replay_vs_trace` came back MISMATCH — 1,184 operations observed against 1,152
+specified, with 852 offset mismatches cascading behind the divergence. The 32
+extra were:
+
+```
+pread64(…/shard_0000.bin, "", 150752, 8500000) = 0
+```
+
+**Cause.** `LocalFileEngine.Read` used `os.File.ReadAt`, which is documented to
+retry until the caller's buffer is full. Under schema v1 the engine asked for
+111,392 bytes and one syscall filled it. Under v2 it correctly asks for the
+source's 262,144, gets 111,392, and `ReadAt` issues a *second*, zero-byte read at
+offset 8,500,000 — an offset the trace never contained — before returning EOF.
+So the v2 fidelity fix introduced a new infidelity one layer down: one recorded
+operation replayed as two syscalls.
+
+It is worth being precise about how mild the symptom was and how badly it would
+have read. The extra call transfers nothing and costs microseconds; the run
+still reported `coverage: 1152/1152 ops (100.0%)` and no errors. Only an
+independent strace of the replay showed it — the same method that found §5.
+
+**Fix.** `readAtOnce` issues exactly one `pread(2)` and returns a partial result
+as-is, letting the caller convert it to `engine.ErrShortRead`; EINTR is the only
+retried condition. Applied to the buffered path and the O_DIRECT path; the
+read-modify-write inside `alignedWriteAt` still wants a full fill and keeps
+`ReadAt`. Non-unix builds keep `ReadAt` behind a documented fallback.
+
+Verified at the syscall level, not by self-report — dataset `pread64` calls in
+the traced replay:
+
+| | before | after |
+|---|---|---|
+| Total | 1,088 | **1,056** (= trace READ ops, exactly) |
+| Returning 262,144 | 1,024 | 1,024 |
+| Returning 111,392 | 32 | 32 |
+| **Returning 0** | **32** | **0** |
+
+`replay_vs_trace` returns to 1,152 of 1,152 with zero residual on every
+dimension, restoring §7. Three tests pin it (`pread_unix_test.go`), counting
+syscalls through an injectable `pread` rather than inferring them from byte
+counts — including the full-read and at-EOF cases, so the assertion keeps its
+meaning when nothing is short.
+
+## 15.7 Two harness corrections, in the spirit of §12
+
+Neither is an IOFlux defect; both produced *false* disagreements, which is the
+failure mode §12 warns about.
+
+1. **`reconcile.py` was stale against schema v2.** It projected trace reads as
+   `requested = len, returned = len` — correct when there was one length field,
+   wrong once `ret` exists. It therefore reported the 32 short reads as
+   returning 262,144 and flagged both `trace_vs_oracle` and `replay_vs_trace` as
+   MISMATCH while the trace, the oracle, and the replay all agreed on 111,392.
+   Now reads `ret` (absent means a full transfer), scores the requested
+   dimension it previously had to skip, and reports
+   `source_returned_length_preserved` alongside the requested one.
+2. **`TrialPolicy` serialized as Go field names.** `MinValidTrials` /
+   `MaxCVPercent` in a results schema that is snake_case everywhere else. Now
+   `min_valid_trials` / `max_cv_percent`. Cosmetic, but these files are the
+   durable evidence artifact.
+
+The second required rebuilding the binary mid-way, and `qual10.sh` was then
+executed once more to verify it reproduces end to end. So the experiment ran
+**three times**, every time with the identical config and seed. All three are
+reported, because all three were run:
+
+| run | baseline median (CV) | treatment median (CV) | paired median | 95% CI | verdict |
+|---|---|---|---|---|---|
+| 1 (pre-fix binary) | 91.0 ms (2.14%) | 90.5 ms (2.70%) | −0.44 ms (−0.5%) | −4.45 … +1.89 ms | comparable, includes zero |
+| **2 (reported above)** | **91.4 ms (2.19%)** | **89.9 ms (1.75%)** | **−1.45 ms (−1.6%)** | **−3.50 … +1.69 ms** | comparable, includes zero |
+| 3 (`qual10.sh` check) | 89.5 ms (2.13%) | 89.1 ms (2.47%) | −0.18 ms (−0.2%) | −4.28 … +2.35 ms | comparable, includes zero |
+
+Three independent 10-pair runs: every arm's CV between 1.75% and 2.70%, every
+paired interval containing zero, every point estimate between −0.2% and −1.6%,
+and not one anywhere near +7%. Run 2 is quoted above because it came from the
+committed binary, not because it was preferred — run 3 is the weakest of the
+three for the treatment and changes no conclusion.
+
+Evidence files: `evidence/qual10-run1.json`, `evidence/qual10.json` (run 2),
+`evidence/qual10-run3.json`.
+
+## 15.8 What this does not measure
+
+Named rather than passed over, as §11:
+
+- **Why the treatment is faster, if it is.** All three runs put the point
+  estimate slightly negative (−0.5%, −1.6%, −0.2%) and all three intervals
+  include zero. That is consistent with no effect, and with a small real effect
+  this design cannot resolve. Nothing here establishes that 64 KiB reads are
+  *faster*, and the −1.6% should not be quoted as if it were an effect.
+- **Sensitivity.** §10 wanted an effect "small enough to test sensitivity", and
+  with no effect to detect, the design's *power* is untested. These 10 pairs
+  bound the effect at roughly ±3.5 ms (±3.8%); whether the machinery would
+  detect a genuine 7% regression is **not established by this run** — it would
+  need a treatment with a known-nonzero effect. That is the single most
+  important thing §10 set out to test and it remains open.
+- **Whether the fixture's prediction is wrong in general.** This measures one
+  host, one NVMe device, one filesystem, at ~3 GB/s with 4 concurrent streams
+  and no application compute. On a device where per-op cost is a larger share of
+  service time — network storage, a slower disk, a single stream — the predicted
+  regression may well appear. §10's expectation is falsified *here*; it is not
+  shown to be wrong everywhere.
+- **The application-level equivalent.** The replay performs no CPython
+  interpreter work and no per-block compute, so this does not predict what the
+  live fixture would do at a 64 KiB block size. The closed-loop gap of §11
+  applies unchanged.
+- **The 45,856-byte tail requests** (§15.3) are a known deviation from a literal
+  64 KiB reader, unmeasured in effect. At 0.5% of bytes they cannot plausibly
+  account for a −1.6% difference, but that is an argument, not a measurement.
+- **Anything about warm-cache behaviour**, or about request size under memory
+  pressure — the cold recipe and FIXTURE.md §4's caveat both still apply.

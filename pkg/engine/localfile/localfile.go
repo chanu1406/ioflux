@@ -410,9 +410,12 @@ func (e *LocalFileEngine) Open(_ context.Context, target string, mode engine.Mod
 	return h, nil
 }
 
-// Read reads length bytes at off from h into buf using File.ReadAt.
+// Read reads length bytes at off from h into buf with a single positional read.
 // Returns engine.ErrShortRead when fewer bytes are available than requested.
 // When the handle was opened with O_DIRECT, an aligned staging buffer is used.
+//
+// One trace operation costs one read syscall: a short result is reported, never
+// topped up by a second read. See readAtOnce.
 func (e *LocalFileEngine) Read(_ context.Context, h engine.Handle, off, length int64, buf []byte) (int, error) {
 	of, err := e.lookupHandle(h)
 	if err != nil {
@@ -421,8 +424,13 @@ func (e *LocalFileEngine) Read(_ context.Context, h engine.Handle, off, length i
 	if of.direct {
 		return alignedReadAt(of.f, buf, off, length, of.align)
 	}
-	n, readErr := of.f.ReadAt(buf[:length], off)
+	n, readErr := readAtOnce(of.f, buf[:length], off)
 	if errors.Is(readErr, io.EOF) {
+		return n, engine.ErrShortRead
+	}
+	if readErr == nil && int64(n) < length {
+		// Reachable without EOF on a non-regular file reached inside the target
+		// root. The op moved fewer bytes than the trace asked for either way.
 		return n, engine.ErrShortRead
 	}
 	return n, readErr

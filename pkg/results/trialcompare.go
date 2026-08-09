@@ -11,9 +11,9 @@ import "fmt"
 type TrialPolicy struct {
 	// MinValidTrials is the smallest number of valid trials a conclusion may
 	// rest on.
-	MinValidTrials int
+	MinValidTrials int `json:"min_valid_trials"`
 	// MaxCVPercent is the widest run-to-run spread a conclusion may rest on.
-	MaxCVPercent float64
+	MaxCVPercent float64 `json:"max_cv_percent"`
 }
 
 // DefaultTrialPolicy returns the built-in floor.

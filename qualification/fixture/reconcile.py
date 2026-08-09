@@ -82,7 +82,11 @@ def trace_sequences(header, ops):
         elif kind in ("READ", "WRITE"):
             entry["path"] = handle_target.get(op.get("h"), "?")
             entry["off"] = op.get("off")
+            # Schema v2 carries both counts: `len` is what the source asked for,
+            # `ret` what it received. `ret` is omitted when the transfer was
+            # full, so its absence means returned == requested.
             entry["len"] = op.get("len")
+            entry["ret"] = op.get("ret", op.get("len"))
         elif kind == "CLOSE":
             entry["path"] = handle_target.get(op.get("h"), "?")
         seqs.setdefault(s, []).append(entry)
@@ -311,9 +315,9 @@ def section_c(dataset_dir, journals, header, ops):
         exp, dropped = importable(exp_all[w])
         res["declared_drops"][w] = {"eof_read": len(dropped)}
 
-        # Project the trace onto the oracle's vocabulary. The trace has one
-        # length field, so it is compared against BOTH requested and returned
-        # to determine, quantitatively, which one it holds.
+        # Project the trace onto the oracle's vocabulary. Schema v2 has a field
+        # for each dimension, so both are compared directly; under v1 the single
+        # `len` field had to be scored against BOTH to determine which it held.
         obs = []
         for e in seq:
             if e["op"] == "OPEN":
@@ -327,28 +331,27 @@ def section_c(dataset_dir, journals, header, ops):
                         "path": e["path"],
                         "off": e["off"],
                         "requested": e["len"],
-                        "returned": e["len"],
+                        "returned": e["ret"],
                     }
                 )
             elif e["op"] == "CLOSE":
                 obs.append({"op": "CLOSE", "path": e["path"]})
-        res["per_worker"][w] = compare_to_oracle(exp, obs, check_requested=False)
+        res["per_worker"][w] = compare_to_oracle(exp, obs)
 
         for i in range(min(len(exp), len(obs))):
             if exp[i]["op"] != "READ" or obs[i]["op"] != "READ":
                 continue
             total_reads += 1
-            tl = obs[i]["returned"]
-            if tl == exp[i]["returned"]:
+            if obs[i]["returned"] == exp[i]["returned"]:
                 matched_returned += 1
-            if tl == exp[i]["requested"]:
+            if obs[i]["requested"] == exp[i]["requested"]:
                 matched_requested += 1
             if exp[i]["requested"] == exp[i]["returned"]:
                 ambiguous += 1
 
     res["len_semantics"] = {
         "trace_reads_compared": total_reads,
-        "len_equals_source_returned": matched_returned,
+        "ret_equals_source_returned": matched_returned,
         "len_equals_source_requested": matched_requested,
         "indistinguishable_because_full_transfer": ambiguous,
         "discriminating_reads": total_reads - ambiguous,
@@ -481,7 +484,7 @@ def section_d(header, ops, journals, replay_events, replay_root, dataset_dir):
                         "path": rel,
                         "off": e["off"],
                         "requested": e["len"],
-                        "returned": e["len"],
+                        "returned": e["ret"],
                     }
                 )
             elif e["op"] == "CLOSE":
@@ -654,9 +657,9 @@ def verdict(report):
         "returned_mismatch",
     ]
     out["capture_vs_oracle"] = zero_residual(report["B_capture_vs_oracle"], dims)
-    out["trace_vs_oracle"] = zero_residual(
-        report["C_trace_vs_oracle"], [d for d in dims if d != "requested_mismatch"]
-    )
+    # The requested dimension is scored here too: schema v2 can represent it, so
+    # excluding it would leave the trace unchecked on the dimension v1 lost.
+    out["trace_vs_oracle"] = zero_residual(report["C_trace_vs_oracle"], dims)
     out["replay_vs_trace"] = zero_residual(report.get("D_replay_vs_trace", {}), dims)
 
     ls = report["C_trace_vs_oracle"]["len_semantics"]
@@ -666,6 +669,13 @@ def verdict(report):
         out["source_requested_length_preserved"] = "match"
     else:
         out["source_requested_length_preserved"] = "MISMATCH"
+
+    if ls["discriminating_reads"] == 0:
+        out["source_returned_length_preserved"] = "not_measured"
+    elif ls["ret_equals_source_returned"] == ls["trace_reads_compared"]:
+        out["source_returned_length_preserved"] = "match"
+    else:
+        out["source_returned_length_preserved"] = "MISMATCH"
 
     e = report["E_outstanding_io_depth"]
     if e.get("live") and e.get("replay"):
