@@ -17,6 +17,7 @@ Commands:
   validate <trace.ioflux>     Validate a trace against the schema and invariants.
   transform <kind> [flags]    Apply a declared transformation to a trace.
   run      [flags]            Replay a trace against a storage engine.
+  calibrate [flags]           Measure the load generator's own ceiling for a trace.
   experiment --config f.yaml  Run two configurations interleaved and compare them.
   worker   --listen :7800     Run a replay worker for distributed runs.
   report   <results.json>     Pretty-print a saved run report.
@@ -43,6 +44,8 @@ func main() {
 		os.Exit(runValidate(args, os.Stdout, os.Stderr))
 	case "run":
 		os.Exit(runRun(args, os.Stdout, os.Stderr))
+	case "calibrate":
+		os.Exit(runCalibrate(args, os.Stdout, os.Stderr))
 	case "experiment":
 		os.Exit(runExperiment(args, os.Stdout, os.Stderr))
 	case "worker":

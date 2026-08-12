@@ -80,6 +80,7 @@ Run `bin/ioflux <command> -h` for all available options.
 | `ioflux validate` | Validate a `.ioflux` trace and its invariants. |
 | `ioflux transform` | Apply a declared transformation to a trace. |
 | `ioflux run` | Replay a trace against the `mem`, `local`, or `s3` engine. |
+| `ioflux calibrate` | Measure the load generator's own ceiling for a trace. |
 | `ioflux experiment` | Run two configurations interleaved and compare them pairwise. |
 | `ioflux worker` | Start a worker for distributed replay. |
 | `ioflux report` | Print one report or trial set, or compare two if they are comparable. |
@@ -156,6 +157,74 @@ bin/ioflux report --min-trials 10 --max-cv 5 before.json after.json
 `--max-cv` is the important one. If a configuration's own run-to-run spread is
 wider than the difference being looked for, no number of trials makes the
 comparison mean anything, and the comparison is refused rather than printed.
+
+## Is the tool the bottleneck?
+
+A throughput number is only a fact about storage if storage is what limited it.
+IOFlux has its own per-op cost — scheduling, dispatch, buffer handling,
+accounting — and against a fast enough backend that cost stops being negligible.
+Two runs compared under those conditions differ by however much the tool got in
+the way, which is not a property of either backend.
+
+`ioflux calibrate` measures the ceiling that cost implies. It replays the same
+trace, at the same concurrency, against the null (`mem`) engine, which performs
+no I/O. Whatever that replay takes is IOFlux alone, and no replay of that trace
+can go faster against any backend:
+
+```bash
+bin/ioflux calibrate --against results.json --max-generator-share 25
+```
+
+```
+Load-generator ceiling (mem engine, 10 valid trial(s))
+  max-inflight        512 over 4 stream(s)
+  median duration     5.9ms for 4131 ops
+  ceiling             700.8k ops/s   (1.4µs per op)
+  trial CV            2.0%
+
+Attribution of results.json
+  run rate            406.7k ops/s
+  generator share     58.0% of ceiling   (bound 25.0%)
+  client CPU          32.6% of all cores during the run
+  verdict             not_attributable
+```
+
+The generator share is the run's op rate as a fraction of that ceiling. A run at
+5% of the ceiling was limited by its backend, and a delta between two such runs
+is a property of those backends. The run above reached 58%, so its timing
+measures IOFlux as much as it measures storage — which is the expected outcome
+for a warm-cache local read, where the filesystem is returning data at close to
+memory speed.
+
+The ceiling is taken from the trials' median rather than their fastest. The
+fastest overstates what the generator can sustain, and an overstated ceiling
+understates its share of a measured run — the direction of error that would
+wrongly reassure.
+
+There is no default share bound, for the same reason there is no default
+regression threshold: what share is tolerable depends on the fixture and on what
+the result will be used for. Without one the share is reported and nothing is
+decided.
+
+Stability is checked before anything is concluded. A ceiling whose own trials
+disagree by more than the policy allows is refused rather than used, because a
+ceiling that the next run would contradict bounds nothing:
+
+```
+  verdict             not_assessed
+    - the calibration's own spread is 35.8% CV, wider than the 5.0% policy:
+      a ceiling this unstable does not bound anything
+```
+
+The same refusals apply as elsewhere: a ceiling measured on a different trace,
+at a different concurrency, or against an engine that performed real I/O is
+rejected rather than caveated, and a run that failed operations acquires no
+verdict. A paced replay (`timeline` or `scaled`) is refused too — its op rate is
+set by the trace's schedule rather than by the backend, so comparing it to a
+ceiling measures the trace.
+
+Verdicts exit `0` for `attributable`, `3` for `not_attributable`, and `1` when
+the evidence was refused.
 
 ## Paired experiments
 
