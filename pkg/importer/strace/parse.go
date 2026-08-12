@@ -357,17 +357,13 @@ func (p *parser) doRW(s, t int64, name string, a []string, ret string, dur *int6
 		return
 	}
 
-	// read(fd, buf, count) and pread64(fd, buf, count, off) both carry the
-	// requested count as the third argument, so a short read records what the
-	// application asked for (len) alongside what it got (ret) and replay issues
-	// the request the source issued. A count that cannot be parsed falls back to
-	// the transferred size and is recorded as a capture loss, since that op will
-	// replay as a smaller request than the source made.
+	// read and pread64 both carry the requested count as the third argument, so a
+	// short read records what was asked for (len) alongside what it got (ret). An
+	// unparseable count falls back to the transferred size and is recorded as a
+	// capture loss, since it will replay as a smaller request.
 	//
-	// Writes take the fallback unconditionally: a source short write is backend
-	// state (a full disk), not a property of the target, so asking a healthy
-	// replay backend to reproduce it would demand a divergence rather than
-	// describe one.
+	// Writes always take the fallback: a source short write is backend state, not
+	// a property of the target, so a healthy replay cannot reproduce it.
 	requested := n
 	if kind == trace.OpRead {
 		if c, ok := parseLeadingInt(argAt(a, 2)); ok && c >= n {

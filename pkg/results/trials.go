@@ -6,13 +6,10 @@ import (
 	"time"
 )
 
-// TrialSet is the output of running one configuration repeatedly. One run is
-// not evidence: a single duration cannot be told apart from noise, so a
-// decision needs a distribution and a statement of how stable it was.
-//
-// The individual trials are kept, not just their summary. A reader who doubts
-// the summary must be able to recompute it, and an excluded trial must remain
-// visible rather than disappearing into an aggregate.
+// TrialSet is the output of running one configuration repeatedly. A single
+// duration cannot be told apart from noise, so a decision needs a distribution
+// and a statement of how stable it was. Individual trials are kept alongside
+// the summary so it can be recomputed and excluded trials stay visible.
 type TrialSet struct {
 	SchemaVersion int    `json:"result_schema_version,omitempty"`
 	GeneratedAt   string `json:"generated_at"`
@@ -28,14 +25,11 @@ type TrialSet struct {
 	Summary TrialSummary `json:"summary"`
 }
 
-// TrialSummary aggregates a trial set's measured trials.
-//
-// Duration is the primary metric: it is what the workload produces, and
-// §11.2's warning applies — a p99 operation latency inside one run is not the
-// p99 of trial outcomes, and neither substitutes for an interval on the metric
-// a decision is made from. GiBPerSec is the same measurement expressed the way
-// people read it, derived from the same trials, so the two cannot be searched
-// against each other for a more favourable answer.
+// TrialSummary aggregates a trial set's measured trials. Duration is the
+// primary metric; a p99 operation latency inside one run is not the p99 of
+// trial outcomes and does not substitute for it. GiBPerSec is the same
+// measurement from the same trials, so the two cannot be played against each
+// other for a better answer.
 type TrialSummary struct {
 	Trials       int           `json:"trials"`
 	ValidTrials  int           `json:"valid_trials"`
@@ -56,11 +50,10 @@ type MetricSummary struct {
 	CVPercent float64 `json:"cv_percent"`
 	Min       float64 `json:"min"`
 	Max       float64 `json:"max"`
-	// CI95Lo and CI95Hi bound the median at 95% confidence, by order statistics
-	// rather than a normal assumption — replay durations are bounded below and
-	// have a long right tail, which is exactly where a symmetric interval
-	// misleads. CI95Available is false when there were too few trials to form an
-	// interval at all (see medianCIBounds), and the bounds are then meaningless.
+	// CI95Lo and CI95Hi bound the median at 95% confidence by order statistics
+	// rather than assuming normality: replay durations are bounded below with a
+	// long right tail, where a symmetric interval misleads. CI95Available is
+	// false when there were too few trials, and the bounds are then meaningless.
 	CI95Lo        float64 `json:"ci95_lo,omitempty"`
 	CI95Hi        float64 `json:"ci95_hi,omitempty"`
 	CI95Available bool    `json:"ci95_available"`
@@ -176,16 +169,12 @@ func median(sorted []float64) float64 {
 }
 
 // medianCIBounds returns the 0-based indexes into a sorted sample of n values
-// that bound its median at ≥95% confidence, and whether such a pair exists.
+// that bound its median at >=95% confidence, and whether such a pair exists.
 //
-// The interval is the distribution-free order-statistic one: with the median as
-// the population centre each observation falls above it with probability 1/2,
-// so the count below is Binomial(n, 1/2), and [x_(k), x_(n+1-k)] covers the
-// median whenever k is the largest index with P(X < k) ≤ 0.025.
-//
-// Below n = 6 no such k exists — even the widest interval, the full range, has
-// coverage under 95% — and the honest answer is that the sample cannot support
-// an interval rather than a narrower one computed by assuming normality.
+// The interval is the distribution-free order-statistic one: the count below
+// the median is Binomial(n, 1/2), so [x_(k), x_(n+1-k)] covers it whenever k is
+// the largest index with P(X < k) <= 0.025. Below n = 6 no such k exists, and
+// the sample cannot support an interval at all.
 func medianCIBounds(n int) (lo, hi int, ok bool) {
 	if n < 6 {
 		return 0, 0, false

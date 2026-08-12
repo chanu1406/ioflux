@@ -18,15 +18,12 @@ var pread = func(fd uintptr, p []byte, off int64) (int, error) {
 
 // readAtOnce reads into buf at off with a single pread(2).
 //
-// os.File.ReadAt cannot be used here: it is documented to retry until buf is
-// full, so a source read that came back short costs a second, zero-byte read at
-// an offset the trace never contained. Replaying one recorded operation as two
-// syscalls misreports the request shape the application actually issued, which
-// is the same class of error as storing a short read as a full one.
+// os.File.ReadAt retries until buf is full, so a short source read would cost a
+// second zero-byte read at an offset the trace never contained, replaying one
+// recorded operation as two syscalls.
 //
-// A partial result is returned as-is rather than topped up; the caller converts
-// it to engine.ErrShortRead. EINTR is the one condition retried, and only
-// because it means no bytes moved at all.
+// A partial result is returned as-is; the caller converts it to
+// engine.ErrShortRead. EINTR is retried, since it means no bytes moved.
 func readAtOnce(f *os.File, buf []byte, off int64) (int, error) {
 	rc, err := f.SyscallConn()
 	if err != nil {

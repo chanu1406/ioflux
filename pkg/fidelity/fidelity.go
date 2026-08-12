@@ -98,7 +98,7 @@ func Build(
 ) FidelityReport {
 	var r FidelityReport
 
-	// --- Schedule drift and completion lag (timeline/scaled only) ---
+	// --- Schedule drift and completion lag (paced modes only) ---
 	if rec.DriftHist != nil {
 		r.ScheduleDrift = summaryOf(rec.DriftHist)
 	}
@@ -174,7 +174,9 @@ func buildConcurrencyCheck(peakByStream map[int64]int64) ConcurrencyCheck {
 // flags; drift above the threshold means the replay fell behind the trace's
 // intended schedule, so the category is "behind_schedule".
 func assessFidelity(r FidelityReport, meanInterArrivalNS int64, mode string) (bool, string, string) {
-	// Only timeline/scaled modes produce meaningful drift data.
+	// Only timeline and scaled can fall behind cumulatively. Think mode measures
+	// each arrival from the previous completion, so its drift is semaphore wait,
+	// which the backlog check below already covers.
 	isTimeline := mode == "timeline" || mode == "scaled"
 
 	if isTimeline {

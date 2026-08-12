@@ -75,7 +75,7 @@ func (c *Coordinator) logf(format string, args ...any) {
 }
 
 // Run drives the full phase protocol over workers and returns the merged Results.
-// Per PRD §8.9 v1 failure policy, any worker error during RUN cancels the rest
+// Under the v1 failure policy, any worker error during RUN cancels the rest
 // and aborts the run with no results.
 func (c *Coordinator) Run(ctx context.Context, plan Plan, workers []Worker) (*results.Results, error) {
 	if len(workers) == 0 {

@@ -18,7 +18,7 @@ import (
 
 // This file covers replay of a source operation that transferred fewer bytes
 // than it requested — the one dimension the qual-01 live-versus-replay
-// reconciliation measured as failing (qualification/RESULTS.md §4).
+// reconciliation measured as failing.
 //
 // The shape is taken from that fixture: a shard whose size is not a multiple of
 // the reader's block size, so the final read of every shard asks for 256 KiB and

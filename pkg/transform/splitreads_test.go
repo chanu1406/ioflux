@@ -39,7 +39,7 @@ func totalMoved(ops []trace.Op) int64 {
 	return n
 }
 
-// The qual-01 §10 treatment: a 256 KiB read becomes four 64 KiB reads over the
+// The qual-01 treatment: a 256 KiB read becomes four 64 KiB reads over the
 // same extent.
 func TestSplitReadsDividesEvenly(t *testing.T) {
 	ops := []trace.Op{readOp(0, 0, 262144)}
@@ -61,7 +61,7 @@ func TestSplitReadsDividesEvenly(t *testing.T) {
 }
 
 // The extent covered and the bytes moved must be identical to the source's —
-// the property FIXTURE.md §10 requires.
+// the property the treatment requires.
 func TestSplitReadsPreservesExtentAndBytes(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

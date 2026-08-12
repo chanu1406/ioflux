@@ -7,18 +7,8 @@ import (
 )
 
 // Version identifies the coordinator/worker protocol. A worker whose Version
-// differs from the coordinator's is rejected at REGISTER, since a stale worker
-// could silently mis-replay a plan it does not fully understand.
-//
-// 0.2.0: PrepareStream chunked trace transfer; the plan gained prepare_scope
-// and fill_mode/fill_seed, which an 0.1.0 worker would silently ignore while
-// the coordinator records them as applied.
-//
-// 0.3.0: PrepareAck gained replay_equivalence and RecorderSnapshot gained
-// histogram_overflows. Both are evidence a 0.2.0 worker cannot send, and their
-// absence reads as "exact replay" and "no lost latency samples" — the two
-// answers most likely to make an invalid run look green. Rejecting the older
-// worker is the only way absence stays distinguishable from a real negative.
+// differs is rejected at REGISTER: an older worker silently omits evidence the
+// coordinator would otherwise read as a clean result.
 const Version = "0.3.0"
 
 const (
@@ -27,8 +17,8 @@ const (
 )
 
 // ResolvePrepareScope returns the configured prepare scope or the backend
-// default. Shared object stores should be materialized once; process-local and
-// node-local backends need per-worker preparation.
+// default: shared object stores are materialized once, node-local backends
+// per worker.
 func ResolvePrepareScope(p Plan) string {
 	switch p.PrepareScope {
 	case PrepareScopeShared, PrepareScopePerWorker:
@@ -41,24 +31,20 @@ func ResolvePrepareScope(p Plan) string {
 }
 
 // Plan is the transport-agnostic description of one worker's share of a replay
-// run. The coordinator builds it once and hands an identical copy (differing
-// only in AssignedStreams) to every worker. A localWorker passes it straight to
-// a Session; a remoteWorker marshals it to protobuf for the wire.
+// run. Every worker gets an identical copy differing only in AssignedStreams.
 type Plan struct {
 	// TracePath is advisory metadata echoed into results; the worker replays
 	// TraceBytes, not this path.
 	TracePath string
 	// TraceBytes is the full .ioflux trace (header line + op lines), inlined.
 	TraceBytes []byte
-	// AssignedStreams lists exactly the stream IDs this worker replays. The
-	// coordinator always populates it (single-node: every stream goes to the one
-	// worker; idle worker: empty). It is authoritative — the Session never infers
-	// "all streams" from an empty list.
+	// AssignedStreams lists the stream IDs this worker replays. Always populated
+	// and authoritative: an empty list means no streams, never all of them.
 	AssignedStreams []int64
 
 	Engine EngineSpec
 
-	// Mode is "asap", "timeline", or "scaled".
+	// Mode is "asap", "think", "timeline", or "scaled".
 	Mode string
 	// MaxInflight is the worker-global in-flight cap (0 → default 512).
 	MaxInflight int
@@ -89,18 +75,13 @@ type WorkerInfo struct {
 	Version  string
 }
 
-// PrepareResult is one worker's PREPARE-phase outcome. The coordinator collects
-// it to record honest run metadata (dataset prep counts, cache actions). Because
-// every worker materializes the full target table idempotently (see Session.Prepare),
-// these per-worker results are identical for shared backends; the coordinator
-// records one representative copy rather than summing.
+// PrepareResult is one worker's PREPARE-phase outcome. Workers prepare the full
+// target table idempotently, so results agree across workers and the
+// coordinator records one representative copy rather than summing.
 type PrepareResult struct {
 	PrepStats   prepare.Stats
 	CacheResult cache.Result
-	// ReplayEquivalence is how faithfully this worker will replay the trace
-	// (results.EquivalenceSyscallLevel or results.EquivalenceObjectLevel),
-	// decided at PREPARE. Every worker parses the same trace against the same
-	// engine spec, so workers agree; the coordinator records the representative
-	// copy alongside the other prepare metadata.
+	// ReplayEquivalence is how faithfully this worker will replay the trace,
+	// decided at PREPARE.
 	ReplayEquivalence string
 }

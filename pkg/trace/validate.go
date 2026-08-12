@@ -194,21 +194,15 @@ func ValidateWithOps(r *Reader, onOp func(Op) error) (Report, error) {
 }
 
 // validateSummaryAgreement reconciles the header's declared summary against what
-// the op stream actually contained.
+// the op stream contained. It is what makes a truncated or edited trace
+// distinguishable from a complete one: replay measures coverage against the ops
+// it finds, so a short trace reports full coverage of itself. The declared
+// counts are the only independent record, so disagreement is an error.
 //
-// This is what makes a trace that lost operations after it was written —
-// a truncated copy, an interrupted transfer, a hand-edited file — distinguishable
-// from a complete one. Nothing downstream can tell the difference on its own:
-// replay measures coverage against the ops it finds, so a short trace reports
-// full coverage of itself and the missing work leaves no trace anywhere in the
-// result. The declared counts are the only independent record of what the trace
-// was supposed to contain, so disagreement is an error rather than a warning.
-//
-// Only counts the op stream defines unambiguously are reconciled.
-// summary.num_groups counts explicitly tagged groups rather than distinct group
-// values, and summary.duration_ns is written as the final timestamp by the
-// importers and as a span by the generators; neither can be recomputed here
-// without inventing a definition it was not written against.
+// Only counts the op stream defines unambiguously are reconciled. num_groups
+// counts explicitly tagged groups, and duration_ns is written as a final
+// timestamp by importers and a span by generators, so neither can be recomputed
+// here.
 func validateSummaryAgreement(rep *Report) {
 	if declared := rep.Header.Summary.NumOps; declared != rep.NumOpsRead {
 		rep.addError(1, "summary.num_ops", fmt.Sprintf(

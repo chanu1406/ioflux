@@ -9,13 +9,10 @@ const (
 )
 
 // PairedExperiment is the output of running two configurations interleaved.
-//
-// Interleaving is what makes the pairing possible, and the pairing is the point:
-// if the machine drifts — thermal throttling, a neighbouring tenant, a cache
-// warming up — running one arm to completion and then the other assigns that
-// drift entirely to the second arm, where it is indistinguishable from the
-// treatment's effect. Alternating the arms spreads the drift across both, and
-// differencing within a pair cancels whatever the two shared.
+// Running one arm to completion and then the other assigns any drift in the
+// machine to the second arm, where it cannot be told apart from the treatment.
+// Alternating spreads the drift across both, and differencing within a pair
+// cancels whatever the two shared.
 type PairedExperiment struct {
 	SchemaVersion int    `json:"result_schema_version,omitempty"`
 	GeneratedAt   string `json:"generated_at"`
@@ -93,10 +90,8 @@ func BuildPaired(
 	tc := CompareTrialSets(baseline, treatment, policy)
 	pe.Eligibility = tc.Eligibility
 	// A declared treatment is not drift. The gate reports every difference it
-	// finds, which for an experiment includes the one deliberately introduced —
-	// and warning about the change the experiment exists to measure is how
-	// readers learn to skip warnings. The treatment is displayed on its own
-	// line; what remains here is what nobody chose.
+	// finds, including the one the experiment introduced; that one is displayed
+	// on its own line, so what remains here is what nobody chose.
 	pe.Eligibility.Caveats = dropDeclaredTreatments(pe.Eligibility.Caveats, treatmentVars)
 	// The verdict was decided before that filtering, so recompute it: an
 	// experiment whose only difference was the treatment it declared is

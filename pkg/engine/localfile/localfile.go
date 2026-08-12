@@ -82,25 +82,19 @@ func WithDirectAlign(n int64) Option {
 	return func(e *LocalFileEngine) { e.directAlignOverride = n }
 }
 
-// WithRoot confines the engine to root: every target passed to Open or Stat
-// must resolve inside it, so a trace target name can neither read nor overwrite
-// data elsewhere on the host. An empty root (the default) applies no
-// containment and is recorded as a limitation. The root is created if it does
-// not exist.
+// WithRoot confines the engine to root: every target must resolve inside it. An
+// empty root applies no containment and is recorded as a limitation. The root is
+// created if missing.
 //
-// Enforcement is done by the operating system, not by string comparison: the
-// engine holds the root open (os.Root) and every file operation is performed
-// relative to that directory handle, so neither a ".." component nor a symlink
-// can escape it. Target names are translated to root-relative form first, which
-// is where a plainly out-of-root name is rejected with a specific message.
+// Enforcement is by the OS, not string comparison: the engine holds the root
+// open (os.Root) and operates relative to that handle, so neither ".." nor a
+// symlink can escape.
 //
-// Two consequences worth knowing:
-//   - An *absolute* symlink inside the root is rejected even when it points
-//     back inside the root, because an absolute link cannot be validated
-//     against a root. Relative symlinks that stay inside the root work.
+//   - An absolute symlink inside the root is rejected even when it points back
+//     inside, since it cannot be validated against a root. Relative ones work.
 //   - A root confines path resolution, not the filesystem: bind mounts, /proc
-//     special files, and device nodes reachable inside the root remain
-//     reachable. This is recorded in Limitations.
+//     files, and device nodes reachable inside it stay reachable. Recorded in
+//     Limitations.
 func WithRoot(root string) Option {
 	return func(e *LocalFileEngine) { e.rootSpec = root }
 }
@@ -209,9 +203,8 @@ func (e *LocalFileEngine) rootRelative(target string) (string, error) {
 // is used and working-directory relative semantics are preserved. createDirs
 // requests the parent directories, created inside the root when confined.
 //
-// A custom opener installed by NewWithOpener applies only to the unconfined
-// path; it is a test seam for simulating filesystem behavior, and a confined
-// engine must not bypass its root to honor it.
+// A custom opener from NewWithOpener applies only to the unconfined path: it is
+// a test seam, and a confined engine must not bypass its root to honor it.
 func (e *LocalFileEngine) openerFor(target string, createDirs bool) (func(int) (*os.File, error), string, error) {
 	if e.rootErr != nil {
 		return nil, target, e.rootErr

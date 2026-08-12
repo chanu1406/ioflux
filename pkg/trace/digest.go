@@ -14,16 +14,12 @@ const DigestPrefix = "sha256:"
 // replayed the same workload, and two runs carrying different digests did not.
 //
 // The digest covers the raw file bytes rather than a canonical form of the
-// parsed operations. That keeps identity to one definition — the artifact on
-// disk — instead of two that can disagree, and it costs nothing in stability
-// because a trace file is written once and never rewritten in place. `ioflux
-// gen` deliberately omits a timestamp from its header for the same reason, so
-// regenerating a synthetic trace from identical flags reproduces the digest.
+// parsed ops, keeping identity to one definition. `ioflux gen` omits a header
+// timestamp for the same reason, so regenerating from identical flags
+// reproduces the digest.
 //
-// A consequence worth stating: a trace that is semantically identical but
-// reserialized (different key order, different whitespace) digests differently
-// and compares as a different workload. That is the safe direction to fail —
-// it reports a difference that is not there rather than hiding one that is.
+// A semantically identical but reserialized trace therefore digests differently
+// and compares as a different workload — the safe direction to fail.
 func Digest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return DigestPrefix + hex.EncodeToString(sum[:])

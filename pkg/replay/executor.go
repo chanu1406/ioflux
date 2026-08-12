@@ -27,7 +27,7 @@ type Plan struct {
 	TracePath  string
 	Engine     engine.Engine
 	EngineName string
-	// Mode is "asap", "timeline", or "scaled".
+	// Mode is "asap", "think", "timeline", or "scaled".
 	Mode string
 	// MaxInflight is the worker-level in-flight cap (0 → default 512).
 	MaxInflight int
@@ -130,13 +130,17 @@ func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStrea
 	// Engines that report ObjectAPI but not PartialWrite (S3-shaped) cannot
 	// replay offset WRITEs at the syscall level. Rather than reject every such
 	// trace outright, track whether each write handle's lifecycle qualifies for
-	// object-level coalesced-PUT replay (§8.4 honesty rule).
+	// object-level coalesced-PUT replay.
 	var eligibility *objectWriteEligibility
 	if caps.ObjectAPI && !caps.PartialWrite {
 		eligibility = newObjectWriteEligibility()
 	}
 
+	var opsWithDur int
 	rep, err := trace.ValidateWithOps(r, func(op trace.Op) error {
+		if op.Dur != nil {
+			opsWithDur++
+		}
 		if op.Group != nil && *op.Group != 0 {
 			return fmt.Errorf("replay: prepare: non-default group %d is not supported", *op.Group)
 		}
@@ -163,6 +167,13 @@ func prepareInternal(plan Plan, r *trace.Reader, streamIDs []int64, loadAllStrea
 	}
 	if !rep.OK() {
 		return nil, fmt.Errorf("replay: prepare: invalid trace: %s", formatValidationErrors(rep))
+	}
+
+	// Think mode derives each gap from the previous op's duration. Without any,
+	// every gap would be zero and the run would silently be an asap replay.
+	if plan.Mode == "think" && opsWithDur == 0 {
+		return nil, fmt.Errorf(
+			"replay: prepare: think mode needs the source's operation durations, and this trace records none")
 	}
 
 	var objectWriteSizes map[int]int64
@@ -340,13 +351,13 @@ func (e *Executor) ReplayEquivalence() string {
 	return results.EquivalenceSyscallLevel
 }
 
-// Run executes the replay and returns Results. Supported modes: "asap",
+// Run executes the replay and returns Results. Supported modes: "asap", "think",
 // "timeline", "scaled".
 func (e *Executor) Run(ctx context.Context) (*results.Results, error) {
 	switch e.plan.Mode {
-	case "asap", "timeline", "scaled":
+	case "asap", "think", "timeline", "scaled":
 	default:
-		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
+		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|think|timeline|scaled)", e.plan.Mode)
 	}
 
 	// Dataset preparation and cache-state controls run before the measured run,
@@ -441,19 +452,15 @@ func (e *Executor) ApplyCache(ctx context.Context) cache.Result {
 
 // RunWorker replays this executor's assigned streams starting at runStart,
 // returning the raw per-worker output for a coordinator to merge. progress, when
-// non-nil, is called periodically with cumulative ops/bytes for live streaming.
-// It is the worker-side primitive beneath the gRPC layer: the distributed
-// coordinator calls it on each worker and feeds the WorkerOutputs to BuildResults.
-// (Single-node Run uses the same scheduler via schedule.)
+// non-nil, is called periodically with cumulative ops/bytes.
 //
-// Cache controls are NOT applied here — they belong to PREPARE (call ApplyCache
-// before the RUN barrier) so they never run inside the measured, barrier-gated
-// window.
+// Cache controls are not applied here: they belong to PREPARE, so they never run
+// inside the measured window.
 func (e *Executor) RunWorker(ctx context.Context, runStart time.Time, progress func(ops, bytes int64)) (*WorkerOutput, error) {
 	switch e.plan.Mode {
-	case "asap", "timeline", "scaled":
+	case "asap", "think", "timeline", "scaled":
 	default:
-		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|timeline|scaled)", e.plan.Mode)
+		return nil, fmt.Errorf("replay: unsupported mode %q (want asap|think|timeline|scaled)", e.plan.Mode)
 	}
 	opts := SchedulerOpts{
 		Mode:             e.plan.Mode,

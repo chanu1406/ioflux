@@ -176,7 +176,7 @@ func (w *stubWorker) Collect(context.Context) (*replay.WorkerOutput, error) {
 }
 func (w *stubWorker) Close() error { return nil }
 
-// TestCoordinator_AbortOnWorkerFailure pins PRD §8.9: one worker failing mid-RUN
+// TestCoordinator_AbortOnWorkerFailure pins the failure policy: one worker failing mid-RUN
 // cancels the rest and aborts with no results.
 func TestCoordinator_AbortOnWorkerFailure(t *testing.T) {
 	traceBytes, _ := genTrace(t, 2, 4)

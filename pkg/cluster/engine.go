@@ -20,19 +20,14 @@ type EngineSpec struct {
 	DirectFallback bool  `json:"direct_fallback,omitempty"`
 	DirectAlign    int64 `json:"direct_align,omitempty"`
 
-	// Root confines the engine to one region of its namespace, so a trace cannot
-	// read or overwrite data elsewhere: a directory for the local engine, a key
-	// prefix within the bucket for s3. Empty applies no containment. The mem
-	// engine has nothing persistent to confine, so BuildEngine rejects a root
-	// there rather than ignoring it.
+	// Root confines the engine to one region of its namespace: a directory for
+	// local, a key prefix for s3. Empty applies no containment, and BuildEngine
+	// rejects a root on mem, which has nothing persistent to confine.
 	//
-	// Root is deliberately NOT carried over the gRPC wire (clusterpb.EngineSpec
-	// has no matching field, and regenerating it needs a protoc toolchain this
-	// repo does not vendor). A coordinator therefore cannot impose a root on a
-	// remote worker — which is the correct trust boundary anyway: the host that
-	// owns the data decides what a plan may touch, via
-	// `ioflux worker --target-root`. `ioflux run` rejects --target-root together
-	// with --hosts so a coordinator-side root can never silently fail to apply.
+	// Root is not carried over the gRPC wire, so a coordinator cannot impose one
+	// on a remote worker — the host owning the data decides, via
+	// `ioflux worker --target-root`. `ioflux run` rejects --target-root with
+	// --hosts so a coordinator-side root can never silently fail to apply.
 	Root string `json:"root,omitempty"`
 
 	S3          s3engine.Config  `json:"s3,omitempty"`

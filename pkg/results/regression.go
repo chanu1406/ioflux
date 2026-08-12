@@ -5,14 +5,9 @@ import (
 	"math"
 )
 
-// RegressionVerdict is a gate's decision about a measured difference.
-//
-// There are three outcomes, not two, and the third is the reason the gate is
-// worth having. A gate that only answers pass/fail has to convert "these trials
-// could not tell" into one of them: call it a pass and a real regression ships
-// whenever the run was noisy; call it a failure and every noisy run blocks a
-// release until someone learns to re-run until it goes green. Naming the
-// undecided case keeps both mistakes visible.
+// RegressionVerdict is a gate's decision about a measured difference. There are
+// three outcomes rather than two: a pass/fail gate has to convert "these trials
+// could not tell" into one of them, and either choice hides a real mistake.
 type RegressionVerdict string
 
 const (
@@ -22,9 +17,8 @@ const (
 	// RegressionFail means the whole interval lies beyond the threshold: the
 	// effect is confidently worse than the budget allows.
 	RegressionFail RegressionVerdict = "regression"
-	// RegressionInconclusive means the interval spans the threshold. These trials
-	// are consistent both with a passing effect and with a regression, so they
-	// decide nothing. More trials or a quieter host, not a re-roll.
+	// RegressionInconclusive means the interval spans the threshold, so these
+	// trials decide nothing. The remedy is more trials or a quieter host.
 	RegressionInconclusive RegressionVerdict = "inconclusive"
 	// RegressionNotAssessed means no decision was attempted: no threshold was
 	// declared, the evidence was ineligible, or there were too few trials to
@@ -33,13 +27,9 @@ const (
 )
 
 // RegressionGate is the decision a declared threshold produces from a measured
-// difference, together with the numbers it was decided from.
-//
-// The gate is deliberately expressed against the *interval* rather than the
-// point estimate. Comparing a median difference to a threshold directly would
-// make the verdict flip on run-to-run noise whenever the true effect sits near
-// the threshold — which is exactly where the decision matters most, and exactly
-// where a flapping gate teaches people to ignore it.
+// difference, together with the numbers it was decided from. It is judged
+// against the interval, not the median: a median comparison flips on noise
+// whenever the true effect sits near the threshold.
 type RegressionGate struct {
 	Verdict RegressionVerdict `json:"verdict"`
 	// ThresholdPercent is the largest duration increase that still passes.
@@ -53,9 +43,7 @@ type RegressionGate struct {
 	IntervalLoPercent float64 `json:"interval_lo_percent"`
 	IntervalHiPercent float64 `json:"interval_hi_percent"`
 	IntervalAvailable bool    `json:"interval_available"`
-	// Reason states why the verdict is what it is, in the terms a reader needs to
-	// act on it.
-	Reason string `json:"reason"`
+	Reason            string  `json:"reason"`
 }
 
 // Assessed reports whether a decision was actually reached.
@@ -72,13 +60,9 @@ func (g RegressionGate) Regressed() bool { return g.Verdict == RegressionFail }
 // threshold, expressed as the percentage increase in the primary metric that is
 // still acceptable. A threshold of 0 or less disables the gate.
 //
-// The metric is wall-clock duration, not throughput. The two are not
-// interchangeable at the threshold: a 7% throughput loss is a 7.5% duration
-// increase, and a gate that quietly swapped them would sit at a threshold
-// nobody chose. Callers wanting a throughput budget should convert deliberately.
-//
-// Ineligible evidence is never converted into a pass. A comparison the tool
-// already refused cannot acquire a verdict by being measured against a number.
+// The metric is wall-clock duration, not throughput: a 7% throughput loss is a
+// 7.5% duration increase, so callers wanting a throughput budget convert
+// deliberately. Ineligible evidence never becomes a pass.
 func EvaluateRegression(pe *PairedExperiment, thresholdPercent float64) RegressionGate {
 	g := RegressionGate{
 		Verdict:          RegressionNotAssessed,
@@ -117,12 +101,9 @@ func EvaluateRegression(pe *PairedExperiment, thresholdPercent float64) Regressi
 	g.IntervalLoPercent = pe.Paired.Delta.CI95Lo / baseMedian * 100
 	g.IntervalHiPercent = pe.Paired.Delta.CI95Hi / baseMedian * 100
 
-	// A difference of exactly the threshold does not land on it in binary: 7 ms
-	// against a 100 ms median divides and rescales to 7.000000000000001%. Without
-	// a tolerance the gate would fire at precisely the value the team chose,
-	// which — thresholds being set at round numbers — is where measurements
-	// cluster. The comparison is therefore "beyond the threshold by more than
-	// representation error", not "greater than".
+	// 7 ms against a 100 ms median rescales to 7.000000000000001%, so an exact
+	// threshold would fire at the very value the team chose. Compare beyond the
+	// threshold by more than representation error, not simply greater than.
 	epsilon := math.Abs(thresholdPercent) * 1e-9
 	if epsilon == 0 {
 		epsilon = 1e-9

@@ -17,17 +17,13 @@ import (
 // more than block bytes, preserving the targets, the offsets covered, the
 // per-stream order, and the total bytes transferred.
 //
-// This models a reader using a smaller block size. It is the treatment
-// qualification/FIXTURE.md §10 predeclared: four times as many reads, each a
-// quarter the size, over identical extents — a request-shape change of the kind
-// teams actually make, rather than an injected delay.
+// This models a reader using a smaller block size: more reads, each smaller,
+// over identical extents.
 //
 // A source operation that transferred less than it requested is split over the
-// bytes it actually moved, and each produced read requests exactly what it will
-// receive. The source's short read therefore becomes full reads covering the
-// same extent: the extent is what §10 requires be identical, and asking for
-// bytes the file does not have would make the transformation demand a failure
-// rather than describe a workload.
+// bytes it actually moved, so its short read becomes full reads covering the
+// same extent. Asking for bytes the file does not have would make the
+// transformation demand a failure rather than describe a workload.
 //
 // Operations other than READ and GET pass through untouched.
 func SplitReads(ops []trace.Op, block int64) ([]trace.Op, error) {

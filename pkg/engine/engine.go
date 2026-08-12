@@ -1,8 +1,5 @@
-// Package engine defines the storage-backend abstraction and the types
-// shared by all engine implementations.
-//
-// Every engine implements Engine. The replay executor depends only on this
-// interface; it knows nothing about the underlying storage system.
+// Package engine defines the storage-backend abstraction and the types shared
+// by all engine implementations. The replay executor depends only on Engine.
 package engine
 
 import (
@@ -30,19 +27,15 @@ var (
 	ErrShortWrite = errors.New("engine: short write")
 
 	// ErrOutsideRoot is returned when a target resolves outside the engine's
-	// configured containment root. Target names come from a trace, which is
-	// imported or hand-edited input, so a confined engine refuses them rather
-	// than reading or overwriting data elsewhere on the host.
+	// configured containment root.
 	ErrOutsideRoot = errors.New("engine: target resolves outside the configured root")
 )
 
-// Handle is an opaque reference to an open file, returned by Open and passed
-// to Read, Write, Fsync, and Close. Engines define what Handle values mean
-// internally; callers must treat them as opaque identifiers.
+// Handle is an opaque reference to an open file, returned by Open and passed to
+// Read, Write, Fsync, and Close.
 type Handle int64
 
-// Mode is the file-open mode. Values match the trace format's "mode" field so
-// the replay executor can pass them through without conversion.
+// Mode is the file-open mode. Values match the trace format's "mode" field.
 type Mode string
 
 const (
@@ -51,9 +44,8 @@ const (
 	ModeReadWrite Mode = "rw"
 )
 
-// OpenFlags is a bitmask of optional behaviors for Engine.Open. Engines
-// honor only the flags relevant to their backend; unrecognized flags are
-// silently ignored.
+// OpenFlags is a bitmask of optional behaviors for Engine.Open. Engines honor
+// only the flags relevant to their backend.
 type OpenFlags uint32
 
 const (
@@ -67,9 +59,8 @@ const (
 	OpenFlagTrunc  OpenFlags = 1 << 6 // O_TRUNC
 )
 
-// Capabilities describes what a backend supports. The replay executor calls
-// Caps() before the run starts and rejects traces that require unsupported
-// operations, rather than letting them fail silently mid-run.
+// Capabilities describes what a backend supports. The replay executor checks it
+// before the run starts and rejects traces needing unsupported operations.
 type Capabilities struct {
 	Seekable     bool // pread/pwrite at arbitrary offsets
 	PartialWrite bool // writes at non-append, non-zero offsets
@@ -87,11 +78,8 @@ type ObjectInfo struct {
 }
 
 // TargetChecker is implemented by engines that confine targets to a configured
-// root. Callers touch targets through paths the Engine interface does not cover
-// — dataset preparation reads a source tree, cache controls open files directly
-// for fadvise — so containment is only complete if those callers consult the
-// engine too. A caller that holds a target list should check it up front rather
-// than relying on the first engine call to reject it.
+// root. Callers that touch targets outside the Engine interface — dataset
+// preparation, cache controls — must consult it for containment to hold.
 //
 // CheckTarget returns nil when target is allowed, and an error wrapping
 // ErrOutsideRoot when it is not.
@@ -100,18 +88,15 @@ type TargetChecker interface {
 }
 
 // Limiter is implemented by engines that record what their configuration does
-// and does not guarantee — a requested behavior that could not be honored, or a
-// safety property the run did not have. Callers surface these in run metadata so
-// a saved report never leaves the question unanswered.
+// not guarantee: a requested behavior that could not be honored, or a safety
+// property the run lacked. Callers surface these in run metadata.
 type Limiter interface {
 	Limitations() []string
 }
 
 // Shutdowner is implemented by engines holding process-level OS resources
-// beyond individual file handles — the local engine keeps its containment root
-// open as a directory handle. A caller that builds engines repeatedly (a
-// long-lived worker builds one per run) must shut the previous one down, or
-// those handles accumulate for the life of the process.
+// beyond file handles, such as the local engine's containment root. A caller
+// building engines repeatedly must shut the previous one down.
 //
 // Shutdown does not close outstanding file handles; Close those individually.
 type Shutdowner interface {
@@ -119,12 +104,8 @@ type Shutdowner interface {
 }
 
 // Engine is the storage-backend abstraction. Implementations must be safe for
-// concurrent use by multiple goroutines. Operations not supported by the
-// backend return ErrUnsupported; the caller must check Caps() before calling
-// them in production code.
-//
-// ctx cancellation is meaningful for engines with network I/O (S3, AIStore);
-// in-process engines (Mem) may ignore it.
+// concurrent use. Unsupported operations return ErrUnsupported; callers check
+// Caps() first. ctx cancellation is meaningful only for network-backed engines.
 type Engine interface {
 	Caps() Capabilities
 

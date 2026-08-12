@@ -21,7 +21,7 @@ import (
 
 // SchedulerOpts configures a schedule call.
 type SchedulerOpts struct {
-	// Mode is "asap", "timeline", or "scaled".
+	// Mode is "asap", "think", "timeline", or "scaled".
 	Mode string
 
 	// MaxInflight is the worker-level maximum concurrent in-flight ops across
@@ -31,7 +31,7 @@ type SchedulerOpts struct {
 	// SpeedupFactor is only used in "scaled" mode. 0 or negative = no scaling.
 	SpeedupFactor float64
 
-	// RunStart is the logical T=0 for timeline/scaled modes.
+	// RunStart is the logical T=0 for think, timeline, and scaled modes.
 	RunStart time.Time
 
 	// PlanInfo is echoed into the returned Results.
@@ -94,6 +94,25 @@ func schedule(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Eng
 // latency accounting, and a shared in-flight cap, returning the raw per-worker
 // recorder and timing. It does not build Results; buildResults does that over
 // one or more WorkerOutputs.
+// thinkGapNS returns how long after prev completed that cur arrived, from the
+// timestamps and durations the trace recorded. Replaying this gap rather than
+// cur's absolute timestamp is what lets a backend slower or faster than the
+// captured one shift the whole run instead of falling behind a fixed schedule.
+//
+// A predecessor without a recorded duration, or a gap that comes out negative
+// because the two overlapped, yields 0: the op then issues as soon as prev
+// completes, which is the shortest defensible wait.
+func thinkGapNS(prev, cur trace.Op) int64 {
+	if prev.Dur == nil {
+		return 0
+	}
+	gap := cur.T - (prev.T + *prev.Dur)
+	if gap < 0 {
+		return 0
+	}
+	return gap
+}
+
 func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.Engine, hdr trace.Header, opts SchedulerOpts) (*WorkerOutput, error) {
 	if opts.MaxInflight <= 0 {
 		opts.MaxInflight = 512
@@ -132,6 +151,8 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 	cpuStart := cpustat.Now()
 
 	isTimeline := opts.Mode == "timeline" || opts.Mode == "scaled"
+	isThink := opts.Mode == "think"
+	paced := isTimeline || isThink
 
 	// Fire one immediate (0,0) tick so a coordinator can timestamp when this
 	// worker actually began running — the basis for the Go-delivery skew diagnostic.
@@ -154,15 +175,25 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 			handleMap := make(map[int64]replayHandle)
 			buf := make([]byte, 64*1024)
 			var streamInflight int64
+			var prevDone time.Time
 
-			for _, op := range streamOps {
+			for i, op := range streamOps {
 				if ctx.Err() != nil {
 					return
 				}
 
 				var intendedArrival time.Time
-				if isTimeline {
+				switch {
+				case isTimeline:
 					intendedArrival = runStart.Add(time.Duration(float64(op.T) / speedup))
+				case isThink && i > 0:
+					intendedArrival = prevDone.Add(time.Duration(thinkGapNS(streamOps[i-1], op)))
+				case isThink:
+					// A stream's first op has no predecessor to wait on; its arrival
+					// is exogenous, so it keeps the recorded offset from run start.
+					intendedArrival = runStart.Add(time.Duration(op.T))
+				}
+				if paced {
 					if wait := time.Until(intendedArrival); wait > 0 {
 						select {
 						case <-time.After(wait):
@@ -205,7 +236,7 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 				}
 
 				serviceStart := time.Now()
-				if isTimeline {
+				if paced {
 					driftNS := serviceStart.Sub(intendedArrival).Nanoseconds()
 					if driftNS < 0 {
 						driftNS = 0
@@ -214,7 +245,9 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 				}
 
 				bytesN, shortRead, opErr := dispatchOp(ctx, op, eng, hdr, handleMap, &buf, fill, opts.ObjectWriteSizes)
-				serviceNS := time.Since(serviceStart).Nanoseconds()
+				opDone := time.Now()
+				prevDone = opDone
+				serviceNS := opDone.Sub(serviceStart).Nanoseconds()
 				if serviceNS < 0 {
 					serviceNS = 0
 				}
@@ -223,11 +256,11 @@ func runStreams(ctx context.Context, byStream map[int64][]trace.Op, eng engine.E
 					rec.RecordShortRead()
 				}
 
-				// In timeline/scaled, latency must capture the full backlog
-				// (coordinated-omission: include the time spent waiting for the
-				// semaphore). In asap, latency is pure service time.
+				// A paced mode's latency must capture the full backlog, including time
+				// spent waiting for the semaphore. In asap, latency is pure service
+				// time.
 				var latencyNS int64
-				if isTimeline {
+				if paced {
 					latencyNS = time.Since(intendedArrival).Nanoseconds()
 					rec.RecordCompletionLag(latencyNS)
 				} else {
@@ -490,15 +523,12 @@ func unionEngineLimitations(outs []*WorkerOutput) []string {
 // (no assigned streams → LastDoneNS == 0) are excluded so they cannot collapse
 // the first-done time to zero.
 //
-// first-done = earliest worker completion, last-done = latest. Last-done
-// throughput is all work over the full window. First-done throughput is the
-// aggregate rate *up to* the earliest worker completion — the rate while every
-// worker was still busy, which excludes the straggler tail (PRD §8.7). Since the
-// per-worker outputs do not carry per-instant op counts, each still-running
-// worker's work-completed-by-first-done is estimated from its uniform average
-// rate (ops · firstDone/lastDone); the earliest worker contributes all its ops.
-// This is deliberately *not* totalOps/firstDone, which would credit the whole
-// run's work to the shorter window and overstate first-done throughput.
+// Last-done throughput is all work over the full window. First-done throughput
+// is the rate while every worker was still busy, excluding the straggler tail.
+// Per-worker outputs carry no per-instant op counts, so each still-running
+// worker's work by first-done is estimated from its average rate
+// (ops * firstDone/lastDone). Deliberately not totalOps/firstDone, which would
+// credit the whole run to the shorter window.
 func buildStraggler(outs []*WorkerOutput, totalOps, totalBytes int64) *results.StragglerWindow {
 	var firstDoneNS, lastDoneNS int64
 	haveFirst := false
@@ -667,11 +697,10 @@ func dispatchOp(
 // expected is what the source actually got back (equal unless the source read
 // short at EOF).
 //
-// The comparison is against expected, not requested. That is what turns a short
-// read from "the backend under-delivered" into "the backend disagreed with the
-// source about how many bytes are there" — a real backend-validation signal.
-// Requesting the source's *result* instead would measure the backend on a
-// request the application never issued and could never disagree at all.
+// The comparison is against expected, not requested: that turns a short read
+// into "the backend disagreed with the source about how many bytes are there".
+// Requesting the source's result instead would measure the backend on a request
+// the application never issued, which could never disagree.
 func checkedReadTransfer(n int, requested, expected int64, err error) (bytesN int64, short bool, opErr error) {
 	// Bounded by requested, not expected: a backend that returns more than the
 	// source did has still moved those bytes, and the op fails on the expected

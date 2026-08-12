@@ -17,10 +17,8 @@ import (
 	"github.com/chanuollala/ioflux/pkg/trace"
 )
 
-// Replay-equivalence classifications recorded in PlanInfo.ReplayEquivalence.
-// They answer whether a result may be read as an exact replay of the trace or
-// only as a transformation of it, so the two are never compared as if they were
-// the same experiment.
+// Replay-equivalence classifications recorded in PlanInfo.ReplayEquivalence:
+// whether a result is an exact replay of the trace or a transformation of it.
 const (
 	// EquivalenceSyscallLevel marks a faithful op-for-op replay.
 	EquivalenceSyscallLevel = "syscall-level"
@@ -32,12 +30,9 @@ const (
 // PlanInfo records the replay configuration echoed into results.json.
 type PlanInfo struct {
 	TracePath string `json:"trace_path"`
-	// TraceDigest identifies the trace bytes this run replayed
-	// ("sha256:<hex>"; see trace.Digest). TracePath cannot serve this purpose:
-	// two runs of "trace.ioflux" may be two different workloads, and two runs of
-	// differently named copies may be one. Empty in results written before the
-	// field existed, which a comparison must report as unverifiable rather than
-	// assume means "same".
+	// TraceDigest identifies the trace bytes this run replayed ("sha256:<hex>").
+	// TracePath cannot: two runs of one filename may be different workloads.
+	// Empty in older results, which a comparison reports as unverifiable.
 	TraceDigest        string  `json:"trace_digest,omitempty"`
 	Engine             string  `json:"engine"`
 	Mode               string  `json:"mode"`
@@ -51,8 +46,7 @@ type PlanInfo struct {
 	NumOps             int64   `json:"num_ops"`
 	TotalBytes         int64   `json:"total_bytes"`
 	// TargetRoot is the containment root the run was confined to, empty when the
-	// run was unconfined. Recorded because it changes what the run was able to
-	// touch, so a confined and an unconfined run are not the same experiment.
+	// run was unconfined.
 	TargetRoot string `json:"target_root,omitempty"`
 	// Bucket is the object-store bucket the run addressed, empty for engines
 	// with no bucket namespace.
@@ -61,9 +55,8 @@ type PlanInfo struct {
 	// the default endpoint for the region applied.
 	Endpoint string `json:"endpoint,omitempty"`
 	// TracePartialReads counts READ/GET ops whose source transferred fewer bytes
-	// than it requested. A run reproducing them is correct and reports no short
-	// read, so without this the report could not distinguish "the workload had no
-	// partial transfers" from "the workload had 32 and the replay matched them".
+	// than requested. A correct replay reports no short read, so this is what
+	// separates "no partial transfers" from "partial transfers, matched".
 	TracePartialReads         int64  `json:"trace_partial_reads,omitempty"`
 	PrepareMode               string `json:"prepare_mode,omitempty"`
 	PrepareScope              string `json:"prepare_scope,omitempty"`
@@ -76,15 +69,12 @@ type PlanInfo struct {
 	PrepareSkippedSizeUnknown int    `json:"prepare_skipped_size_unknown,omitempty"`
 	PrepareDerivedSizeFromOps int    `json:"prepare_derived_size_from_ops,omitempty"`
 	// TraceTransformations is the trace's declared transformation ledger, empty
-	// when the trace still describes what was captured or generated. Carried into
-	// the result so a transformed replay cannot be read as a replay of the source
-	// workload, and so a comparison can recognize one side as a declared
-	// transformation of the other rather than an unrelated trace.
+	// when the trace still describes what was captured or generated. Carried here
+	// so a comparison can recognize one side as a transformation of the other.
 	TraceTransformations []trace.Transformation `json:"trace_transformations,omitempty"`
 	// ReplayEquivalence is "syscall-level" for a faithful op-for-op replay, or
-	// "object-level" when write ops were coalesced into a single PUT because
-	// the backend cannot replay offset writes directly (see pkg/replay
-	// objectWriteEligibility). Empty when not determined by this code path.
+	// "object-level" when write ops were coalesced into a single PUT. Empty when
+	// not determined by this code path.
 	ReplayEquivalence string `json:"replay_equivalence,omitempty"`
 }
 
@@ -100,8 +90,10 @@ type PerOpStats struct {
 	MeanNS float64 `json:"mean_ns"`
 }
 
-// DriftStats summarizes schedule drift (actualIssue − intendedArrival) for a
-// run. Zero values indicate the field was not measured (e.g., asap mode).
+// DriftStats summarizes schedule drift (actualIssue - intendedArrival) for a
+// run. Zero values indicate the field was not measured, as in asap mode. The
+// intended arrival is the trace's timestamp in timeline and scaled modes, and
+// the previous op's completion plus its think gap in think mode.
 type DriftStats struct {
 	P99NS  int64   `json:"p99_ns"`
 	P999NS int64   `json:"p999_ns"`
@@ -126,28 +118,21 @@ type RunEnv struct {
 	EngineLimitations []string `json:"engine_limitations,omitempty"`
 }
 
-// Tool identifies the IOFlux build that produced a result, so a comparison can
-// tell whether two results came from the same measuring instrument.
+// Tool identifies the IOFlux build that produced a result.
 type Tool struct {
 	Version  string `json:"version,omitempty"`
 	Revision string `json:"revision,omitempty"`
 }
 
-// Host records the machine that produced a result. Two runs measured on
-// different hosts are not a controlled comparison unless the host is the
-// declared treatment, so the fields exist to make that difference visible
-// rather than leave it to be remembered.
+// Host records the machine that produced a result, so a comparison across two
+// of them is visibly not controlled.
 //
-// For a distributed run this is the coordinator, which is not where the I/O
-// happened; the hosts that replayed it are in Results.Hosts. The distinction
-// matters when reading a comparison: agreeing Host fields across two
-// distributed runs mean the same coordinator, not the same workers.
+// For a distributed run this is the coordinator, not where the I/O happened;
+// the replaying hosts are in Results.Hosts.
 //
-// The fields here are the portable ones. Kernel release, filesystem type,
-// mount options, and device topology are the other half of environment
-// comparability (they matter at least as much for a storage experiment) but
-// they are platform-specific to discover and are deliberately left to a
-// separate change rather than half-populated here.
+// Only portable fields are recorded. Kernel release, filesystem type, mount
+// options, and device topology matter as much for a storage experiment but are
+// platform-specific to discover, and are left to a separate change.
 type Host struct {
 	Hostname string `json:"hostname,omitempty"`
 	OS       string `json:"os,omitempty"`
@@ -169,8 +154,8 @@ func CurrentTool() Tool {
 	return Tool{Version: buildinfo.Version, Revision: buildinfo.Revision()}
 }
 
-// CPU records per-process CPU time consumed by the run. Reported alongside
-// throughput so a CPU-bound result is not mistaken for a storage-bound one.
+// CPU records per-process CPU time consumed by the run, so a CPU-bound result
+// is not mistaken for a storage-bound one.
 type CPU struct {
 	UserNS int64 `json:"user_ns"`
 	SysNS  int64 `json:"sys_ns"`
@@ -191,8 +176,7 @@ type HostResult struct {
 }
 
 // StragglerWindow quantifies completion skew across workers in a distributed
-// run. FirstDoneNS is the earliest worker completion (throughput up to it
-// excludes the straggler tail); LastDoneNS is the latest. SkewNS is the gap.
+// run: the earliest and latest worker completions, and the gap between them.
 type StragglerWindow struct {
 	FirstDoneNS        int64   `json:"first_done_ns"`
 	LastDoneNS         int64   `json:"last_done_ns"`
@@ -203,11 +187,8 @@ type StragglerWindow struct {
 	LastDoneGiBPerSec  float64 `json:"last_done_gib_per_sec"`
 }
 
-// SchemaVersion is the result_schema_version written into every new result.
-// It exists so a reader can tell a result that omits a field because the field
-// did not exist from one that omits it because the value was absent — the
-// distinction a comparison needs before it can treat a missing trace digest as
-// "unverifiable" rather than "unset".
+// SchemaVersion is the result_schema_version written into every new result. It
+// lets a reader tell a field that did not exist from one whose value was absent.
 const SchemaVersion = 2
 
 // Results is the full output of a replay run written to results.json.
@@ -224,11 +205,9 @@ type Results struct {
 	BytesMoved    int64    `json:"bytes_moved"`
 	Errors        int64    `json:"errors"`
 	ShortReads    int64    `json:"short_reads,omitempty"`
-	// HistogramOverflows counts latency samples that exceeded the histogram's
-	// 100s trackable range and were excluded from every percentile in
-	// PerOpStats/ServiceTimeStats. The underlying op still completed and is
-	// included in OpsCompleted; only its latency sample was lost. A nonzero
-	// value means the reported percentiles cannot be trusted as complete.
+	// HistogramOverflows counts latency samples beyond the histogram's 100s range,
+	// excluded from every percentile. The ops still completed and still count in
+	// OpsCompleted; a nonzero value means the percentiles are incomplete.
 	HistogramOverflows int64        `json:"histogram_overflows,omitempty"`
 	PerOpStats         []PerOpStats `json:"per_op_stats"`
 	ServiceTimeStats   []PerOpStats `json:"service_time_stats,omitempty"`
@@ -239,9 +218,8 @@ type Results struct {
 	ScheduleDrift    DriftStats              `json:"schedule_drift"`
 	CPU              CPU                     `json:"cpu"`
 	Fidelity         fidelity.FidelityReport `json:"fidelity"`
-	// HistogramSnapshot is the merged recorder in lossless form, so saved runs
-	// can be re-merged or re-queried at arbitrary percentiles. (omitempty has
-	// no effect on a struct field; the snapshot is always present.)
+	// HistogramSnapshot is the merged recorder in lossless form, so saved runs can
+	// be re-merged or re-queried at arbitrary percentiles.
 	HistogramSnapshot metrics.RecorderSnapshot `json:"histogram_snapshot"`
 	TimeSeries        []ProgressPoint          `json:"time_series,omitempty"`
 
@@ -331,19 +309,13 @@ func WriteJSON(w io.Writer, v any) error {
 const resultsFileMode = 0o644
 
 // WriteJSONFile writes v to path atomically: the JSON goes to a temporary file
-// in the same directory, is flushed to stable storage, and is renamed over path
-// only once it is complete. Either the caller sees the new results or the
-// previous ones — never a half-written file, and never a truncated one left
-// behind by a failure partway through.
-//
-// This matters because the results file is the run's evidence. Creating it
-// directly would destroy the previous run's results the instant the file was
-// opened, before knowing whether the new ones could be written at all, and a
-// write that failed while flushing would still look like it succeeded.
+// in the same directory, is flushed, and is renamed over path only once
+// complete. The caller sees either the new results or the previous ones, never
+// a half-written file.
 //
 // The temporary file shares path's directory so the rename stays within one
-// filesystem, where it is atomic. Callers writing to stdout should use
-// WriteJSON; a stream cannot be written atomically.
+// filesystem, where it is atomic. Callers writing to stdout use WriteJSON; a
+// stream cannot be written atomically.
 func WriteJSONFile(path string, v any) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")

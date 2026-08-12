@@ -40,20 +40,16 @@ type expPolicy struct {
 	MaxCVPercent *float64 `yaml:"max_cv_percent"`
 	// MaxDurationRegressionPercent turns the reported difference into a pass/fail
 	// decision. Absent leaves the gate off rather than applying a built-in
-	// number: plan.md §11.3 is explicit that thresholds are calibrated per
+	// number: thresholds are calibrated per
 	// fixture, so a default here would be a decision made on the team's behalf.
 	MaxDurationRegressionPercent *float64 `yaml:"max_duration_regression_percent"`
 }
 
 // armConfig overrides individual replay settings. Every field is a pointer so
-// "absent" stays distinguishable from "set to the zero value" — without that, a
-// treatment declaring max_inflight: 0 would be silently indistinguishable from
-// one declaring nothing.
+// "absent" stays distinguishable from "set to the zero value".
 //
-// S3 credentials are deliberately absent. A config file sits next to its
-// results and is meant to be shared; secrets must not travel with the evidence,
-// so they come from the environment as the AWS SDK's default chain resolves
-// them.
+// S3 credentials are absent by design: a config file travels with its results,
+// so secrets come from the environment instead.
 type armConfig struct {
 	Trace            *string  `yaml:"trace"`
 	Engine           *string  `yaml:"engine"`

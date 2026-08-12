@@ -430,7 +430,7 @@ func TestImport_Empty(t *testing.T) {
 // size of the source's *result* and reported a green, short-read-free run for a
 // request the application never made.
 //
-// The qualification fixture (qualification/FIXTURE.md) reads shards whose size
+// The qualification fixture reads shards whose size
 // is not a multiple of its block size, which produces exactly this case; the
 // count was cross-checked against an independent oracle.
 func TestImport_ShortReadPreservesRequestedLength(t *testing.T) {

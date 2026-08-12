@@ -18,10 +18,9 @@ import "strings"
 const TraceFormatVersion = 1
 
 // TraceFormatVersionMax is the newest ioflux_trace_version this build
-// understands. A trace declaring a higher version is rejected outright rather
-// than read with its unrecognized fields silently dropped: a field the reader
-// does not know about decodes as a benign default — "the whole request was
-// transferred" — which is exactly how an invalid run would look green.
+// understands. A higher version is rejected outright rather than read with its
+// unknown fields dropped, since they decode as benign defaults that would make
+// an invalid run look clean.
 const TraceFormatVersionMax = 3
 
 // VersionPartialTransfer is the ioflux_trace_version required by an op carrying
@@ -184,16 +183,11 @@ type TargetInfo struct {
 	Size int64      `json:"size"`
 }
 
-// Summary records aggregate trace statistics. Populated by the producer
-// (generator or capture tool) and treated as advisory metadata by the
-// validator. NumGroups is 0 for traces that use only the implicit default
-// group.
-//
-// NumPartialReads counts READ/GET ops whose source transferred fewer bytes than
-// it requested (ops carrying Ret). It is optional so pre-v2 traces stay valid,
-// and it is reconciled against the op stream rather than trusted, because it is
-// what tells a consumer holding only the header — a distributed coordinator, a
-// saved report — that the trace contains partial transfers at all.
+// Summary records aggregate trace statistics, populated by the producer and
+// advisory to the validator. NumGroups is 0 for traces using only the implicit
+// default group. NumPartialReads counts READ/GET ops whose source transferred
+// fewer bytes than requested; it is optional so pre-v2 traces stay valid, and
+// reconciled against the op stream rather than trusted.
 type Summary struct {
 	NumOps          int64 `json:"num_ops"`
 	NumStreams      int   `json:"num_streams"`
@@ -203,13 +197,9 @@ type Summary struct {
 	NumPartialReads int64 `json:"num_partial_reads,omitempty"`
 }
 
-// Header is the first line of an .ioflux file.
-//
-// Required for every header: Version, Kind, TimeUnit, Targets, Summary.
-// For Kind in {TraceCaptured, TraceImported}, CaptureMethod and
-// CaptureLimitations are also required so consumers always know the
-// fidelity of the trace. Scrubbed indicates whether ioflux scrub has
-// anonymized target names.
+// Header is the first line of an .ioflux file. Version, Kind, TimeUnit,
+// Targets, and Summary are always required; captured and imported traces also
+// require CaptureMethod and CaptureLimitations so consumers know their fidelity.
 type Header struct {
 	Version            int           `json:"ioflux_trace_version"`
 	Kind               TraceKind     `json:"kind"`
@@ -223,25 +213,17 @@ type Header struct {
 	Targets            []TargetInfo  `json:"targets"`
 	Summary            Summary       `json:"summary"`
 	Notes              string        `json:"notes,omitempty"`
-	// Transformations is the ledger of declared changes applied to this trace
-	// after capture, oldest first. Empty means the trace still describes what was
-	// captured or generated.
-	//
-	// It travels in the trace rather than alongside it because a transformed
-	// trace outlives the terminal that produced it, and a replay of one is not a
-	// replay of the source workload — a claim a result must not be able to make
-	// by having lost the paperwork.
+	// Transformations is the ledger of declared changes applied after capture,
+	// oldest first. Empty means the trace still describes what was captured or
+	// generated. It travels in the trace so a replay of a transformed trace can
+	// never be read as a replay of the source workload.
 	Transformations []Transformation `json:"transformations,omitempty"`
 }
 
-// Transformation records one declared, deliberate change to a trace: what was
-// done, with what parameters, and to which trace.
-//
-// SourceDigest is what makes the ledger verifiable rather than a note. It ties
-// this trace to the exact bytes it was derived from, so a comparison can tell
-// "the treatment is a declared transformation of the baseline" apart from "the
-// two runs replayed unrelated workloads" — which look identical when all you
-// have is two differing digests.
+// Transformation records one declared change to a trace: what was done, with
+// what parameters, and to which trace. SourceDigest ties it to the exact bytes
+// it came from, which is what lets a comparison tell a declared transformation
+// of the baseline apart from an unrelated workload.
 type Transformation struct {
 	Kind         string            `json:"kind"`
 	Params       map[string]string `json:"params,omitempty"`
@@ -281,17 +263,10 @@ func (h Header) DerivedFrom(digest string) bool {
 
 // Op is a single storage operation record.
 //
-// Pointer fields use omitempty so the JSON encoding mirrors the per-op-kind
-// schema (e.g., READ has h/off/len but no tgt; OPEN has tgt/h/mode/flags but
-// no off/len). Using pointers preserves the legitimate zero value across the
-// JSON round-trip, which a plain int with `omitempty` would silently drop.
-//
-// Len and Ret are the two halves of a transfer outcome and answer different
-// questions. Len is what the source *asked* for; Ret is what it *got*. Storing
-// only one collapses them, and the collapse is not neutral: a source read of
-// 256 KiB that returned 111 KiB would replay as a 111 KiB request, so the
-// backend is measured on a request the application never made and the run
-// reports no short read because the replay itself read nothing short.
+// Pointer fields use omitempty so the encoding mirrors the per-op-kind schema
+// and a legitimate zero survives the JSON round-trip, which a plain int with
+// omitempty would drop. Len is what the source asked for, Ret what it got;
+// keeping both apart is what stops a short read replaying as a smaller request.
 type Op struct {
 	T     int64    `json:"t"`
 	OpID  *int64   `json:"op_id,omitempty"`
@@ -305,24 +280,18 @@ type Op struct {
 	Off   *int64   `json:"off,omitempty"`
 	// Len is the number of bytes the operation requests.
 	Len *int64 `json:"len,omitempty"`
-	// Ret is the number of bytes the source operation actually transferred,
-	// present only on READ/GET and only when it differs from Len. Absent means
-	// the full requested length was transferred, which is what every trace
-	// written before schema v2 means by its len alone.
-	//
-	// It is deliberately not carried on WRITE/PUT. A partial read is a
-	// reproducible property of the target's length (EOF); a partial write is
-	// backend state (a full disk) that a healthy replay backend cannot be asked
-	// to reproduce, so recording one would let a trace demand a divergence
-	// rather than describe one.
+	// Ret is the number of bytes the source actually transferred, present only on
+	// READ/GET and only when it differs from Len. Absent means the full requested
+	// length was transferred. Not carried on WRITE/PUT: a partial read follows
+	// from the target's length, but a partial write is backend state a healthy
+	// replay cannot be asked to reproduce.
 	Ret *int64 `json:"ret,omitempty"`
 	Dur *int64 `json:"dur,omitempty"`
 }
 
-// MinVersion returns the lowest ioflux_trace_version whose readers can
-// interpret op correctly. A writer declares the maximum over its ops, so a
-// trace advertises exactly the version it needs and no more — traces using only
-// v1 fields keep validating on builds that predate anything later.
+// MinVersion returns the lowest ioflux_trace_version that can interpret op. A
+// writer declares the maximum over its ops, so a trace advertises exactly the
+// version it needs and no more.
 func (op Op) MinVersion() int {
 	if op.Ret != nil {
 		return VersionPartialTransfer

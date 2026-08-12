@@ -24,7 +24,7 @@ Replay a trace against a storage engine and emit results.json.
 Flags:
   --trace <path>        Path to a .ioflux trace file (required)
   --engine <name>       Storage engine: mem | local | s3 (default mem)
-  --mode <mode>         Replay mode: asap | timeline | scaled (default asap)
+  --mode <mode>         Replay mode: asap | think | timeline | scaled (default asap)
   --max-inflight <n>    Worker-global concurrent in-flight op cap (default 512)
   --speedup <f>         Timeline scaling factor for --mode scaled (default 1.0)
   --target-map <path>   Path to a YAML target-map config (optional)
@@ -132,7 +132,7 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	)
 	fs.StringVar(&tracePath, "trace", "", "path to .ioflux trace file (required)")
 	fs.StringVar(&engineName, "engine", "mem", "storage engine (mem | local | s3)")
-	fs.StringVar(&mode, "mode", "asap", "replay mode: asap | timeline | scaled")
+	fs.StringVar(&mode, "mode", "asap", "replay mode: asap | think | timeline | scaled")
 	fs.IntVar(&maxInflight, "max-inflight", 512, "worker-global concurrent in-flight op cap")
 	fs.Float64Var(&speedup, "speedup", 1.0, "timeline scaling factor for --mode scaled")
 	fs.StringVar(&outPath, "o", "", "output path for results.json (required; - for stdout)")

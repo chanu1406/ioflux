@@ -26,13 +26,11 @@ const defaultRunLease = 2 * time.Minute
 // that decodes requests, drives the Session through the phase protocol, and
 // encodes responses.
 //
-// A worker serves one run at a time. A run owns the worker from Prepare until
-// Collect, guarded by a lease so the result is never clobbered by an overlapping
-// run, yet an abandoned coordinator cannot wedge the worker forever: the lease is
-// refreshed throughout an active run (each progress tick) and a new Prepare may
-// take over only once it goes stale. Mid-run abandonment is handled instantly,
-// without waiting for the lease — the Run stream's context is cancelled, so Run
-// returns an error and releases the worker.
+// A worker serves one run at a time, from Prepare until Collect, guarded by a
+// lease: an overlapping run cannot clobber the result, and an abandoned
+// coordinator cannot wedge the worker, since the lease is refreshed on each
+// progress tick and a new Prepare takes over once it goes stale. Mid-run
+// abandonment cancels the Run stream's context immediately.
 type Server struct {
 	clusterpb.UnimplementedWorkerServer
 	session  *Session
@@ -213,7 +211,7 @@ func (s *Server) Collect(_ context.Context, _ *clusterpb.CollectRequest) (*clust
 
 // ServerOptions returns the gRPC server options IOFlux workers use: keepalive
 // parameters so a dropped coordinator or stalled worker is detected as missed
-// heartbeats (PRD §8.9 failure handling) rather than hanging indefinitely.
+// heartbeats rather than hanging indefinitely.
 func ServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(maxGRPCMessageBytes),

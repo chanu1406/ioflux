@@ -20,50 +20,34 @@ const calibrateUsage = `Usage:
 Measure the load generator's own ceiling for a trace, so a run's timing can be
 attributed to its backend rather than to IOFlux.
 
-The same trace is replayed at the same concurrency against the null (mem)
-engine, which performs no I/O. What remains is IOFlux's own cost: scheduling,
-dispatch, buffer handling, and accounting. No replay of that trace at that
-concurrency can go faster, whatever backend sits underneath.
-
-A measured run's op rate as a fraction of that ceiling is the generator's share
-of the result. A run at 5% of the ceiling was limited by its backend; a run at
-90% was limited by IOFlux, and a comparison between two such runs measures the
-tool rather than the storage.
+The trace is replayed at the same concurrency against the null (mem) engine,
+which performs no I/O. A measured run's op rate as a fraction of that ceiling is
+the generator's share of the result.
 
 Flags:
   --trace <path>        Path to a .ioflux trace file. Required unless --against
-                        is given, in which case it defaults to the trace that
-                        run recorded.
+                        is given, which supplies it.
   --against <path>      A results.json or trial set to assess against the
                         ceiling. Its concurrency is adopted so the two match.
   --max-inflight <n>    Concurrent in-flight op cap (default 512, or the
                         assessed run's).
   --trials <n>          Number of measured calibration trials (default 10). The
-                        ceiling is taken from their median duration, not their
-                        fastest: the fastest overstates what the generator can
-                        sustain, and an overstated ceiling understates its share
-                        of a measured run.
+                        ceiling comes from their median duration, not the
+                        fastest.
   --warmup <n>          Unmeasured trials to run first (default 2).
   --max-generator-share <pct>
                         Largest generator share that still permits attribution.
-                        Omitted, the share is reported and nothing is decided —
-                        there is no default, because the tolerable share depends
-                        on the fixture and on what the result will be used for.
+                        Omitted, the share is reported and nothing is decided.
   --min-trials <n>      Fewest valid calibration trials a ceiling may rest on
                         (default 6).
   --max-ceiling-cv <pct>
-                        Widest run-to-run spread the calibration itself may have
-                        (default 5). A ceiling measured on a host too noisy to
-                        repeat is not a bound but one sample of a moving
-                        quantity, so an unstable calibration is refused rather
-                        than used.
+                        Widest spread the calibration itself may have (default
+                        5). An unstable calibration is refused rather than used.
   -o <path>             Write the calibration artifact here (optional; - for
-                        stdout). Omitted, the summary is printed and nothing is
-                        saved.
+                        stdout).
 
-Note: the null engine holds the trace's dataset in memory, so calibrating a
-trace whose targets total more than available RAM will not complete. Calibrate
-the trace shape you intend to attribute, not a larger one.
+The null engine holds the trace's dataset in memory, so a trace whose targets
+exceed available RAM will not complete.
 
 Exit codes:
   0   ceiling measured; attributable, or reported with no bound declared
@@ -114,8 +98,7 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// The assessed run supplies the trace and concurrency the ceiling must match,
-	// so the two cannot silently describe different measurements.
+	// The assessed run supplies the trace and concurrency the ceiling must match.
 	var assessed *results.Results
 	var assessedDurationNS int64
 	if againstPath != "" {
@@ -133,10 +116,8 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "ioflux calibrate: %s has no valid trials to assess\n", againstPath)
 				return 1
 			}
-			// The median comes from the valid trials only, so the trial standing for
-			// the set must be a valid one too. Taking the first trial regardless
-			// would refuse the whole set whenever trial 1 happened to fail, even
-			// though its failure kept it out of the median being assessed.
+			// The median covers the valid trials only, so the trial standing for the
+			// set must be valid too.
 			assessed = firstValidTrial(art.trials)
 			assessedDurationNS = int64(art.trials.Summary.DurationNS.Median)
 		default:
@@ -160,15 +141,9 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 		maxInflight = 512
 	}
 
-	// The null engine replays asap with no cache recipe: it has no page cache to
-	// control, and declaring a recipe would name a guarantee that means nothing.
-	//
-	// assume-existing is load-bearing rather than incidental. The mem engine
-	// creates each object on first touch, so without a PREPARE pass that touches
-	// them the dataset is allocated lazily *inside* the measured window, and the
-	// ceiling measures Go's allocator instead of the load generator. Preparing
-	// first moves that cost where a real backend's dataset already sits: before
-	// the run.
+	// The mem engine creates each object on first touch, so without a PREPARE
+	// pass the dataset is allocated inside the measured window and the ceiling
+	// measures Go's allocator. It has no page cache, so no recipe applies.
 	settings := defaultRunSettings()
 	settings.TracePath = tracePath
 	settings.EngineName = calibrate.NullEngine
@@ -185,12 +160,9 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 
 	measured := make([]*results.Results, 0, trials)
 	for i := 0; i < warmup+trials; i++ {
-		// Each trial builds a fresh engine holding a fresh copy of the dataset, so
-		// without collecting first, trial N runs while trial N-1's garbage is still
-		// resident and its collection still pending. Everywhere else that would be
-		// ordinary noise; here the load generator's own memory behaviour is the
-		// quantity being measured, so inheriting another trial's heap is a confound
-		// rather than a condition.
+		// Each trial allocates a fresh copy of the dataset. Collecting first keeps
+		// trial N from running against trial N-1's garbage, which otherwise
+		// dominates the spread.
 		runtime.GC()
 
 		if warmup+trials > 1 {
@@ -216,8 +188,7 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// A valid trial, not simply the first: the median is computed over the valid
-	// trials, so the op count paired with it has to come from one of them.
+	// The op count must come from a valid trial, since the median does.
 	ceiling := calibrate.CeilingFrom(firstValidTrial(ts), int64(ts.Summary.DurationNS.Median))
 	ceiling.Trials = ts.Summary.ValidTrials
 	ceiling.CVPercent = ts.Summary.DurationNS.CVPercent
@@ -269,8 +240,7 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 }
 
 // firstValidTrial returns the first trial whose execution was valid, falling
-// back to the set's representative when none is (a caller that has already
-// checked ValidTrials > 0 never sees the fallback).
+// back to the set's representative when none is.
 func firstValidTrial(ts *results.TrialSet) *results.Results {
 	for _, t := range ts.Trials {
 		if len(t.ExecutionInvalidReasons()) == 0 {
@@ -280,8 +250,7 @@ func firstValidTrial(ts *results.TrialSet) *results.Results {
 	return ts.Representative()
 }
 
-// printCalibration writes the human-readable summary. It prints to stdout
-// because the ceiling is the command's result, not a diagnostic about it.
+// printCalibration writes the human-readable summary.
 func printCalibration(w io.Writer, cal *calibrate.Calibration) {
 	c := cal.Ceiling
 	fmt.Fprintf(w, "\nLoad-generator ceiling (%s engine, %d valid trial(s))\n", c.Engine, c.Trials)
@@ -321,8 +290,7 @@ func printCalibration(w io.Writer, cal *calibrate.Calibration) {
 	fmt.Fprintf(w, "  %s\n", a.Explanation)
 }
 
-// fmtCount renders a rate compactly without implying more precision than a
-// median over a handful of trials carries.
+// fmtCount renders a rate compactly.
 func fmtCount(v float64) string {
 	switch {
 	case v >= 1e6:

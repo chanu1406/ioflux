@@ -186,16 +186,11 @@ func runExperiment(args []string, stdout, stderr io.Writer) int {
 }
 
 // regressionExitCode maps a gate verdict to the process exit status.
-//
-// A declared threshold is meant to gate something, so its verdict has to reach
-// the caller as an exit status rather than only as printed text. "Inconclusive"
-// gets its own code instead of being folded into either neighbour: a team that
-// would block a release on a regression usually wants to retry on undecided
-// evidence, and one code for both takes that choice away.
-//
-// An unassessed gate is 0 because the experiment itself succeeded — the caller
-// asked for no decision and got none. Callers that require a decision should
-// declare a threshold rather than read 0 as a pass.
+// Inconclusive gets its own code rather than being folded into a neighbour, so
+// a caller can retry on undecided evidence instead of treating it as a verdict.
+// An unassessed gate is 0: the experiment succeeded and no decision was asked
+// for, so callers needing one declare a threshold rather than reading 0 as a
+// pass.
 func regressionExitCode(v results.RegressionVerdict) int {
 	switch v {
 	case results.RegressionFail:

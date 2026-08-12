@@ -62,12 +62,10 @@ func (s *Session) Info() WorkerInfo {
 // dataset preparation, and applies cache controls — every barrier-gated
 // precondition for the RUN phase. On success the Session is ready to Run.
 //
-// Each worker materializes the full target table (not only its assigned
-// streams'): for the v1 prep modes the written content is deterministic
-// (synthetic zeros, or an identical source copy), so replicating it across
-// workers is idempotent and the PREPARE barrier guarantees every target is fully
-// written before any worker reads. The coordinator therefore records one
-// worker's PrepareResult rather than summing across workers.
+// Each worker materializes the full target table, not only its assigned
+// streams': prep content is deterministic, so replicating it is idempotent and
+// the PREPARE barrier guarantees every target is written before any read. The
+// coordinator records one worker's PrepareResult rather than summing.
 func (s *Session) Prepare(ctx context.Context, p Plan) (PrepareResult, error) {
 	return s.PrepareReader(ctx, p, bytes.NewReader(p.TraceBytes))
 }

@@ -4,10 +4,8 @@ import "fmt"
 
 // TrialPolicy is the rule set a trial comparison must satisfy to produce a
 // conclusion. It is fixed before measured trials, not chosen after seeing them.
-//
-// The values here are floors, not universal defaults. A fixture declares its
-// own: qualification/FIXTURE.md requires ten trials at 5% for qual-01, and a
-// noisier workload or a costlier decision needs different ones.
+// The values are floors rather than universal defaults; a fixture declares its
+// own.
 type TrialPolicy struct {
 	// MinValidTrials is the smallest number of valid trials a conclusion may
 	// rest on.
@@ -15,18 +13,14 @@ type TrialPolicy struct {
 	// MaxCVPercent is the widest run-to-run spread a conclusion may rest on.
 	MaxCVPercent float64 `json:"max_cv_percent"`
 	// MaxDurationRegressionPercent is the largest increase in the primary metric
-	// that still passes. Zero leaves the gate off: the difference is reported and
-	// no pass/fail decision is made, which is the right default for a tool whose
-	// thresholds must be calibrated per fixture (§11.3) rather than inherited.
+	// that still passes. Zero leaves the gate off, reporting the difference and
+	// deciding nothing, since thresholds are calibrated per fixture.
 	MaxDurationRegressionPercent float64 `json:"max_duration_regression_percent,omitempty"`
 }
 
-// DefaultTrialPolicy returns the built-in floor.
-//
-// Six trials is not a statistical recommendation — it is the point below which
+// DefaultTrialPolicy returns the built-in floor. Six is the point below which
 // no 95% median interval exists at all (see medianCIBounds), so a smaller set
-// cannot state its own uncertainty. Five percent follows §11.3's example, whose
-// own text warns that it is calibrated to a fixture rather than universal.
+// cannot state its own uncertainty.
 func DefaultTrialPolicy() TrialPolicy {
 	return TrialPolicy{MinValidTrials: 6, MaxCVPercent: 5}
 }
@@ -42,11 +36,8 @@ type TrialComparison struct {
 	DeltaMedianNS float64 `json:"delta_median_ns"`
 	DeltaPercent  float64 `json:"delta_percent"`
 	// Separated reports whether the two medians' 95% intervals are disjoint.
-	//
-	// Disjoint intervals are evidence that the medians genuinely differ.
-	// Overlapping ones are not evidence that they do not: this test is
-	// conservative, and a real difference can still produce overlap. It is
-	// reported as "not separated", never as "no difference".
+	// Disjoint means the medians genuinely differ; overlapping is not evidence
+	// they do not, so it reads as "not separated", never "no difference".
 	Separated bool `json:"separated"`
 	// SeparationKnown is false when either side lacked the trials to form an
 	// interval, in which case Separated carries no information.
@@ -54,12 +45,9 @@ type TrialComparison struct {
 }
 
 // CompareTrialSets checks whether two trial sets may be compared under policy
-// and, if so, quantifies the difference between them.
-//
-// It layers on CheckEligibility rather than replacing it: everything that makes
-// two single runs incomparable still makes two sets of them incomparable, and
-// the set-level rules — enough trials, stable enough, no failed trial — are
-// added on top.
+// and, if so, quantifies the difference between them. It layers on
+// CheckEligibility: everything making two single runs incomparable still makes
+// two sets of them incomparable, with the set-level rules added on top.
 func CompareTrialSets(a, b *TrialSet, policy TrialPolicy) TrialComparison {
 	tc := TrialComparison{Policy: policy, A: a.Summary, B: b.Summary}
 

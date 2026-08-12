@@ -610,7 +610,7 @@ func TestReportCmd_ComparisonCleanWhenFullyComparable(t *testing.T) {
 // TestReportCmd_ComparisonFlagsEquivalenceMismatch verifies that comparing an
 // object-level (coalesced write) run against a syscall-level run is flagged,
 // since the delta may reflect that semantic difference rather than backend
-// performance (PRD §6 honesty rule).
+// performance.
 func TestReportCmd_ComparisonFlagsEquivalenceMismatch(t *testing.T) {
 	a := makeTestResults()
 	a.Plan.ReplayEquivalence = "object-level"

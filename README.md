@@ -14,7 +14,7 @@ and replay fidelity across runs.
 - Import file I/O captured by `strace` or DFTracer.
 - Validate portable, JSONL-based `.ioflux` traces.
 - Replay against in-memory, local filesystem, and S3-compatible backends.
-- Run in maximum-throughput, original-timeline, or scaled-timeline modes.
+- Run in maximum-throughput, think-time, original-timeline, or scaled modes.
 - Distribute streams across multiple replay workers.
 - Export machine-readable JSON, optional CSV, and human-readable reports.
 
@@ -117,6 +117,50 @@ bin/ioflux run \
 Imported traces retain the limitations of their capture method. IOFlux records
 those limitations and replay-fidelity information in the trace and result
 metadata.
+
+## Replay modes
+
+A trace records when each operation happened and how long it took. How replay
+uses those two numbers decides what a run measures:
+
+| Mode | Each op is issued | Use it for |
+| --- | --- | --- |
+| `asap` | as soon as the previous op in its stream completes | maximum throughput the backend allows |
+| `think` | after the previous op completes, plus the gap the source left | a workload whose pacing depends on the backend |
+| `timeline` | at its recorded timestamp | reproducing an arrival schedule that does not depend on the backend |
+| `scaled` | at its recorded timestamp, divided by `--speedup` | the same, compressed or stretched |
+
+`asap` and `timeline` both mislead when the replay backend is not about as fast
+as the captured one. `asap` discards the source's idle time, so a workload that
+spent most of its time computing between reads replays as one that never
+computes, and every slowdown lands on storage. `timeline` holds each op to a
+fixed clock, so a slower backend falls further behind with every operation and
+the run measures a queue backing up rather than the workload — which the
+fidelity report will flag as `behind_schedule`.
+
+`think` replays the gap instead of the timestamp:
+
+```bash
+bin/ioflux run --trace workload.ioflux --engine s3 --mode think --bucket bench -o results.json
+```
+
+Each operation is issued once the previous one in its stream has completed and
+the source's own gap has elapsed. A backend twice as slow produces a run that is
+longer by however much slower it actually was, rather than one that spends the
+whole time behind schedule. There is no fixed schedule to fall behind, so the
+mode carries no `behind_schedule` category.
+
+The gap is derived from the trace: `t` of the next op minus `t` plus `dur` of
+the previous one, within a stream. A trace that records no durations cannot
+express think time, and the run is refused rather than quietly replayed as
+`asap`. Where an individual gap is missing or comes out negative it is treated
+as zero, which issues the operation as soon as its predecessor finishes.
+
+Two limits are worth stating. Capture inflates the durations it records —
+`strace` by 1.2–1.3x on the qualification fixture — so a derived gap is
+correspondingly short. And the replay performs no application compute; it waits
+out the gap rather than reproducing the work that filled it, so think time is
+reproduced as a delay, not as load on the machine.
 
 ## Comparing two runs
 

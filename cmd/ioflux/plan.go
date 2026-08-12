@@ -77,9 +77,9 @@ func (s runSettings) validate() *planError {
 		return usageErrorf("a trace is required")
 	}
 	switch s.Mode {
-	case "asap", "timeline", "scaled":
+	case "asap", "think", "timeline", "scaled":
 	default:
-		return usageErrorf("unsupported mode %q (want asap | timeline | scaled)", s.Mode)
+		return usageErrorf("unsupported mode %q (want asap | think | timeline | scaled)", s.Mode)
 	}
 	if s.MaxInflight <= 0 {
 		return usageErrorf("max-inflight must be > 0, got %d", s.MaxInflight)

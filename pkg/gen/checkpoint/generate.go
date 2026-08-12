@@ -6,12 +6,10 @@
 // CLOSE). A run may emit several checkpoints separated by an interval, modelling
 // periodic checkpointing.
 //
-// Each writer rank is a strictly-sequential stream (at most one op in flight),
-// so replay never adds parallelism. All ops within one rank's checkpoint share
-// the checkpoint's arrival time: a checkpoint is an I/O burst issued as fast as
-// the backend allows, not a paced stream. Successive checkpoints are separated
-// by the checkpoint interval; with a zero interval all checkpoints collapse into
-// one dense burst at t=0.
+// Each writer rank is a strictly-sequential stream, so replay never adds
+// parallelism. Ops within one rank's checkpoint share its arrival time, making
+// a checkpoint a burst rather than a paced stream. A zero interval collapses
+// every checkpoint into one burst at t=0.
 //
 // fsync policy controls durability:
 //   - per-file: every shard is fsync'd before close.

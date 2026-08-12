@@ -7,13 +7,10 @@ import (
 	"strings"
 )
 
-// Verdict classifies whether two results may be read as a comparison.
-//
-// The three outcomes exist because "comparable" and "not comparable" is not a
-// rich enough answer. A run against a different backend is exactly what a
-// storage experiment is *for*, so a gate that rejected every difference would
-// reject the measurement it exists to support; a run that failed 417 operations
-// is not a measurement at all. The first is a caveat, the second is a refusal.
+// Verdict classifies whether two results may be read as a comparison. Three
+// outcomes, because a differing backend is what a storage experiment is for
+// while a run that failed its operations is not a measurement at all: the first
+// is a caveat, the second a refusal.
 type Verdict string
 
 const (
