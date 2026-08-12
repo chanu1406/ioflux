@@ -156,11 +156,30 @@ express think time, and the run is refused rather than quietly replayed as
 `asap`. Where an individual gap is missing or comes out negative it is treated
 as zero, which issues the operation as soon as its predecessor finishes.
 
-Two limits are worth stating. Capture inflates the durations it records —
-`strace` by 1.2–1.3x on the qualification fixture — so a derived gap is
-correspondingly short. And the replay performs no application compute; it waits
-out the gap rather than reproducing the work that filled it, so think time is
-reproduced as a delay, not as load on the machine.
+Three limits are worth stating.
+
+**The mode assumes the gap is exogenous.** Replaying a fixed gap is right when
+the source's idle time was caused by something independent of storage — a GPU
+step, a fixed compute budget. It is wrong when the gap was itself caused by
+storage, as with a prefetch queue that was full: there, a slower backend would
+have shortened the real gap, and replay holds it constant. Whether a given
+workload is in the first regime is a property of the fixture and has to be
+established, not assumed. The clearest evidence is that its gaps stay about the
+same when the source runs against storage of different speeds.
+
+**Capture perturbs the gap.** The gap is a residual between one operation's
+recorded end and the next one's recorded start, so tracer overhead at both
+boundaries lands inside it. On the qualification fixture `strace` inflates total
+phase time by 1.2–1.3x. The direction and size of the error *on the gap
+specifically* has not been measured, so no correction is applied and none should
+be assumed; measuring it needs a source run whose compute interval is known
+independently.
+
+**The gap is waited out, not worked.** Replay performs no application compute,
+so the CPU, memory bandwidth, and cache pressure the real workload applied while
+thinking are absent. This matters most for backends whose client is itself
+expensive — an object-store client doing TLS and checksums competes for CPU that
+replay leaves free.
 
 ## Comparing two runs
 
